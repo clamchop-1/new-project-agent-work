@@ -83,8 +83,22 @@ def section(path, index=0, history_authorized=False):
                         return section_record(path, output, first_line, line_number)
                 if section_number == index and len(output) + len(pending) > budget:
                     if budget == 16384:
-                        raise AgentError('Current section exceeds 16KiB; no partial section returned.')
-                    budget *= 2
+                        # Permit bounded lookahead for a possible next heading.
+                        possible_heading = (
+                            fence is None
+                            and bool(output)
+                            and len(pending) <= 256
+                            and re.fullmatch(
+                                rb' {0,3}(?:#{0,2}[ \t]*)?',
+                                bytes(pending),
+                            ) is not None
+                        )
+                        if not possible_heading:
+                            raise AgentError(
+                                'Current section exceeds 16KiB; no partial section returned.'
+                            )
+                    else:
+                        budget *= 2
                 if byte != b'\n':
                     continue
             elif not pending:
