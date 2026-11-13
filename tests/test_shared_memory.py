@@ -119,6 +119,26 @@ class MemoryTests(FixtureCase):
         path.write_bytes(current+b'## Older\nnot selected\n')
         self.assertEqual(section(path)['text'].encode(),current)
 
+    def test_16k_boundary_rejects_oversized_content(self):
+        path = self.base / 'memory.md'
+
+        cases = {
+            'ordinary': b'## Current\n' + b'x' * 17000 + b'\n',
+            'heading_like': (
+                b'## Current\n'
+                + b'x' * (16384 - 11)
+                + b'\n# '
+                + b'x' * 300
+                + b'\n'
+            ),
+        }
+
+        for name, content in cases.items():
+            with self.subTest(case=name):
+                path.write_bytes(content)
+                with self.assertRaises(AgentError):
+                    section(path)
+
     def test_missing_memory_is_reported_without_history_fallback(self):
         (self.project.root/'.local/PROJECT_CONTEXT.md').unlink()
         memory = self.project.memory()
