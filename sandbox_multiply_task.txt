@@ -1,0 +1,20 @@
+﻿Project: LocalAgentSandbox
+
+Objective:
+Add multiplication support to the existing calculator.
+
+Requirements:
+1. Read calculator.py and test_calculator.py before editing.
+2. Add a function multiply(a, b) that returns a * b.
+3. Add unit tests covering positive, negative, and zero values.
+4. Preserve the existing add and subtract functions and tests.
+5. Modify ONLY calculator.py and test_calculator.py.
+6. Run the available calculator tests after editing.
+7. Report files changed, test results, and any unfinished work.
+
+Safety:
+- Do not modify any other project.
+- Do not delete files.
+- Do not modify AGENTS.md or project memory.
+- Do not execute arbitrary shell commands.
+- Stop and report if the requested changes cannot be completed safely.

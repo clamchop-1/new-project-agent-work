@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import time
 import uuid
 
 
@@ -27,18 +28,41 @@ def file_hash(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
+def _retry_windows_sharing(operation, attempts=6, delay=0.1):
+    for attempt in range(attempts):
+        try:
+            return operation()
+        except OSError as exc:
+            if (
+                os.name != 'nt'
+                or getattr(exc, 'winerror', None) not in (32, 33)
+                or attempt == attempts - 1
+            ):
+                raise
+            time.sleep(delay * (attempt + 1))
+
+
 def atomic_write(path, raw):
     path = Path(path)
     temporary = path.with_name(path.name + '.new-' + uuid.uuid4().hex)
     try:
-        with temporary.open('xb') as stream:
-            stream.write(raw)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        def create_and_write():
+            with temporary.open('xb') as stream:
+                stream.write(raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+
+        _retry_windows_sharing(create_and_write)
+        _retry_windows_sharing(lambda: os.replace(temporary, path))
     finally:
         if temporary.exists():
-            temporary.unlink()
+            try:
+                _retry_windows_sharing(temporary.unlink)
+            except OSError as exc:
+                if os.name != 'nt' or getattr(exc, 'winerror', None) not in (32, 33):
+                    raise
+                # Preserve the original failure; a locked temporary file
+                # can be reviewed and cleaned up separately.
 
 
 SECRET = re.compile(r'(?:sk-(?:proj-|ant-)?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[A-Z0-9]{16}|-----BEGIN [^-]*PRIVATE KEY-----|[\"\']?(?:api[_-]?key|password|access[_-]?token)[\"\']?\s*[:=]\s*[\"\']?[A-Za-z0-9_+/=-]{16,}|Bearer\s+[A-Za-z0-9._~-]{16,})', re.I)
@@ -89,7 +113,7 @@ def section(path, index=0, history_authorized=False):
                             and bool(output)
                             and len(pending) <= 256
                             and re.fullmatch(
-                                rb' {0,3}(?:#{0,2}[ \t]*)?',
+                                rb' {0,3}(?:#{0,2}[ \t]*|##?[ \t]+[^\r\n]*)?',
                                 bytes(pending),
                             ) is not None
                         )
@@ -218,6 +242,11 @@ class Project:
             raise AgentError('Private, generated or credential path rejected.')
         if relative.name.casefold() in ('auth.json', 'credentials.json', 'secrets.json', 'id_rsa', 'id_ed25519') or relative.suffix.casefold() in ('.pem', '.p12', '.pfx'):
             raise AgentError('Credential artifact rejected.')
+        if (self.root.name.casefold() == 'localagentsandbox'
+                and tuple(part.casefold() for part in relative.parts)
+                == ('tests', 'test_verified_calculator.py')
+                and not allow_instructions):
+            raise AgentError('Trusted verification fixture is protected.')
         target = self.root / relative
         current = target
         while current != self.root:

@@ -1,0 +1,10 @@
+﻿Add a subtract(a, b) function to calculator.py.
+
+Requirements:
+- Return a minus b.
+- Preserve the existing add function.
+- Add unit tests for subtract in test_calculator.py.
+- Include positive, negative, and zero test cases.
+- Run the Python unittest suite.
+- Do not modify any other project files.
+- Report the changes and test results.

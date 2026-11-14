@@ -18,7 +18,7 @@ SAFE_BUILTINS = {'sum': sum, 'len': len, 'min': min, 'max': max, 'abs': abs,
 ALLOWED = (ast.Module, ast.FunctionDef, ast.arguments, ast.arg, ast.Return, ast.If,
            ast.Raise, ast.Expr, ast.Constant, ast.Name, ast.Load,
            ast.BinOp, ast.UnaryOp, ast.BoolOp, ast.Compare, ast.Call,
-           ast.Add, ast.Sub, ast.Div, ast.FloorDiv,
+           ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv,
            ast.Mod, ast.USub, ast.UAdd, ast.Not, ast.And, ast.Or, ast.Eq, ast.NotEq,
            ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Is, ast.IsNot)
 
@@ -61,15 +61,44 @@ def validate_source(text):
 
 def main():
     root = Path(sys.argv[1]).resolve()
-    config = json.loads(Path(sys.argv[2]).read_bytes())
+    config_path = Path(sys.argv[2]).resolve()
+    expected_config = root / '.local' / 'pinned-tests.json'
+
+    if config_path != expected_config:
+        raise ValueError('Unexpected pinned test configuration path')
+
+    config = json.loads(config_path.read_bytes())
+
+    if root.name.casefold() == 'localagentsandbox':
+        expected = {
+            'test_file': 'tests/test_verified_calculator.py',
+            'test_sha256': 'ea91fa9f1bb1b6f984df3e7ace8a7faf8062ab2bb58e926ce02e10054547c98d',
+            'modules': ['calculator'],
+        }
+    elif root.parent.parent == (Path(__file__).resolve().parent / '.local' / 'tests').resolve():
+        expected = {
+            'test_file': 'tests/test_stats.py',
+            'test_sha256': '6a9f34017eb9574fc9f415368eb9c845bb4643f9633ccc9e98de7b7bc98d3181',
+            'modules': ['calculator', 'stats'],
+        }
+    else:
+        raise ValueError('Unapproved pinned test project')
+
+    if config != expected:
+        raise ValueError('Pinned test configuration differs from approved values')
+
     test = root / config['test_file']
     if hashlib.sha256(test.read_bytes()).hexdigest() != config['test_sha256']:
         raise ValueError('Pinned test changed; refusing execution')
     for name in config['modules']:
         source = root / (name + '.py')
         if not source.is_file():
-            continue  # Trusted unittest reports the actual missing-module failure.
-        tree = validate_source(source.read_text(encoding='utf-8'))
+            # Keep an approved-but-missing module importable so the pinned
+            # unittest can report the missing implementation as an assertion
+            # failure instead of aborting test discovery with ImportError.
+            sys.modules[name] = types.ModuleType(name)
+            continue
+        tree = validate_source(source.read_text(encoding='utf-8-sig'))
         module = types.ModuleType(name)
         namespace = {'__builtins__': dict(SAFE_BUILTINS), '__name__': name}
         exec(compile(tree, str(source), 'exec'), namespace)

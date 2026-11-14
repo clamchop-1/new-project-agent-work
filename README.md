@@ -111,3 +111,31 @@ Emergency stop: Ctrl+C stops the launcher; its owned bounded command is cleaned 
 Creating a `STOP` file in a run's execution directory stops between model calls.
 An in-flight Ollama request may finish before cancellation is observed. Never kill
 all Python/Ollama/Codex processes or stop an unrelated session.
+
+## Current validation update — 2026-11-13
+
+The dated setup text above is a historical checkpoint. Current progress and
+verified experiment receipts are recorded in `.local/CONTINUATION_20261113.md`.
+The repair fixture is registered as `LocalAgentRepairFixture`; it is a disposable
+experiment result and currently contains modified `calculator.py` plus new
+`stats.py`. Do not reset it as part of routine cleanup.
+
+The latest framework regression run passed **116 tests**, with one symbolic-link
+creation test skipped because this account lacks the Windows symlink privilege. The
+Windows junction rejection test passed. This does not
+establish general OS sandboxing.
+
+To compare existing saved runs without launching inference or contacting a model:
+
+```powershell
+& 'C:\Users\dsmus\AppData\Local\Programs\Python\Python314\python.exe' `
+  'D:\Workspaces\LocalCodingAgent\model_evaluation.py' `
+  'D:\Workspaces\LocalCodingAgent\.local\runs\<run-id>\execution'
+```
+
+The report groups verified completions, test outcomes, tool errors, steps, elapsed
+time, and available token/context metrics by model. Older runs without those fields
+are reported as unavailable rather than treated as zero. Use multiple execution
+directories to compare runs; small samples are diagnostic, not a model ranking.
+The first three-model sample and its limitations are recorded in
+`MODEL_EVALUATION.md`.

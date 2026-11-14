@@ -9,11 +9,26 @@ import uuid
 
 from agent_core import AgentError, Project, atomic_write, encoded, digest, exclusive, save_handoff
 from local_agent import HUB, run_agent
+from model_router import get_models, choose_model
+from conversation_session import load_session
+
+REPAIR_ROOT = (HUB / '.local/tests/live-repair-001/repo').resolve()
+REPAIR_WRITE_PATHS = frozenset({'calculator.py', 'stats.py'})
 
 PROJECTS = {'KronosStage': 'D:/Workspaces/KronosStage',
             'PhotoLibraryTools': 'D:/Workspaces/ChasingLight',
-            'PhotoLibraryPlanning': 'D:/Workspaces/ChasingLight-Planning'}
+            'PhotoLibraryPlanning': 'D:/Workspaces/ChasingLight-Planning',
+            'LocalAgentSandbox': 'D:/Workspaces/LocalAgentSandbox',
+            'LocalAgentRepairFixture': str(REPAIR_ROOT)}
 PRIVATE = HUB/'.local'
+
+
+def validate_write_paths(project_name, write_paths):
+    paths = tuple(write_paths)
+    if project_name == 'LocalAgentRepairFixture':
+        if not paths or len(paths) != len(set(paths)) or not set(paths) <= REPAIR_WRITE_PATHS:
+            raise AgentError('Repair fixture permits may authorize only calculator.py and stats.py.')
+    return paths
 
 
 def new_directory(kind):
@@ -64,7 +79,25 @@ def main():
     parser.add_argument('--proposal',type=Path);parser.add_argument('--authorize-memory-save',action='store_true')
     parser.add_argument('--agent',choices=['codex','claude','qwen'],default='qwen')
     parser.add_argument('--history-index',type=int);parser.add_argument('--authorize-history',action='store_true')
-    args=parser.parse_args();PRIVATE.mkdir(exist_ok=True)
+    parser.add_argument('--conversation', action='store_true')
+    args=parser.parse_args()
+
+    # Reject unauthorized conversation use before project preparation.
+    if args.conversation:
+        if args.action != 'run':
+            raise AgentError(
+                'Conversation history is supported only for run actions.'
+            )
+        if args.project != 'LocalAgentSandbox':
+            raise AgentError(
+                'Conversation history is currently sandbox-only.'
+            )
+        if args.permit or args.write_path:
+            raise AgentError(
+                'Conversation history cannot be combined with write permits.'
+            )
+
+    PRIVATE.mkdir(exist_ok=True)
     project=Project(PROJECTS[args.project])
     locks=PRIVATE/'locks';locks.mkdir(exist_ok=True)
     with exclusive(locks/(project.identity+'.lock'),args.agent):
@@ -82,10 +115,11 @@ def main():
             if not args.task_file or not args.write_path:raise AgentError('Reviewable task file and exact write paths are required.')
             state=project.state()
             if state['status'].strip():raise AgentError('Existing worktree changes must be reviewed/isolated before edit authorization.')
-            for path in args.write_path:project.path(path)
+            write_paths = validate_write_paths(args.project, args.write_path)
+            for path in write_paths:project.path(path)
             folder=new_directory('approvals')
             permit={'project_id':project.identity,'state':state,'memory':project.memory_snapshot(),
-                    'task':args.task_file.read_text(encoding='utf-8'),'write_paths':args.write_path,'used':False}
+                    'task':args.task_file.read_text(encoding='utf-8'),'write_paths':list(write_paths),'used':False}
             atomic_write(folder/'permit.json',encoded(permit))
             print('Single-task edit permit: '+str(folder/'permit.json'));return
         if args.action=='run':
@@ -100,12 +134,40 @@ def main():
                     raise AgentError('Permit is used, cross-project or stale.')
                 if not args.task and not args.task_file:task=permit['task']
                 if task!=permit['task']:raise AgentError('Approved task changed.')
-                writes=permit['write_paths'];permit['used']=True;atomic_write(permit_path,encoded(permit))
+                writes=validate_write_paths(args.project, permit['write_paths'])
+                permit['used']=True;atomic_write(permit_path,encoded(permit))
             parent=new_directory('runs');packet=snapshot(project,parent)
             prepare_bridges(project,parent,packet)
             try:
                 with exclusive(PRIVATE/'inference.lock','qwen'):
-                    result=run_agent(project,args.model,task,parent/'execution',args.endpoint,writes=writes)
+                    selected_model = args.model
+                    if selected_model == 'auto':
+                        routing = choose_model(get_models(args.endpoint), task)
+                        selected_model = routing['model']
+                        print('LOCAL MODEL ROUTING: ' + json.dumps(routing), flush=True)
+                    conversation = ()
+                    if args.conversation:
+                        if args.project != 'LocalAgentSandbox':
+                            raise AgentError(
+                                'Conversation history is currently sandbox-only.'
+                            )
+                        if writes:
+                            raise AgentError(
+                                'Conversation history cannot be combined with write permits.'
+                            )
+                        conversation = load_session(args.project)
+
+                    result=run_agent(
+                        project,selected_model,task,
+                        parent/'execution',args.endpoint,
+                        writes=writes,
+                        conversation=conversation,
+                        test_config=(
+                            project.root / '.local' / 'pinned-tests.json'
+                            if args.project in ('LocalAgentSandbox', 'LocalAgentRepairFixture')
+                            else None
+                        )
+                    )
             finally:
                 atomic_write(parent/'post-run.json',encoded({'state':project.state(),'memory':packet['memory_snapshot'],
                               'task':task,'run':str(parent/'execution')}))
