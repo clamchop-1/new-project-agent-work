@@ -139,3 +139,13 @@ are reported as unavailable rather than treated as zero. Use multiple execution
 directories to compare runs; small samples are diagnostic, not a model ranking.
 The first three-model sample and its limitations are recorded in
 `MODEL_EVALUATION.md`.
+
+## Saving committed work to GitHub
+
+`Sync LocalCodingAgent to GitHub.cmd` runs the repository-specific sync helper.
+It checks the repository root, configured `origin`, and current branch, then
+performs a non-forced push of the current branch after interactive confirmation.
+Use `--dry-run` to check whether Git accepts the push without updating the remote.
+The helper never stages or commits files; it reports uncommitted work so it is
+clear that only existing commits are uploaded. Configure the intended `origin`
+remote before using it.
