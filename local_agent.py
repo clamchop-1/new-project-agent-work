@@ -632,18 +632,25 @@ def run_agent(project, model, task, output, base='http://127.0.0.1:11434', write
 
             messages.append(message)
             if not calls:
-                content = message.get('content', '')
-                if content == previous_unhandled:
-                    repeated_unhandled += 1
-                else:
-                    previous_unhandled = content
-                    repeated_unhandled = 1
-                if repeated_unhandled >= 3:
+                repeated_unhandled += 1
+                if repeated_unhandled >= 4:
                     result['status'] = 'repeated_unhandled_response'
                     break
-                messages.append({'role': 'user', 'content': 'Use actual tools and finish with the finish tool; prose alone does not establish execution.'})
+                messages.append({
+                    'role': 'user',
+                    'content': (
+                        'Recovery guidance: The project and task are already selected. '
+                        'Do not ask the operator to provide file paths again. '
+                        'Use list_files with empty arguments to discover available '
+                        'relative paths, then read_file with a listed relative path. '
+                        'Use run_tests with empty arguments to execute the approved '
+                        'pinned tests. Invoke an actual permitted tool call; prose '
+                        'alone does not establish execution. Finish using the '
+                        'finish tool and report only observed results. '
+                        'Do not bypass authorization or tool validation.'
+                    )
+                })
                 continue
-            previous_unhandled = None
             repeated_unhandled = 0
             for call in calls:
                 function_call = call['function'];name = function_call['name'];args = function_call.get('arguments', {})
