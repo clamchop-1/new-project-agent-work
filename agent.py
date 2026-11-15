@@ -16,6 +16,7 @@ from agent_config import (config_path, default_projects, load_config,
 
 REPAIR_ROOT = (HUB / '.local/tests/live-repair-001/repo').resolve()
 REPAIR_WRITE_PATHS = frozenset({'calculator.py', 'stats.py'})
+PINNED_TEST_PROJECTS = frozenset({'LocalAgentSandbox', 'LocalAgentRepairFixture'})
 
 PROJECTS = default_projects(HUB)
 PRIVATE = HUB/'.local'
@@ -77,6 +78,10 @@ def main():
     parser.add_argument('--task');parser.add_argument('--task-file',type=Path)
     parser.add_argument('--model',default=config['inference']['model']);parser.add_argument('--endpoint',default=config['inference']['endpoint'])
     parser.add_argument('--write-path',action='append',default=[])
+    parser.add_argument(
+        '--allow-pinned-tests', action='store_true',
+        help='Expose this project’s registered pinned test suite to the agent for this run.',
+    )
     parser.add_argument('--resume-held-project',action='store_true')
     parser.add_argument('--permit',type=Path);parser.add_argument('--run-directory',type=Path)
     parser.add_argument('--proposal',type=Path);parser.add_argument('--authorize-memory-save',action='store_true')
@@ -181,17 +186,17 @@ def main():
                             )
                         conversation = load_session(selected_project_name)
 
+                    test_config = None
+                    if args.allow_pinned_tests and selected_project_name in PINNED_TEST_PROJECTS:
+                        test_config = project.root / '.local' / 'pinned-tests.json'
+
                     result=run_agent(
                         project,selected_model,task,
                         parent/'execution',args.endpoint,
                         writes=writes,
                         conversation=conversation,
                         provider_name=config['inference']['provider'],
-                        test_config=(
-                            project.root / '.local' / 'pinned-tests.json'
-                        if selected_project_name in ('LocalAgentSandbox', 'LocalAgentRepairFixture')
-                            else None
-                        )
+                        test_config=test_config,
                     )
             finally:
                 atomic_write(parent/'post-run.json',encoded({'state':project.state(),'memory':packet['memory_snapshot'],

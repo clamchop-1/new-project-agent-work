@@ -19,6 +19,9 @@ They are distinct main/feature worktrees, with existing changes/holds preserved.
 No model is downloaded, no global configuration changed, and no cloud fallback
 exists in the local runner. Existing project memory loads automatically through
 the adapter; only complete newest sections are provided and identical ones deduplicate.
+The agent does not receive a test tool by default. To allow the registered fixture's
+pinned suite for one run, pass `--allow-pinned-tests`; this never enables arbitrary
+commands or unpinned project tests.
 
 ## Host-local project and inference configuration
 
@@ -129,6 +132,34 @@ or configuration changes. It may take several minutes. Inspect its recorded resu
 before calling native Codex tool/model compatibility validated. No existing project
 is its target. Do not use full-access or permissive legacy fallback to bypass failure.
 
+## Interactive Codex with local Ollama
+
+After the native validation gate passes, start an interactive Codex session through
+the isolated local provider profile:
+
+```powershell
+& 'D:\Workspaces\LocalCodingAgent\Start-Codex-Ollama.cmd' -ProjectPath 'D:\path\to\your\project' -Preview
+& 'D:\Workspaces\LocalCodingAgent\Start-Codex-Ollama.cmd' -ProjectPath 'D:\path\to\your\project' -TrustProject
+```
+
+The launcher creates a new short-path profile under `.local/co` for every run.
+The short path is needed by Codex's Windows app-server socket. It does not read or
+modify `%USERPROFILE%\.codex`. It selects the explicit
+loopback Ollama Responses provider, disables web search, removes inherited API
+keys/tokens/cloud credentials from the Codex process, and uses `workspace-write`
+with `on-request` approvals. Codex CLI and an already-running local Ollama server
+are required; nothing is installed or downloaded. The default model and 8192 token
+context match the tested Windows alias. Override them with `-Model` and
+`-ContextWindow` for another installed local model. Use `-Preview` to generate and
+inspect the isolated profile without starting Codex or sending a model request.
+The launcher uses Codex's `--no-daemon` mode so isolated runs do not leave a shared
+app-server running in the background.
+`-TrustProject` opts that project into its project-level Codex settings for this
+isolated profile; those settings may run project hooks. Trust is not set unless the
+switch is passed. Codex may still show a folder-trust confirmation before opening
+the project. On Windows, the profile selects the MXC sandbox validated by
+`Test-NativeCodex.cmd`; it does not invoke the administrator setup or legacy fallback.
+
 ## Shared memory and authorization
 
 `agent_core.py` preserves each project's AGENTS.md and existing
@@ -150,12 +181,23 @@ task/state/paths. Inspection never resumes a saved hold or authorizes hardware/d
 
 ## Current limitations
 
-- Latest full new-suite result: **20 pass, one error out of 21**. An earlier run
-  passed all 21 before an exact-boundary test was added. Current known bug: a valid
-  exactly-16-KiB current section can fail while looking ahead to the next heading.
-  It fails closed without returning a partial section. See saved logs/handoff.
-- Broader native Codex execution and model compatibility remain unvalidated.
-- Other installed Qwen models have not received the same comparative coding trial.
+- Latest full suite: **166 passed, 1 skipped**. The skipped symbolic-link test
+  requires a Windows privilege unavailable in this account; junction rejection
+  and the exact-16-KiB section boundary tests passed. POSIX symbolic-link behavior
+  remains unverified on this Windows host.
+- Windows native Codex execution passed one compact Qwen3.5 4B / 8k disposable edit-and-test
+  task, including all filesystem sentinels and the three fixture tests. This is one
+  successful sample, not a broad model-reliability claim.
+- Interactive Codex with Qwen3.5 4B completed a read-only tool call, but its broad
+  summary included stale claims. A later exact extraction matched the README.
+  Interactive coding attempts with Qwen3.5 4B repeated file reads; Qwen3 8B issued
+  malformed PowerShell writes and produced a UTF-16 `stats.py` in the disposable
+  fixture, which failed Python import with null bytes. The root worktree was not
+  changed by these trials. Use the validated `codex exec` fixture route for coding
+  evidence until a larger-model interactive task succeeds.
+- Qwen3 8B's noninteractive probe used the fixture's `approval_policy = "never"` and
+  refused to run commands, so it is not a comparable model trial. Mac model/context
+  sizing remains untested; the Mac's 128 GiB unified memory is a separate evaluation.
 - Claude settings/context accessibility is prepared; actual Claude comprehension
   is not tested. No cloud agent was launched to manufacture a pass.
 - Two-file replacement is recoverable, not OS-atomic across both files. Locks

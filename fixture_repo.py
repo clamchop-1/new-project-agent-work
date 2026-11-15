@@ -31,7 +31,7 @@ class StatsTests(unittest.TestCase):
     for name, text in files.items():
         path = root/name;path.parent.mkdir(exist_ok=True);path.write_text(text, encoding='utf-8')
     subprocess.run(['git', 'init', '--initial-branch=main', str(root)], check=True, capture_output=True)
-    subprocess.run(['git', '-C', str(root), 'add', '.'], check=True, capture_output=True)
+    subprocess.run(['git', '-C', str(root), 'add', '-A'], check=True, capture_output=True)
     subprocess.run(['git', '-C', str(root), '-c', 'user.name=Local Agent Fixture', '-c',
                     'user.email=fixture@example.invalid', 'commit', '-m', 'Seed controlled validation fixture'], check=True, capture_output=True)
     local = root/'.local';local.mkdir()

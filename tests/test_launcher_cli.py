@@ -29,6 +29,50 @@ class LauncherCliTests(FixtureCase):
         projects['LocalAgentRepairFixture'] = str(self.project.root)
         return (patch.object(agent, 'PROJECTS', projects), patch.object(agent, 'PRIVATE', self.private))
 
+    def test_pinned_test_capability_is_opt_in_and_project_scoped(self):
+        captured_test_configs = []
+
+        def fake_run(project, model, task, output, endpoint, **kwargs):
+            output.mkdir(parents=True)
+            summary = {'summary': 'CLI test run', 'unfinished': [], 'next_actions': []}
+            atomic_write(output / 'result.json', encoded({
+                'project_id': project.identity,
+                'summary': summary,
+                'commands': [],
+            }))
+            captured_test_configs.append(kwargs['test_config'])
+            return {
+                'status': 'complete',
+                'summary': summary,
+                'operator_policy': {'write_paths': list(kwargs['writes'])},
+                'verified_test_status': 'not_run',
+            }
+
+        with self.patched_launcher()[0], self.patched_launcher()[1]:
+            with patch.object(agent, 'run_agent', side_effect=fake_run):
+                self.run_cli([
+                    'run', '--project', 'LocalAgentRepairFixture',
+                    '--task', 'Inspect source only.',
+                ])
+                self.assertIsNone(captured_test_configs[-1])
+
+                self.run_cli([
+                    'run', '--project', 'LocalAgentRepairFixture',
+                    '--task', 'Inspect source and run the pinned suite.',
+                    '--allow-pinned-tests',
+                ])
+                self.assertEqual(
+                    captured_test_configs[-1],
+                    self.project.root / '.local' / 'pinned-tests.json',
+                )
+
+                with patch.object(agent, 'PROJECTS', {'UnapprovedProject': str(self.project.root)}):
+                    self.run_cli([
+                        'run', '--project', 'UnapprovedProject',
+                        '--task', 'Run tests.', '--allow-pinned-tests',
+                    ])
+                    self.assertIsNone(captured_test_configs[-1])
+
     def test_approval_is_single_use_and_exact_scope_is_enforced_at_run(self):
         with self.patched_launcher()[0], self.patched_launcher()[1]:
             approved = self.run_cli([
