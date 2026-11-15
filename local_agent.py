@@ -393,6 +393,28 @@ def validate_native_tool_calls(calls, allowed_tools):
             raise AgentError('Native tool is not currently permitted.')
 
         args = fn.get('arguments', {})
+        schema = schemas[name]
+        properties = schema['properties']
+
+        # Some local models incorrectly put a JSON-encoded argument object
+        # inside a second `arguments` property. Unwrap only that exact,
+        # single-property shape when it cannot be a declared tool parameter;
+        # the decoded object still goes through the normal schema checks.
+        if (
+            isinstance(args, dict)
+            and set(args) == {'arguments'}
+            and 'arguments' not in properties
+            and isinstance(args['arguments'], str)
+        ):
+            wrapped = args['arguments']
+            if len(wrapped.encode('utf-8')) > 16384:
+                raise AgentError('Native tool arguments too large.')
+            try:
+                args = json.loads(wrapped)
+            except (ValueError, TypeError):
+                raise AgentError('Invalid wrapped native tool JSON.')
+            if not isinstance(args, dict):
+                raise AgentError('Wrapped native tool arguments must be an object.')
 
         if isinstance(args, str):
             if len(args.encode('utf-8')) > 16384:
@@ -405,8 +427,6 @@ def validate_native_tool_calls(calls, allowed_tools):
         if not isinstance(args, dict):
             raise AgentError('Native tool arguments must be an object.')
 
-        schema = schemas[name]
-        properties = schema['properties']
         required = schema['required']
 
         if any(key not in properties for key in args):

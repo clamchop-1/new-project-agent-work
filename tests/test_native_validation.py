@@ -38,12 +38,38 @@ class NativeValidationTests(unittest.TestCase):
                 })], TOOLS
             )
 
-    def test_nested_arguments_wrapper_is_rejected(self):
+    def test_single_nested_arguments_wrapper_is_unwrapped_and_validated(self):
+        result = validate_native_tool_calls(
+            [call('finish', {
+                'arguments': '{"summary":"Done","unfinished":[],"next_actions":[]}'
+            })],
+            TOOLS,
+        )
+        self.assertEqual(
+            result[0]['function']['arguments'],
+            {'summary': 'Done', 'unfinished': [], 'next_actions': []},
+        )
+
+    def test_nested_arguments_wrapper_rejects_invalid_inner_schema(self):
+        with self.assertRaisesRegex(AgentError, 'Missing required native tool argument'):
+            validate_native_tool_calls(
+                [call('finish', {'arguments': '{"summary":"Done"}'})],
+                TOOLS,
+            )
+
+    def test_nested_arguments_wrapper_does_not_allow_extra_inner_fields(self):
         with self.assertRaisesRegex(AgentError, 'Unexpected native tool argument'):
             validate_native_tool_calls(
-                [call('finish', {
-                    'arguments': '{"summary":"Done","unfinished":[],"next_actions":[]}'
+                [call('read_file', {
+                    'arguments': '{"path":"calculator.py","command":"dir"}'
                 })],
+                TOOLS,
+            )
+
+    def test_nested_arguments_wrapper_requires_json_object(self):
+        with self.assertRaisesRegex(AgentError, 'Wrapped native tool arguments must be an object'):
+            validate_native_tool_calls(
+                [call('list_files', {'arguments': '[]'})],
                 TOOLS,
             )
 
