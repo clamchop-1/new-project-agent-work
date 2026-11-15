@@ -55,3 +55,23 @@ Final runs: `20261114T230240415856Z-2bce3baf` (7.25 seconds) and `20261114T23024
 Final suite: 140 tests run, one existing Windows symlink-privilege skip, no failures/errors. Seven history regressions supplement the eleven path-presentation regressions. Fixture source/private data and original reference history stayed unchanged. Earlier incomplete trials remain preserved.
 
 Local details: `.local/step58/QWEN_CONTINUATION_REPORT.md`, `.local/step58/live-validation-e55211888c6f.json`, and exact model-message/replay captures in the same directory. Cross-platform architecture assessment and migration proposal: `ARCHITECTURE_ASSESSMENT.md`. No architecture implementation, commit, or push occurred.
+
+## Windows continuation comparison — 2026-11-15
+
+All runs used the same bounded read-only task on `LocalAgentRepairFixture`: read the five named files, run the pinned tests, report `MAPLE-427`, and make no edits. The fixture began and ended with the existing `M calculator.py` and `?? stats.py` status. All listed runs used local Ollama, no write permit, and no cloud fallback.
+
+| Model / run | Tools and tests | Marker in final summary | Agent time | Assessment |
+|---|---|---:|---:|---|
+| `qwen2.5-coder:7b-instruct` / `20261115T004026683726Z-98756c18` | Five reads; 3/3 tests | Yes | 7.41 s | Task requirements reported |
+| `qwen2.5-coder:7b-instruct` / `20261115T010627642818Z-fde3016c` | Five reads; 3/3 tests | No; despite marker being present in the AGENTS.md receipt | 7.28 s | Objective-reporting miss |
+| `qwen2.5-coder:7b-instruct` / `20261115T010845789663Z-02ba678a` | Five reads; 3/3 tests | No; despite marker being present in the AGENTS.md receipt | 7.94 s | Objective-reporting miss |
+| `qwen3:8b` / `20261115T010707679742Z-ae7e1d87` | Five reads; 3/3 tests | Yes | 36.09 s | Task requirements reported |
+
+The Qwen2.5 runs all produced valid tool calls and passing test receipts, but only one of these three summaries reported the requested marker. Both observed Qwen3:8B runs (including the earlier 20.78-second run above) reported it. These are small samples and do not establish general reliability. `completed_verified` currently reflects the passing test receipt; it does not prove every natural-language task requirement was satisfied. Inspect the actual read and test receipts when evaluating task completion.
+
+The no-config fallback is now `qwen3:8b`. Qwen3:8B followed the marker instruction in two read-only runs and completed the authorized edit/test trial below. Qwen2.5-Coder is retained as the coding-router fallback because it is faster on the bounded fixture, but it omitted the requested marker in two of three read-only samples. Qwen3.5 is excluded from automatic routing after repeated invalid native finish arguments. These are small, task-specific samples; the default remains subject to broader evaluation.
+## Authorized Qwen3:8B edit trial - 2026-11-15
+
+A fresh Git fixture under `.local/tests/repair-trial-20261115T011541499861Z/repo` received a single-use permit bound to its initial Git state and limited to `calculator.py` and `stats.py`. Qwen3:8B repaired `average`, created `clamp`, and used the pinned-test capability three times: the first run exposed the remaining implementation issues, the next exposed the missing `stats.py`, and the final run passed all three tests. It reported `MAPLE-427`; the verified result is `completed_verified` after 12 steps and 40.94 seconds, with no unpermitted writes or cloud fallback. The disposable repo's only source changes are the two permitted files. Evidence: `.local/runs/20261115T011554549282Z-fa75773a/execution/`.
+
+An earlier trial under `.local/host-validation/` correctly had no pinned-test capability because that path is outside the approved fixture layout; it stopped as `completed_not_tested`. It is preserved at `.local/runs/20261115T011423653157Z-7d690a4a/execution/` and is not counted as a coding pass.

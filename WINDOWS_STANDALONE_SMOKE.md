@@ -34,7 +34,7 @@ the installed local Ollama model. It does not authorize source writes.
    ollama list
    ```
 
-   Select an installed model such as `qwen3.5:4b`; do not assume the configured
+   Select an installed model such as `qwen3:8b`; do not assume the configured
    default is installed.
 
 3. Verify the fixture registration before running it:
@@ -50,7 +50,7 @@ the installed local Ollama model. It does not authorize source writes.
 4. Run the bounded read-only acceptance task with the installed model:
 
    ```powershell
-   & .\Start-LocalCodingAgent.cmd --project LocalAgentRepairFixture --model qwen2.5-coder:7b-instruct --task "Read AGENTS.md, README.md, calculator.py, stats.py, and tests/test_stats.py. Run only the approved pinned tests. Report marker MAPLE-427 and summarize the observed results. Do not modify files."
+   & .\Start-LocalCodingAgent.cmd --project LocalAgentRepairFixture --model qwen3:8b --task "Read AGENTS.md, README.md, calculator.py, stats.py, and tests/test_stats.py. Run only the approved pinned tests. Report marker MAPLE-427 and summarize the observed results. Do not modify files."
    ```
 
    No write permit is supplied. Do not add one for this check. The only test
@@ -110,3 +110,9 @@ This validates the Windows standalone launcher and provider path for one model
 and one fixture task. Qwen 3.5's repeated formatting failure is model-specific
 evidence; the added guidance did not correct it. Do not relax native tool-call
 validation to turn its failed runs into passes.
+
+## Native Codex host-gate follow-up — 2026-11-15
+
+The disposable filesystem sentinels passed: outside read/write and writes to `AGENTS.md` and `.git/config` were blocked, while the explicitly approved source write was available. The local Codex edit step did not start successfully. With Qwen2.5 configured, the Codex CLI reported missing model metadata and Ollama rejected its 4,475-token request against an available 4,096-token context. Setting `model_context_window` to 4,096 did not change the request. The gate therefore failed before any model edits; its follow-on tests also failed because `stats.py` had not been created. Existing projects and system settings were unchanged, cloud fallback was false, and the disposable run receipts remain in `.local/host-validation/20261115T005930465282Z/` and `.local/host-validation/20261115T011017159573Z/`.
+
+This is a limitation of the native Codex-to-Ollama gate in this configuration. The direct LocalCodingAgent Ollama path separately completed the bounded read-only workflow. Do not interpret this gate failure as a Qwen model installation failure or relax its filesystem sentinels.

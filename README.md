@@ -8,7 +8,7 @@ this repository: source is presently uncommitted/untracked and evidence is priva
 ## Launch local Qwen
 
 In normal PowerShell, this uses the existing Ollama server and installed
-`qwen3.5:4b`, with bounded repository tools and **read-only takeover by default**:
+`qwen3:8b`, with bounded repository tools and **read-only takeover by default**:
 
 ```powershell
 & 'D:\Workspaces\LocalCodingAgent\Start-LocalCodingAgent.cmd' --project KronosStage
@@ -31,7 +31,7 @@ Git because project roots and local model preferences belong to each installatio
 Without it, Windows keeps the established project names and roots. On macOS and
 other POSIX hosts, the current LocalCodingAgent checkout is the only default project;
 add other authorized project roots to the host-local configuration. The default model
-qwen3.5:4b and the Ollama endpoint remain loopback-only.
+qwen3:8b and the Ollama endpoint remain loopback-only.
 A configured project uses a stable lowercase
 ID independent of its local checkout path:
 
@@ -50,7 +50,7 @@ ID independent of its local checkout path:
   },
   "inference": {
     "provider": "ollama",
-    "model": "qwen3.5:4b",
+    "model": "qwen3:8b",
     "endpoint": "http://127.0.0.1:11434"
   }
 }

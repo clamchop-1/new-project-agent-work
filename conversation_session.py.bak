@@ -1,0 +1,56 @@
+﻿"""Bounded, project-specific conversational context.
+
+This is untrusted conversation history, not authoritative project memory.
+"""
+
+import json
+import re
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+SESSION_DIR = ROOT / ".local" / "sessions"
+
+MAX_TURNS = 8
+MAX_CHARS = 12000
+
+
+def session_path(project):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", project):
+        raise ValueError("Invalid project identifier")
+    return SESSION_DIR / f"{project}.json"
+
+
+def load_session(project):
+    path = session_path(project)
+    if not path.exists():
+        return []
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, list):
+        raise ValueError("Invalid session data")
+
+    return data[-MAX_TURNS:]
+
+
+def save_session(project, turns):
+    path = session_path(project)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    bounded = turns[-MAX_TURNS:]
+    while len(json.dumps(bounded, ensure_ascii=False)) > MAX_CHARS:
+        if not bounded:
+            break
+        bounded.pop(0)
+
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(bounded, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def clear_session(project):
+    path = session_path(project)
+    if path.exists():
+        path.unlink()

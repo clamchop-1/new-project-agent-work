@@ -1,4 +1,4 @@
-﻿import unittest
+import unittest
 from unittest.mock import patch
 import model_router
 from model_router import choose_model, get_models
@@ -14,10 +14,17 @@ MODELS = [
 class ModelRouterTests(unittest.TestCase):
     def test_coding_task(self):
         result = choose_model(MODELS, "Write Python unit tests")
-        self.assertEqual(result["model"], "qwen2.5-coder:7b-instruct")
+        self.assertEqual(result["model"], "qwen3:8b")
         self.assertEqual(result['provider'], 'ollama')
         self.assertFalse(result["cloud_used"])
 
+    def test_coding_falls_back_to_qwen25_if_qwen3_unavailable(self):
+        result = choose_model(["qwen2.5-coder:7b-instruct"], "Write Python tests")
+        self.assertEqual(result["model"], "qwen2.5-coder:7b-instruct")
+
+    def test_qwen35_is_not_automatically_routed(self):
+        with self.assertRaises(RuntimeError):
+            choose_model(["qwen3.5:4b"], "Write Python tests")
     def test_model_discovery_uses_configured_provider_contract(self):
         provider = type('FakeProvider', (), {
             'models': lambda self: [{'name': 'qwen3.5:4b'}],
@@ -54,7 +61,7 @@ class ModelRouterTests(unittest.TestCase):
 
     def test_general_assistance(self):
         result = choose_model(MODELS, "Explain this project")
-        self.assertEqual(result["model"], "qwen3.5:4b")
+        self.assertEqual(result["model"], "qwen3:8b")
 
     def test_missing_models_fail_closed(self):
         with self.assertRaises(RuntimeError):

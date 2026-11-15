@@ -21,10 +21,10 @@ def choose_model(models, task, provider_name='ollama'):
         preferences = ["qwen3.8:27b", "deepseek-r1:8b", "qwen3:8b"]
         category = "complex reasoning"
     elif any(word in task for word in ("code", "python", "function", "refactor", "test")):
-        preferences = ["qwen2.5-coder:7b-instruct", "qwen3.5:4b", "qwen3:8b"]
+        preferences = ["qwen3:8b", "qwen2.5-coder:7b-instruct"]
         category = "coding"
     else:
-        preferences = ["qwen3.5:4b", "qwen3:4b", "llama3.2:3b"]
+        preferences = ["qwen3:8b", "qwen3:4b", "llama3.2:3b", "qwen2.5-coder:7b-instruct"]
         category = "general assistance"
 
     selected = next((model for model in preferences if model in models), None)

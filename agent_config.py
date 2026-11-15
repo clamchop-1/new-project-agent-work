@@ -10,7 +10,7 @@ from agent_core import AgentError
 
 CONFIG_VERSION = 1
 PROJECT_ID = re.compile(r'[a-z][a-z0-9_-]{2,63}\Z')
-DEFAULT_MODEL = 'qwen3.5:4b'
+DEFAULT_MODEL = 'qwen3:8b'
 DEFAULT_ENDPOINT = 'http://127.0.0.1:11434'
 
 

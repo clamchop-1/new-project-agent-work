@@ -1,0 +1,87 @@
+"""Restricted pure-Python fixture executor, not a general OS sandbox.
+
+Only pinned tests and AST-validated, import-free pure functions are supported.
+General repository test/shell execution is deliberately refused without a qualified
+external sandbox. This narrow executor proves the edit/test loop safely here.
+"""
+import ast
+import hashlib
+import json
+from pathlib import Path
+import sys
+import types
+import unittest
+
+
+SAFE_BUILTINS = {'sum': sum, 'len': len, 'min': min, 'max': max, 'abs': abs,
+                 'ValueError': ValueError, 'TypeError': TypeError}
+ALLOWED = (ast.Module, ast.FunctionDef, ast.arguments, ast.arg, ast.Return, ast.If,
+           ast.Raise, ast.Expr, ast.Constant, ast.Name, ast.Load,
+           ast.BinOp, ast.UnaryOp, ast.BoolOp, ast.Compare, ast.Call,
+           ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv,
+           ast.Mod, ast.USub, ast.UAdd, ast.Not, ast.And, ast.Or, ast.Eq, ast.NotEq,
+           ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Is, ast.IsNot)
+
+
+def validate_source(text):
+    tree = ast.parse(text)
+    if len(list(ast.walk(tree))) > 1000:
+        raise ValueError('Pure fixture source exceeds AST limit')
+    functions = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
+    if functions & set(SAFE_BUILTINS):
+        raise ValueError('Pure fixtures cannot shadow approved builtins')
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef) and not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)):
+            raise ValueError('Only pure function definitions and a module docstring are allowed')
+    for node in ast.walk(tree):
+        if not isinstance(node, ALLOWED):
+            raise ValueError('Unsupported pure-fixture syntax: ' + type(node).__name__)
+        if isinstance(node, ast.Name) and node.id.startswith('__'):
+            raise ValueError('Dunder access rejected')
+        if isinstance(node, ast.FunctionDef):
+            if node.decorator_list or node.returns or any(a.annotation for a in node.args.args):
+                raise ValueError('Decorators/annotations are outside the pure-fixture contract')
+        if isinstance(node, ast.Constant):
+            if type(node.value) in (int, float) and abs(node.value) > 1000000:
+                raise ValueError('Pure-fixture constant too large')
+            if isinstance(node.value, str) and len(node.value) > 2000:
+                raise ValueError('Pure-fixture string too large')
+            if isinstance(node.value, str):
+                parent = parents.get(node)
+                is_doc = isinstance(parent, ast.Expr)
+                is_error = isinstance(parent, ast.Call) and isinstance(parent.func, ast.Name) and parent.func.id in ('ValueError', 'TypeError')
+                if not is_doc and not is_error:
+                    raise ValueError('String/container construction is outside the numeric fixture contract')
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name) or node.func.id not in SAFE_BUILTINS:
+                raise ValueError('Only explicitly safe builtins may be called; no recursion/import/IO')
+    return tree
+
+
+def main():
+    root = Path(sys.argv[1]).resolve()
+    config = json.loads(Path(sys.argv[2]).read_bytes())
+    test = root / config['test_file']
+    if hashlib.sha256(test.read_bytes()).hexdigest() != config['test_sha256']:
+        raise ValueError('Pinned test changed; refusing execution')
+    for name in config['modules']:
+        source = root / (name + '.py')
+        if not source.is_file():
+            continue  # Trusted unittest reports the actual missing-module failure.
+        tree = validate_source(source.read_text(encoding='utf-8'))
+        module = types.ModuleType(name)
+        namespace = {'__builtins__': dict(SAFE_BUILTINS), '__name__': name}
+        exec(compile(tree, str(source), 'exec'), namespace)
+        module.__dict__.update(namespace)
+        sys.modules[name] = module
+    # Tests are authored/reviewed by the operator and pinned before model execution.
+    # Models cannot edit this file or choose another test module through this tool.
+    spec = types.ModuleType('approved_fixture_tests')
+    exec(compile(test.read_bytes(), str(test), 'exec'), spec.__dict__)
+    result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromModule(spec))
+    return 0 if result.wasSuccessful() else 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

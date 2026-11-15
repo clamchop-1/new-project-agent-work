@@ -19,7 +19,7 @@ ROOT=Path(__file__).resolve().parent
 
 
 def main():
-    model='qwen3.5:4b'
+    model='qwen2.5-coder:7b-instruct'
     identity=Ollama().model(model)
     base=ROOT/'.local/host-validation'/datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
     base.mkdir(parents=True)
@@ -42,9 +42,9 @@ except OSError: checks['approved_source_write_available']=False
 print(json.dumps(checks));sys.exit(0 if all(checks.values()) else 3)
 ''',encoding='utf-8')
     python_root=Path(sys.executable).parent
-    config='''model = "qwen3.5:4b"
+    config='''model = "qwen2.5-coder:7b-instruct"
 model_provider = "local_ollama"
-model_context_window = 32768
+model_context_window = 4096
 approval_policy = "never"
 web_search = "disabled"
 default_permissions = "fixture"

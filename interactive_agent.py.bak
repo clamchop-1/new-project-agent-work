@@ -1,0 +1,90 @@
+﻿"""Interactive, read-only terminal for LocalCodingAgent."""
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+PROJECTS = (
+    "LocalAgentSandbox",
+    "KronosStage",
+    "PhotoLibraryTools",
+    "PhotoLibraryPlanning",
+)
+
+def main():
+    project = "LocalAgentSandbox"
+    model = "auto"
+
+    print("\nLocalCodingAgent — Interactive Terminal")
+    print("Local inference | Read-only | Cloud disabled")
+    print("Type /help for commands.\n")
+
+    while True:
+        try:
+            line = input(f"[{project} | {model}] > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nGoodbye.")
+            break
+
+        if not line:
+            continue
+
+        if line in ("/exit", "/quit"):
+            print("Goodbye.")
+            break
+
+        if line == "/help":
+            print("/projects  /project NAME  /model NAME  /status  /exit")
+            print("Or type a natural-language task.")
+            continue
+
+        if line == "/projects":
+            for name in PROJECTS:
+                print((" * " if name == project else "   ") + name)
+            continue
+
+        if line.startswith("/project "):
+            candidate = line.split(" ", 1)[1].strip()
+            if candidate not in PROJECTS:
+                print("Unknown project. Use /projects.")
+            else:
+                project = candidate
+                print(f"Selected project: {project}")
+            continue
+
+        if line.startswith("/model "):
+            candidate = line.split(" ", 1)[1].strip()
+            if not candidate:
+                print("Specify a model name or auto.")
+            else:
+                model = candidate
+                print(f"Selected model: {model}")
+            continue
+
+        if line == "/status":
+            print(f"Project: {project}")
+            print(f"Model: {model}")
+            print("Endpoint: http://127.0.0.1:11434")
+            print("Mode: Read-only")
+            print("Cloud: Disabled")
+            continue
+
+        if line.startswith("/"):
+            print("Unknown command. Type /help.")
+            continue
+
+        command = [
+            sys.executable,
+            str(ROOT / "agent.py"),
+            "run",
+            "--project", project,
+            "--model", model,
+            "--task", line,
+        ]
+
+        print("\nRunning local agent...\n", flush=True)
+        subprocess.run(command, cwd=str(ROOT), check=False)
+        print()
+
+if __name__ == "__main__":
+    main()

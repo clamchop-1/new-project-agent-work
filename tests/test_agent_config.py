@@ -48,6 +48,7 @@ class AgentConfigTests(unittest.TestCase):
         self.assertEqual(config['projects']['photolibrarytools'],
                          {'name': 'PhotoLibraryTools', 'root': 'D:/Photos'})
         self.assertEqual(config['projects']['localagentsandbox']['name'], 'LocalAgentSandbox')
+        self.assertEqual(DEFAULT_MODEL, 'qwen3:8b')
         self.assertEqual(config['inference']['model'], DEFAULT_MODEL)
         self.assertEqual(config['inference']['endpoint'], DEFAULT_ENDPOINT)
         self.assertEqual(selector_map(config)['PhotoLibraryTools'], 'photolibrarytools')
