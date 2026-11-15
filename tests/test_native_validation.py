@@ -38,6 +38,15 @@ class NativeValidationTests(unittest.TestCase):
                 })], TOOLS
             )
 
+    def test_nested_arguments_wrapper_is_rejected(self):
+        with self.assertRaisesRegex(AgentError, 'Unexpected native tool argument'):
+            validate_native_tool_calls(
+                [call('finish', {
+                    'arguments': '{"summary":"Done","unfinished":[],"next_actions":[]}'
+                })],
+                TOOLS,
+            )
+
     def test_wrong_type(self):
         with self.assertRaises(AgentError):
             validate_native_tool_calls(

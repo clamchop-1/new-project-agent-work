@@ -89,12 +89,15 @@ The `py` launcher returned `No installed Python found` for a full `run --project
 ...` invocation. This launcher issue was avoided by using the supported
 `Start-LocalCodingAgent.cmd`, which pins Python 3.12.
 
-Two Qwen 3.5 attempts (direct Python 3.14 and the `.cmd` launcher) read all five
-files and passed all three pinned tests. Both then emitted a native `finish`
-call with the summary nested under an unexpected `arguments` field. Strict
-validation rejected each call, and both runs were recorded as failed. Evidence:
+Three Qwen 3.5 attempts (direct Python 3.14 and two `.cmd` runs) read all five
+files and passed the pinned tests. All three then emitted a native `finish` call
+with the summary nested under an unexpected `arguments` field. The third attempt
+followed a more explicit system instruction for native argument shape; it still
+made the same error. Strict validation rejected each call, and the runs were
+recorded as failed. Evidence:
 `.local/runs/20261115T003851003549Z-725aecbd/execution/` and
-`.local/runs/20261115T004009998701Z-4f97e3c3/execution/`.
+`.local/runs/20261115T004009998701Z-4f97e3c3/execution/` and
+`.local/runs/20261115T004354044027Z-ff420068/execution/`.
 
 The Qwen 2.5 Coder run through the `.cmd` launcher completed the same task in
 seven steps: all five reads, three passing pinned tests, marker `MAPLE-427`, and
@@ -104,5 +107,6 @@ The fixture's pre-existing `M calculator.py` and `?? stats.py` status remained
 unchanged throughout.
 
 This validates the Windows standalone launcher and provider path for one model
-and one fixture task. The Qwen 3.5 formatting failure is model-specific evidence;
-do not relax native tool-call validation to turn its failed runs into passes.
+and one fixture task. Qwen 3.5's repeated formatting failure is model-specific
+evidence; the added guidance did not correct it. Do not relax native tool-call
+validation to turn its failed runs into passes.

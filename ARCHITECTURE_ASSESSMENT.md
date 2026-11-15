@@ -259,7 +259,7 @@ loopback endpoint policy is unchanged; no native macOS run has occurred.
 Automatic model discovery now uses that provider contract and records the
 configured provider identifier in routing output. Remote endpoints and provider
 fallback remain disabled. Routing filters cloud and Ollama remote-model entries
-before selection. The Windows suite passed 160 tests with one symlink-privilege
+before selection. The Windows suite passed 161 tests with one symlink-privilege
 skip; native macOS execution remains unverified.
 
 ## Windows standalone readiness review
@@ -281,5 +281,7 @@ Python 3.12 `.cmd` launcher completed and verified with Qwen 2.5 Coder: five fil
 reads, three passing pinned tests, and marker `MAPLE-427`; zero writes and no cloud
 fallback. Two Qwen 3.5 attempts also completed the reads and tests but failed on
 an invalid nested native finish argument, which the strict validator correctly
-rejected. Evidence and limits are recorded in `WINDOWS_STANDALONE_SMOKE.md`; one
-model/task success does not establish general reliability.
+rejected. A third attempt after adding a direct native-argument instruction
+repeated the failure. Evidence and limits are recorded in
+`WINDOWS_STANDALONE_SMOKE.md`; one model/task success does not establish general
+reliability.
