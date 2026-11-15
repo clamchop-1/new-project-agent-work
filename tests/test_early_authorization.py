@@ -1,5 +1,8 @@
-﻿import subprocess
+import json
+import os
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -8,20 +11,36 @@ AGENT = ROOT / "agent.py"
 
 
 def invoke(*args):
-    return subprocess.run(
-        [sys.executable, str(AGENT), *args],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        timeout=15
-    )
+    with tempfile.TemporaryDirectory() as temporary:
+        config_path = Path(temporary) / 'agent-config.json'
+        config_path.write_text(json.dumps({
+            'version': 1,
+            'projects': {
+                'kronosstage': {'name': 'KronosStage', 'root': str(ROOT)},
+                'localagentsandbox': {'name': 'LocalAgentSandbox', 'root': str(ROOT)},
+            },
+            'inference': {
+                'provider': 'ollama',
+                'model': 'qwen3.5:4b',
+                'endpoint': 'http://127.0.0.1:11434',
+            },
+        }), encoding='utf-8')
+        environment = dict(os.environ)
+        environment['LOCAL_CODING_AGENT_CONFIG'] = str(config_path)
+        return subprocess.run(
+            [sys.executable, str(AGENT), *args],
+            cwd=ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
 
 
 class EarlyAuthorizationTests(unittest.TestCase):
 
     def assert_blocked_early(self, result, expected):
         output = result.stdout + result.stderr
-
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(expected, output)
         self.assertNotIn("LOCAL MODEL ROUTING", output)
@@ -29,52 +48,38 @@ class EarlyAuthorizationTests(unittest.TestCase):
 
     def test_production_conversation_blocked(self):
         result = invoke(
-            "run",
-            "--project", "KronosStage",
-            "--model", "auto",
-            "--conversation",
-            "--task", "Do not modify anything."
+            "run", "--project", "KronosStage", "--model", "auto",
+            "--conversation", "--task", "Do not modify anything."
         )
         self.assert_blocked_early(
-            result,
-            "Conversation history is currently sandbox-only."
+            result, "Conversation history is currently sandbox-only."
         )
 
     def test_conversation_with_write_path_blocked(self):
         result = invoke(
-            "run",
-            "--project", "LocalAgentSandbox",
-            "--conversation",
-            "--write-path", "calculator.py",
-            "--task", "Do not modify anything."
+            "run", "--project", "LocalAgentSandbox", "--conversation",
+            "--write-path", "calculator.py", "--task", "Do not modify anything."
         )
         self.assert_blocked_early(
-            result,
-            "Conversation history cannot be combined with write permits."
+            result, "Conversation history cannot be combined with write permits."
         )
 
     def test_conversation_with_permit_blocked(self):
         result = invoke(
-            "run",
-            "--project", "LocalAgentSandbox",
-            "--conversation",
+            "run", "--project", "LocalAgentSandbox", "--conversation",
             "--permit", "nonexistent-permit.json",
             "--task", "Do not modify anything."
         )
         self.assert_blocked_early(
-            result,
-            "Conversation history cannot be combined with write permits."
+            result, "Conversation history cannot be combined with write permits."
         )
 
     def test_conversation_on_inspect_blocked(self):
         result = invoke(
-            "inspect",
-            "--project", "LocalAgentSandbox",
-            "--conversation"
+            "inspect", "--project", "LocalAgentSandbox", "--conversation"
         )
         self.assert_blocked_early(
-            result,
-            "Conversation history is supported only for run actions."
+            result, "Conversation history is supported only for run actions."
         )
 
 

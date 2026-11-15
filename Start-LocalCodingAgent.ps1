@@ -1,6 +1,8 @@
-param([ValidateSet('KronosStage','PhotoLibraryTools','PhotoLibraryPlanning')][string]$Project='KronosStage',
+param([string]$Project='KronosStage',
       [string]$Task='Perform a read-only takeover. Explain the architecture, current hold/task and next safe step.',
-      [string]$Model='qwen3.5:4b')
+      [string]$Model)
 $ErrorActionPreference='Stop'
-& (Join-Path $PSScriptRoot 'Start-LocalCodingAgent.cmd') --project $Project --task $Task --model $Model
+$arguments = @('--project', $Project, '--task', $Task)
+if ($Model) { $arguments += @('--model', $Model) }
+& (Join-Path $PSScriptRoot 'Start-LocalCodingAgent.cmd') @arguments
 exit $LASTEXITCODE

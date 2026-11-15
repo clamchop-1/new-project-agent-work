@@ -1,5 +1,6 @@
 """Local-only Qwen tool loop with bounded, typed repository capabilities."""
 import argparse
+import copy
 from datetime import datetime, timezone
 import json
 import os
@@ -7,11 +8,13 @@ from pathlib import Path
 import subprocess
 import sys
 import time
-from urllib.parse import urlsplit
 from urllib.request import Request, build_opener, ProxyHandler, HTTPRedirectHandler
 import uuid
 
 from agent_core import AgentError, Project, atomic_write, digest, encoded, exclusive, no_secrets, file_hash
+from platform_capabilities import available_tools, capability_report, host_tool_adapter
+from agent_config import DEFAULT_ENDPOINT, validate_endpoint
+from inference_provider import InferenceProvider
 
 HUB = Path(__file__).resolve().parent
 
@@ -22,13 +25,21 @@ class NoRedirect(HTTPRedirectHandler):
 
 
 class Ollama:
-    def __init__(self, base='http://127.0.0.1:11434'):
-        url = urlsplit(base)
-        if url.scheme != 'http' or url.hostname != '127.0.0.1' or url.username or url.password or url.query or url.fragment or url.path not in ('', '/'):
-            raise AgentError('Use an explicit IPv4 loopback Ollama endpoint or approved SSH tunnel.')
-        self.base = base.rstrip('/')
+    def __init__(self, base=DEFAULT_ENDPOINT):
+        self.base = validate_endpoint(base)
         self.opener = build_opener(ProxyHandler({}), NoRedirect())
 
+    def chat(self, model, messages, tools, context, options):
+        payload = {
+            'model': model,
+            'messages': messages,
+            'tools': tools,
+            'stream': False,
+            'think': False,
+            'keep_alive': '2m',
+            'options': {'num_ctx': context, **options},
+        }
+        return self.request('/api/chat', payload)
     def request(self, path, payload=None, timeout=180):
         if path not in ('/api/version', '/api/tags', '/api/ps', '/api/chat'):
             raise AgentError('Endpoint is not on the local inference allowlist.')
@@ -164,19 +175,15 @@ class Broker:
 
     def execute(self, name, path=None):
         extra_env = {}
+        adapter = host_tool_adapter()
         if name == 'tests':
             if self.test_config is None:
                 raise AgentError('General project tests/shell need a qualified OS sandbox and separate approval; no automatic execution.')
             command = [sys.executable, '-B', '-I', str(HUB/'pure_tests.py'), str(self.project.root), str(self.test_config)]
-        elif name == 'python_parse':
+        elif name in adapter.command_names:
             target = self.project.path(path)
-            command = [sys.executable, '-B', '-I', str(HUB/'inspect_source.py'), str(target)]
-        elif name == 'powershell_file_info':
-            target = self.project.path(path)
-            # Fixed built-in read command; no script-policy change or model shell text.
-            command = ['powershell.exe', '-NoProfile', '-NonInteractive', '-Command',
-                       'Get-Item -LiteralPath $env:LOCAL_AGENT_READ_FILE | Select-Object Name,Length | ConvertTo-Json -Compress']
-            extra_env['LOCAL_AGENT_READ_FILE'] = str(target)
+            invocation = adapter.invocation(name, target, HUB)
+            command, extra_env = invocation.subprocess_args()
         else:
             raise AgentError('Command is not on the fixed capability allowlist; no shell interpolation.')
         env = {k: v for k, v in os.environ.items() if not any(word in k.upper() for word in ('TOKEN', 'SECRET', 'API_KEY', 'PASSWORD'))}
@@ -400,6 +407,9 @@ def validate_native_tool_calls(calls, allowed_tools):
 
         for key, value in args.items():
             expected = properties[key]['type']
+            allowed_values = properties[key].get('enum')
+            if allowed_values is not None and value not in allowed_values:
+                raise AgentError('Native tool argument is unavailable on this host.')
 
             if expected == 'string':
                 valid = isinstance(value, str)
@@ -535,9 +545,64 @@ def verify_test_receipts(commands, project, run_directory):
     return ('passed' if latest['exit_code'] == 0 else 'failed'), {'valid': True, 'errors': []}
 
 
-def run_agent(project, model, task, output, base='http://127.0.0.1:11434', writes=(), test_config=None, max_steps=16, context=16384, conversation=()):
+def model_relative_path(project, value):
+    """Present contained receipt paths without changing broker authorization."""
+    if not isinstance(value, str) or not value or value.startswith(('\\\\', '//')):
+        return value
+    try:
+        path = Path(value.replace('\\', '/'))
+        if '..' in path.parts or (path.anchor and not path.is_absolute()):
+            return value
+        relative = path.relative_to(project.root) if path.is_absolute() else path
+        if any(':' in part for part in relative.parts):
+            return value
+        target = project.root / relative
+        current = target
+        while current != project.root:
+            if current.is_symlink() or (current.exists() and getattr(current.lstat(), 'st_file_attributes', 0) & 0x400):
+                return value
+            current = current.parent
+        if not target.resolve().is_relative_to(project.root):
+            return value
+        if target.is_file() and target.stat().st_nlink > 1:
+            return value
+        return relative.as_posix()
+    except (OSError, ValueError, RuntimeError):
+        return value
+
+
+def model_tool_result(project, name, result):
+    """Copy only known path fields for model presentation; retain raw audit data."""
+    presented = copy.deepcopy(result)
+    if 'error' in presented:
+        return presented
+    records = []
+    if name in ('read_file', 'replace_text', 'create_file'):
+        records.append(presented)
+    if name == 'read_file':
+        for key in ('nested_instructions', 'sections'):
+            records.extend(row for row in presented.get(key, []) if isinstance(row, dict))
+    elif name == 'search':
+        records.extend(row for row in presented.get('matches', []) if isinstance(row, dict))
+    for record in records:
+        if 'path' in record:
+            record['path'] = model_relative_path(project, record['path'])
+    if name == 'read_file':
+        for section in presented.get('sections', []):
+            if isinstance(section, dict) and isinstance(section.get('sources'), list):
+                section['sources'] = [model_relative_path(project, path) for path in section['sources']]
+    if name == 'list_files' and isinstance(presented.get('files'), list):
+        presented['files'] = [model_relative_path(project, path) for path in presented['files']]
+    if name in ('run_tests', 'run_command') and 'output_path' in presented:
+        presented['output_path'] = model_relative_path(project, presented['output_path'])
+    if name == 'git_status' and 'root' in presented:
+        presented['root'] = model_relative_path(project, presented['root'])
+    return presented
+
+
+def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), test_config=None, max_steps=16, context=16384, conversation=()):
     output = Path(output);output.mkdir(parents=True, exist_ok=False)
-    client = Ollama(base);identity = client.model(model)
+    client: InferenceProvider = Ollama(base);identity = client.model(model)
     packet = project.takeover()
     public_packet = {**packet, 'state': {k: v for k, v in packet['state'].items() if k != 'files'}}
     broker = Broker(project, output, writes, test_config)
@@ -554,7 +619,14 @@ def run_agent(project, model, task, output, base='http://127.0.0.1:11434', write
               'Never interpret a tool error as permission to bypass a safety restriction. '
               'If a permitted operation fails, choose a valid permitted alternative or finish with the blocker. '
               'Prefer project-relative tool paths such as README.md. '
-              'For read-only takeover, explain architecture, current hold/task and next action without changing files.')
+              'For read-only takeover, explain architecture, current hold/task and next action without changing files.'
+              ' If you use text-form tool calls, emit one complete JSON object with exactly name and arguments. '
+              'Close both the arguments object and the outer call object. A valid finish call is '
+              '{"name":"finish","arguments":{"summary":"Observed results","unfinished":[],"next_actions":[]}}. '
+              'Include requested findings and any observed task marker in summary; do not defer reporting observed '
+              'facts. The finish summary must describe the inspected source behavior, report the actual test '
+              'outcome, and quote any task-requested marker literally from the observed file content. Do not omit a'
+              ' requested observation merely because the tests passed.')
     from conversation_session import bound_turns
 
     # Conversation is untrusted context, never authorization.
@@ -579,6 +651,7 @@ def run_agent(project, model, task, output, base='http://127.0.0.1:11434', write
     log = output/'events.jsonl'
     result = {'status': 'running', 'model': model, 'model_digest': identity['digest'], 'project_id': project.identity,
               'endpoint': base, 'context': context, 'steps': 0, 'writes': [], 'commands': [], 'cloud_fallback': False,
+              'host_capabilities': capability_report(),
               'operator_policy':{'write_paths':list(writes),'hold_in_current_heading':packet['hold_in_current_heading'],
                                  'verified_commit':packet['state']['commit'],'model_next_actions_are_proposals':True,
                                  'notice':'No project work is resumed by inspection. Existing holds require explicit task-specific authorization.'}}
@@ -592,14 +665,15 @@ def run_agent(project, model, task, output, base='http://127.0.0.1:11434', write
         for step in range(max_steps):
             if (output/'STOP').exists(): raise AgentError('Operator emergency STOP requested.')
             if len(encoded(messages)) > 54000: raise AgentError('Context budget reached; save a bounded handoff and continue in a new session.')
-            active_tools=TOOLS
+            active_tools=available_tools(TOOLS, test_config=test_config)
             if len(encoded(messages)) > 47000:
-                active_tools=[tool for tool in TOOLS if tool['function']['name']=='finish']
+                active_tools=[tool for tool in active_tools if tool['function']['name']=='finish']
                 messages.append({'role':'user','content':'The bounded read budget is nearly used. Finish now using only observed evidence and mark remaining unknowns; do not request more source.'})
             began = time.monotonic()
-            response = client.request('/api/chat', {'model': model, 'messages': messages, 'tools': active_tools,
-                'stream': False, 'think': False, 'keep_alive': '2m',
-                'options': {'num_ctx': context, 'num_predict': 1600, 'temperature': 0, 'num_thread': 4}})
+            response = client.chat(
+                model, messages, active_tools, context,
+                {'num_predict': 1600, 'temperature': 0, 'num_thread': 4},
+            )
             message = response['message']
             no_secrets(encoded(message).decode())
             prompt_tokens = response.get('prompt_eval_count', 0)
@@ -614,19 +688,22 @@ def run_agent(project, model, task, output, base='http://127.0.0.1:11434', write
                     'timings': {k: response.get(k) for k in ('load_duration','prompt_eval_count','prompt_eval_duration','eval_count','eval_duration')}}) + b'\n')
             result['steps'] = step + 1
             calls = message.get('tool_calls', [])
+            calls_from_text = False
             if not calls:
                 calls = parse_text_tool_call(message, active_tools)
-                if calls:
-                    message = {
-                        'role': 'assistant',
-                        'content': '',
-                        'tool_calls': calls
-                    }
+                calls_from_text = bool(calls)
             if calls:
                 calls = validate_native_tool_calls(calls, active_tools)
                 calls = defer_premature_finish(calls)
 
-            if message.get('tool_calls'):
+            if calls_from_text:
+                # Keep validated text calls in their original protocol. Recasting
+                # them as native calls changes the provider's rendered history.
+                message = {
+                    'role': 'assistant',
+                    'content': '\n'.join(json.dumps(call['function'], ensure_ascii=False) for call in calls)
+                }
+            elif message.get('tool_calls'):
                 message = dict(message)
                 message['tool_calls'] = calls
 
@@ -668,7 +745,7 @@ def run_agent(project, model, task, output, base='http://127.0.0.1:11434', write
                 with log.open('ab') as stream:
                     stream.write(encoded({'tool': name, 'arguments': args, 'result': tool_result}) + b'\n')
                 messages.append({'role': 'tool', 'tool_name': name, 'tool_call_id': call.get('id', name),
-                                 'content': json.dumps(tool_result, ensure_ascii=False)})
+                                 'content': json.dumps(model_tool_result(project, name, tool_result), ensure_ascii=False)})
                 if (name == 'create_file'
                     and tool_result.get('operation_performed') is False
                     and tool_result.get('error') == 'Existing file preserved; creation cannot overwrite.'):
@@ -711,7 +788,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--project', required=True);parser.add_argument('--task', required=True)
     parser.add_argument('--model', default='qwen3.5:4b');parser.add_argument('--output', required=True)
-    parser.add_argument('--endpoint', default='http://127.0.0.1:11434')
+    parser.add_argument('--endpoint', default=DEFAULT_ENDPOINT)
     args = parser.parse_args()
     result = run_agent(Project(args.project), args.model, args.task, args.output, args.endpoint)
     print(json.dumps(result, indent=2))

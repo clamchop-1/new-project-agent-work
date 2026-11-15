@@ -6,15 +6,14 @@ import sys
 from pathlib import Path
 
 from conversation_session import load_session, save_session, clear_session
+from agent_config import config_path, default_projects, load_config, legacy_name_map
+from platform_capabilities import capability_report
 
 ROOT = Path(__file__).resolve().parent
 
-PROJECTS = (
-    "LocalAgentSandbox",
-    "KronosStage",
-    "PhotoLibraryTools",
-    "PhotoLibraryPlanning",
-)
+CONFIG_PATH = config_path(ROOT)
+CONFIG = load_config(CONFIG_PATH, default_projects(ROOT))
+PROJECTS = tuple(legacy_name_map(CONFIG))
 
 
 def run_task(project, model, task, verbose=False):
@@ -23,9 +22,10 @@ def run_task(project, model, task, verbose=False):
         str(ROOT / "agent.py"),
         "run",
         "--project", project,
-        "--model", model,
         "--task", task,
     ]
+    if model:
+        command.extend(["--model", model])
 
     if project == "LocalAgentSandbox":
         command.append("--conversation")
@@ -148,8 +148,8 @@ def run_task(project, model, task, verbose=False):
 
 
 def main():
-    project = "LocalAgentSandbox"
-    model = "auto"
+    project = "LocalAgentSandbox" if "LocalAgentSandbox" in PROJECTS else PROJECTS[0]
+    model = ""
     verbose = False
 
     print("\nLocalCodingAgent — Interactive Terminal")
@@ -172,6 +172,7 @@ def main():
 
         if line == "/help":
             print("/projects       List available projects")
+            print("/capabilities   Show detected host tools")
             print("/project NAME   Select a project")
             print("/model NAME     Select a model or auto")
             print("/status         Show current settings")
@@ -184,6 +185,10 @@ def main():
         if line == "/projects":
             for name in PROJECTS:
                 print((" * " if name == project else "   ") + name)
+            continue
+
+        if line == "/capabilities":
+            print(json.dumps(capability_report(), indent=2))
             continue
 
         if line.startswith("/project "):
@@ -237,8 +242,11 @@ def main():
 
         if line == "/status":
             print(f"Project: {project}")
-            print(f"Model: {model}")
-            print("Endpoint: http://127.0.0.1:11434")
+            print(f"Model: {model or CONFIG['inference']['model']}")
+            print(f"Endpoint: {CONFIG['inference']['endpoint']}")
+            logical_id = next((key for key, row in CONFIG['projects'].items()
+                               if row['name'] == project), 'unknown')
+            print(f"Logical project ID: {logical_id}")
             print("Mode: Read-only")
             print("Cloud: Disabled")
             print(f"Verbose: {verbose}")

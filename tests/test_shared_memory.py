@@ -11,6 +11,7 @@ from agent_core import (AgentError, Project, digest, encoded, exclusive, file_ha
                         no_secrets, save_handoff, section)
 from fixture_repo import make_fixture
 from local_agent import Broker, Ollama
+from platform_capabilities import available_commands
 from pure_tests import validate_source
 
 HOME = Path(__file__).resolve().parents[1]
@@ -270,13 +271,16 @@ class CapabilityTests(FixtureCase):
         dirty=self.broker(['stats.py'])
         with self.assertRaises(AgentError):dirty.write('stats.py','def clamp(x,a,b):\n    return x\n')
 
-    def test_fixed_python_and_powershell_commands_execute(self):
+    def test_fixed_commands_follow_host_capability_discovery(self):
         broker=self.broker()
         self.assertEqual(broker.execute('python_parse','calculator.py')['exit_code'],0)
-        result=broker.execute('powershell_file_info','calculator.py')
-        self.assertEqual(result['exit_code'],0)
-        self.assertIn('calculator.py',result['output'])
-
+        if 'powershell_file_info' in available_commands():
+            result=broker.execute('powershell_file_info','calculator.py')
+            self.assertEqual(result['exit_code'],0)
+            self.assertIn('calculator.py',result['output'])
+        else:
+            with self.assertRaises(AgentError):
+                broker.execute('powershell_file_info','calculator.py')
     def test_pinned_tests_execute_failure_then_pass_after_authorized_edits(self):
         broker=self.broker(['calculator.py','stats.py'],True)
         self.assertNotEqual(broker.execute('tests')['exit_code'],0)

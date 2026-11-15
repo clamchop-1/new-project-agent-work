@@ -11,15 +11,13 @@ from agent_core import AgentError, Project, atomic_write, encoded, digest, exclu
 from local_agent import HUB, run_agent
 from model_router import get_models, choose_model
 from conversation_session import load_session
+from agent_config import (config_path, default_projects, load_config,
+                          legacy_name_map, selector_map)
 
 REPAIR_ROOT = (HUB / '.local/tests/live-repair-001/repo').resolve()
 REPAIR_WRITE_PATHS = frozenset({'calculator.py', 'stats.py'})
 
-PROJECTS = {'KronosStage': 'D:/Workspaces/KronosStage',
-            'PhotoLibraryTools': 'D:/Workspaces/ChasingLight',
-            'PhotoLibraryPlanning': 'D:/Workspaces/ChasingLight-Planning',
-            'LocalAgentSandbox': 'D:/Workspaces/LocalAgentSandbox',
-            'LocalAgentRepairFixture': str(REPAIR_ROOT)}
+PROJECTS = default_projects(HUB)
 PRIVATE = HUB/'.local'
 
 
@@ -68,11 +66,16 @@ def prepare_bridges(project, folder, packet):
 
 
 def main():
+    effective_config_path = config_path(HUB)
+    config = load_config(effective_config_path, PROJECTS)
+    configured_projects = legacy_name_map(config)
+    selectors = selector_map(config)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['inspect','run','approve','history','prepare-bridges','prepare-handoff','save-handoff'])
-    parser.add_argument('--project', choices=PROJECTS, default='KronosStage')
+    parser.add_argument('action', choices=['config','inspect','run','approve','history','prepare-bridges','prepare-handoff','save-handoff'])
+    parser.add_argument('--project', choices=selectors,
+                        default='KronosStage' if 'KronosStage' in configured_projects else next(iter(configured_projects)))
     parser.add_argument('--task');parser.add_argument('--task-file',type=Path)
-    parser.add_argument('--model',default='qwen3.5:4b');parser.add_argument('--endpoint',default='http://127.0.0.1:11434')
+    parser.add_argument('--model',default=config['inference']['model']);parser.add_argument('--endpoint',default=config['inference']['endpoint'])
     parser.add_argument('--write-path',action='append',default=[])
     parser.add_argument('--resume-held-project',action='store_true')
     parser.add_argument('--permit',type=Path);parser.add_argument('--run-directory',type=Path)
@@ -88,7 +91,7 @@ def main():
             raise AgentError(
                 'Conversation history is supported only for run actions.'
             )
-        if args.project != 'LocalAgentSandbox':
+        if config['projects'][selectors[args.project]]['name'] != 'LocalAgentSandbox':
             raise AgentError(
                 'Conversation history is currently sandbox-only.'
             )
@@ -97,12 +100,25 @@ def main():
                 'Conversation history cannot be combined with write permits.'
             )
 
+    if args.action == 'config':
+        from platform_capabilities import capability_report
+        print(json.dumps({'host_capabilities': capability_report(),
+                          'projects': [{'id': key, **record} for key, record in config['projects'].items()],
+                          'inference': config['inference'],
+                          'config_path': str(effective_config_path)}, indent=2))
+        return
     PRIVATE.mkdir(exist_ok=True)
-    project=Project(PROJECTS[args.project])
+    logical_project_id = selectors[args.project]
+    selected_project_name = config['projects'][logical_project_id]['name']
+    project=Project(configured_projects[selected_project_name])
     locks=PRIVATE/'locks';locks.mkdir(exist_ok=True)
     with exclusive(locks/(project.identity+'.lock'),args.agent):
         if args.action in ('inspect','prepare-bridges'):
             folder=new_directory('takeovers');packet=snapshot(project,folder)
+            packet['logical_project_id'] = logical_project_id
+            from platform_capabilities import capability_report
+            packet['host_capabilities'] = capability_report()
+            atomic_write(folder/'takeover.json', encoded(packet))
             bridge=prepare_bridges(project,folder,packet)
             print(json.dumps({'folder':str(folder),'project':str(project.root),'branch':packet['state']['branch'],
                  'commit':packet['state']['commit'],'status':packet['state']['status'],'deduplicated_memory_sections':len(packet['memory']),
@@ -115,7 +131,7 @@ def main():
             if not args.task_file or not args.write_path:raise AgentError('Reviewable task file and exact write paths are required.')
             state=project.state()
             if state['status'].strip():raise AgentError('Existing worktree changes must be reviewed/isolated before edit authorization.')
-            write_paths = validate_write_paths(args.project, args.write_path)
+            write_paths = validate_write_paths(selected_project_name, args.write_path)
             for path in write_paths:project.path(path)
             folder=new_directory('approvals')
             permit={'project_id':project.identity,'state':state,'memory':project.memory_snapshot(),
@@ -134,9 +150,13 @@ def main():
                     raise AgentError('Permit is used, cross-project or stale.')
                 if not args.task and not args.task_file:task=permit['task']
                 if task!=permit['task']:raise AgentError('Approved task changed.')
-                writes=validate_write_paths(args.project, permit['write_paths'])
+                writes=validate_write_paths(selected_project_name, permit['write_paths'])
                 permit['used']=True;atomic_write(permit_path,encoded(permit))
             parent=new_directory('runs');packet=snapshot(project,parent)
+            packet['logical_project_id'] = logical_project_id
+            from platform_capabilities import capability_report
+            packet['host_capabilities'] = capability_report()
+            atomic_write(parent/'takeover.json', encoded(packet))
             prepare_bridges(project,parent,packet)
             try:
                 with exclusive(PRIVATE/'inference.lock','qwen'):
@@ -147,7 +167,7 @@ def main():
                         print('LOCAL MODEL ROUTING: ' + json.dumps(routing), flush=True)
                     conversation = ()
                     if args.conversation:
-                        if args.project != 'LocalAgentSandbox':
+                        if selected_project_name != 'LocalAgentSandbox':
                             raise AgentError(
                                 'Conversation history is currently sandbox-only.'
                             )
@@ -155,7 +175,7 @@ def main():
                             raise AgentError(
                                 'Conversation history cannot be combined with write permits.'
                             )
-                        conversation = load_session(args.project)
+                        conversation = load_session(selected_project_name)
 
                     result=run_agent(
                         project,selected_model,task,
@@ -164,14 +184,19 @@ def main():
                         conversation=conversation,
                         test_config=(
                             project.root / '.local' / 'pinned-tests.json'
-                            if args.project in ('LocalAgentSandbox', 'LocalAgentRepairFixture')
+                        if selected_project_name in ('LocalAgentSandbox', 'LocalAgentRepairFixture')
                             else None
                         )
                     )
             finally:
                 atomic_write(parent/'post-run.json',encoded({'state':project.state(),'memory':packet['memory_snapshot'],
-                              'task':task,'run':str(parent/'execution')}))
-            print(json.dumps({'run':str(parent),'status':result['status'],'summary':result.get('summary'),
+                              'task':task,'run':str(parent/'execution'),'logical_project_id':logical_project_id}))
+            result.setdefault('project_id', project.identity)
+            result.setdefault('commands', [])
+            result['logical_project_id'] = logical_project_id
+            atomic_write(parent/'execution'/'result.json', encoded(result))
+            print(json.dumps({'run':str(parent),'logical_project_id':logical_project_id,
+                              'status':result['status'],'summary':result.get('summary'),
                               'operator_policy':result['operator_policy'],'verified_test_status':result['verified_test_status']},indent=2));return
         if args.action=='prepare-handoff':
             if not args.run_directory:raise AgentError('Select an actual saved run.')

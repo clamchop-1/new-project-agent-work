@@ -1,18 +1,14 @@
-﻿import argparse
+import argparse
 import json
 import urllib.request
-from urllib.parse import urlparse
 
-DEFAULT_ENDPOINT = "http://127.0.0.1:11434"
+from agent_config import DEFAULT_ENDPOINT, validate_endpoint
+
 
 def get_models(endpoint):
-    parsed = urlparse(endpoint)
-    if parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "localhost"):
-        raise ValueError("Only local Ollama endpoints are enabled in this initial version.")
-
+    endpoint = validate_endpoint(endpoint)
     with urllib.request.urlopen(endpoint.rstrip("/") + "/api/tags", timeout=10) as response:
         data = json.load(response)
-
     return [item["name"] for item in data.get("models", [])]
 
 def choose_model(models, task):

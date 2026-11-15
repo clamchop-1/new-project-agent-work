@@ -20,6 +20,62 @@ No model is downloaded, no global configuration changed, and no cloud fallback
 exists in the local runner. Existing project memory loads automatically through
 the adapter; only complete newest sections are provided and identical ones deduplicate.
 
+## Host-local project and inference configuration
+
+Run `python -B agent.py config` to display the effective host configuration and
+detected capabilities without opening a project or contacting Ollama.
+
+The launcher reads optional `.local/agent-config.json`. Set
+`LOCAL_CODING_AGENT_CONFIG` to use a different host-local config file. This file is ignored by
+Git because project roots and local model preferences belong to each installation.
+Without it, Windows keeps the established project names and roots. On macOS and
+other POSIX hosts, the current LocalCodingAgent checkout is the only default project;
+add other authorized project roots to the host-local configuration. The default model
+qwen3.5:4b and the Ollama endpoint remain loopback-only.
+A configured project uses a stable lowercase
+ID independent of its local checkout path:
+
+```json
+{
+  "version": 1,
+  "projects": {
+    "kronosstage": {
+      "name": "KronosStage",
+      "root": "D:/Workspaces/KronosStage"
+    },
+    "local-agent-repair-fixture": {
+      "name": "LocalAgentRepairFixture",
+      "root": "D:/Workspaces/LocalCodingAgent/.local/tests/live-repair-001/repo"
+    }
+  },
+  "inference": {
+    "provider": "ollama",
+    "model": "qwen3.5:4b",
+    "endpoint": "http://127.0.0.1:11434"
+  }
+}
+```
+
+Each configured root must still be the exact registered Git worktree. Configured
+endpoints remain restricted to IPv4 loopback Ollama. The stable ID is recorded
+alongside run/takeover evidence for cross-installation attribution. Existing
+checkout identity remains path-derived and continues to bind permits, Git
+snapshots, memory checks, and command receipts. Moving a checkout therefore does
+not silently transfer an approval or make two machines' receipts interchangeable.
+
+The launcher detects a small set of fixed host capabilities before advertising
+tools. Python source parsing is available on supported hosts. The `run_command`
+schema lists only the commands available on this host. The fixed PowerShell
+file-information operation appears only on Windows when `powershell.exe` is
+present; both schema validation and direct broker execution reject it elsewhere.
+Platform detection does not add a general shell capability.
+
+Configuration, registered roots, memory, and run history remain local to each
+installation. Stable logical project IDs can match across installations, while
+each host resolves its own root and retains its own checkout-bound approvals and
+receipts. The current provider profile is still local Ollama on IPv4 loopback;
+LAN inference and remote execution are separate future phases.
+
 For deterministic inspection without any model request:
 
 ```powershell
