@@ -46,22 +46,13 @@ class EarlyAuthorizationTests(unittest.TestCase):
         self.assertNotIn("LOCAL MODEL ROUTING", output)
         self.assertNotIn('"run":', output)
 
-    def test_production_conversation_blocked(self):
-        result = invoke(
-            "run", "--project", "KronosStage", "--model", "auto",
-            "--conversation", "--task", "Do not modify anything."
-        )
-        self.assert_blocked_early(
-            result, "Conversation history is currently sandbox-only."
-        )
-
     def test_conversation_with_write_path_blocked(self):
         result = invoke(
             "run", "--project", "LocalAgentSandbox", "--conversation",
             "--write-path", "calculator.py", "--task", "Do not modify anything."
         )
         self.assert_blocked_early(
-            result, "Conversation history cannot be combined with write permits."
+            result, "Conversation history cannot be combined with project write permits."
         )
 
     def test_conversation_with_permit_blocked(self):
@@ -71,7 +62,7 @@ class EarlyAuthorizationTests(unittest.TestCase):
             "--task", "Do not modify anything."
         )
         self.assert_blocked_early(
-            result, "Conversation history cannot be combined with write permits."
+            result, "Conversation history cannot be combined with project write permits."
         )
 
     def test_conversation_on_inspect_blocked(self):

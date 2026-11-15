@@ -1,9 +1,38 @@
-# Local coding-agent setup — working checkpoint
+# Local assistant setup
 
-Work stopped at the user's request to preserve Codex usage. This is a partially
-validated implementation, not a finished general-purpose coding environment.
-Private resume record: `.local/SETUP_HANDOFF.md`. Do not delete `.local` or clean
-this repository: source is presently uncommitted/untracked and evidence is private.
+This local assistant uses Ollama and Qwen for general help and project-aware coding.
+From PowerShell, run `agent` in the folder or drive root you want it to access.
+Bounded current-folder reads include PDF text extraction; one-task text edits and
+new files require exact-path authorization. Private state and evidence remain under
+`.local/`.
+
+## Interactive assistant from any PowerShell location
+
+The `agent` command is available on this Windows host. Start PowerShell in the
+folder or drive root you want the assistant to read, then run:
+
+```powershell
+Set-Location D:\
+agent
+```
+
+The selected folder becomes the assistant's read/search scope; a drive root such
+as `D:\` covers that drive, while files on another drive require changing scope
+with `/root C:\`. Project memory still loads from the selected project (by default
+`LocalCodingAgent`), regardless of the current-folder scope. Use `/project NAME`
+to select another registered project and its memory. Current-folder tools are bounded and
+exclude hidden, private, system, linked, hard-linked, and secret-like paths. A
+one-task edit/create requires `/allow-edit PATH` or `/allow-create PATH`; Git
+worktree files continue through the project's reviewed permit flow. No delete or
+arbitrary PowerShell tool is available. Text/source files are supported; PDF text
+extraction requires the optional local `pypdf` package, and scanned PDFs need OCR,
+which is not currently provided.
+
+To use another manual as reference, place its text or PDF under the selected
+assistant folder and ask for specific pages or sections. The assistant can use
+that material for the current task. Lasting guidance must be distilled and saved
+through the reviewed project-memory adapter; this does not change model weights.
+The terminal accepts local paths, not uploaded attachments.
 
 ## Launch local Qwen
 

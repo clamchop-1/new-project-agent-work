@@ -1,0 +1,2 @@
+# Local-only PDF text extraction. Install in the ignored .venv, not globally.
+pypdf==7.1.0

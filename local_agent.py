@@ -15,6 +15,7 @@ from agent_core import AgentError, Project, atomic_write, digest, encoded, exclu
 from platform_capabilities import available_tools, capability_report, host_tool_adapter
 from agent_config import DEFAULT_ENDPOINT, validate_endpoint
 from inference_provider import InferenceProvider
+from assistant_files import AssistantFiles
 
 HUB = Path(__file__).resolve().parent
 
@@ -81,9 +82,23 @@ def function(name, description, properties=None, required=None):
 TEXT = {'type': 'string'}
 TOOLS = [
     function('list_files', 'List bounded source paths in the selected actual repository. This tool accepts NO arguments: call it with an empty JSON object {}. Do not supply path, directory, or any other argument.'),
-    function('read_file', 'Read source and applicable instructions. Use returned SHA for edits.',
+    function('read_file', 'Read a source passage of at most 120 lines and applicable instructions. Authoritative project memory files are already loaded; this tool only verifies their loaded status. Use returned SHA for edits.',
              {'path': TEXT, 'start_line': {'type': 'integer'}, 'line_count': {'type': 'integer'}}, ['path']),
     function('search', 'Search source literally; no shell or regular-expression execution.', {'text': TEXT}, ['text']),
+    function('list_location', 'List immediate visible entries in the read-only folder where PowerShell launched the assistant. Optional path is relative to that folder.',
+             {'path': TEXT}),
+    function('find_location_files', 'Find file names below the read-only PowerShell launch folder. Search is bounded to 5000 files and skips private/system directories and links.',
+             {'query': TEXT, 'limit': {'type': 'integer'}}, ['query']),
+    function('search_location_text', 'Search supported UTF-8 text files below the read-only PowerShell launch folder. Search is bounded and skips private/system paths and secret-like content.',
+             {'text': TEXT, 'limit': {'type': 'integer'}}, ['text']),
+    function('read_location_file', 'Read a bounded passage from a supported text file in the read-only PowerShell launch folder. Path must be relative to that folder.',
+             {'path': TEXT, 'start_line': {'type': 'integer'}, 'line_count': {'type': 'integer'}}, ['path']),
+    function('read_location_pdf', 'Extract embedded text from at most 10 pages of a local PDF in the read-only PowerShell launch folder. OCR and encrypted PDFs are unsupported.',
+             {'path': TEXT, 'start_page': {'type': 'integer'}, 'page_count': {'type': 'integer'}}, ['path']),
+    function('edit_location_file', 'Edit an existing UTF-8 text file only when its exact relative path is authorized for this one task. Read it first and use the returned SHA-256.',
+             {'path': TEXT, 'expected_sha256': TEXT, 'content': TEXT}, ['path', 'expected_sha256', 'content']),
+    function('create_location_file', 'Create a new UTF-8 text file only when its exact relative path is authorized for this one task. Never overwrites.',
+             {'path': TEXT, 'content': TEXT}, ['path', 'content']),
     function('git_status', 'Read actual branch, commit and dirty status.'),
     function('git_diff', 'Read the actual current source diff.'),
     function('replace_text', 'Authorized edit only: exact file SHA and one exact occurrence required.',
@@ -99,13 +114,19 @@ TOOLS = [
 
 
 class Broker:
-    def __init__(self, project, run, writes=(), test_config=None):
+    def __init__(self, project, run, writes=(), test_config=None, assistant_root=None, assistant_write_paths=()):
         self.project, self.run = project, Path(run)
         self.allowed_writes = set(writes)
         self.test_config = test_config
         self.commands, self.writes = [], []
+        self.assistant_writes = []
+        self.allowed_assistant_writes = set(assistant_write_paths)
         self.dirty = bool(project.state()['status'].strip())
         self.loaded_memory = project.memory()
+        self.assistant_files = (
+            assistant_root if isinstance(assistant_root, AssistantFiles)
+            else AssistantFiles(assistant_root) if assistant_root else None
+        )
 
     def source_paths(self):
         names = self.project.git('ls-files', '-z', '--cached', '--others', '--exclude-standard').split('\0')
@@ -122,8 +143,6 @@ class Broker:
         return result[:500]
 
     def read(self, path, start_line=1, line_count=80):
-        if type(start_line) is not int or type(line_count) is not int or not 1 <= start_line <= 100000 or not 1 <= line_count <= 120:
-            raise AgentError('Read requires bounded positive line numbers/count.')
         requested = Path(path.replace('\\','/'))
         if not requested.is_absolute():requested=self.project.root/requested
         authorities = [self.project.root/'.local'/name for name in ('PROJECT_CONTEXT.md','DURABLE_MEMORY.md')]
@@ -132,6 +151,8 @@ class Broker:
             return {'already_loaded_at_startup':True,
                     'sections':[{k:v for k,v in row.items() if k!='text'} for row in self.loaded_memory],
                     'guidance':'Complete newest text is already in the initial packet. Historical content was not loaded.'}
+        if type(start_line) is not int or type(line_count) is not int or not 1 <= start_line <= 100000 or not 1 <= line_count <= 120:
+            raise AgentError('Read requires bounded positive line numbers/count (maximum 120 lines).')
         target = self.project.path(path, allow_instructions=True)
         if target.stat().st_size > 1024 * 1024:
             raise AgentError('Source file exceeds bounded read size.')
@@ -225,6 +246,35 @@ class Broker:
     def call(self, name, args):
         if name == 'list_files': return {'files': self.source_paths()}
         if name == 'read_file': return self.read(**args)
+        if name in ('list_location', 'find_location_files', 'search_location_text', 'read_location_file', 'read_location_pdf', 'edit_location_file', 'create_location_file'):
+            if self.assistant_files is None:
+                raise AgentError('No PowerShell launch folder was supplied to this run.')
+            if name == 'list_location': return self.assistant_files.list_directory(**args)
+            if name == 'find_location_files': return self.assistant_files.find_files(**args)
+            if name == 'search_location_text': return self.assistant_files.search_text(**args)
+            if name == 'read_location_pdf': return self.assistant_files.read_pdf(**args)
+            if name == 'read_location_file': return self.assistant_files.read_text(**args)
+            target = self.assistant_files._path(args['path'])
+            canonical = target.relative_to(self.assistant_files.root).as_posix()
+            if canonical not in self.allowed_assistant_writes:
+                raise AgentError('This exact assistant file path was not authorized for this task.')
+            if target.resolve().is_relative_to(self.project.root):
+                raise AgentError('Selected project files must use that project and its reviewed write permit.')
+            for ancestor in target.parents:
+                if (ancestor / '.git').exists():
+                    raise AgentError('Files inside Git worktrees must use the selected project and its reviewed write permit.')
+                if ancestor == Path(ancestor.anchor):
+                    break
+            lock_folder = HUB / '.local' / 'locks'
+            lock_folder.mkdir(parents=True, exist_ok=True)
+            lock_path = lock_folder / ('assistant-file-' + digest(str(target).casefold().encode()) + '.lock')
+            with exclusive(lock_path, uuid.uuid4().hex):
+                if name == 'edit_location_file':
+                    receipt = self.assistant_files.write_text(**args)
+                else:
+                    receipt = self.assistant_files.create_text(**args)
+            self.assistant_writes.append(receipt)
+            return receipt
         if name == 'search':
             needle = args['text']
             if not isinstance(needle, str) or not 1 <= len(needle) <= 200:
@@ -630,14 +680,43 @@ def model_tool_result(project, name, result):
     return presented
 
 
-def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), test_config=None, max_steps=16, context=16384, conversation=(), provider_name='ollama'):
+def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), test_config=None, max_steps=16, context=16384, conversation=(), provider_name='ollama', assistant_root=None, assistant_write_paths=()):
     output = Path(output);output.mkdir(parents=True, exist_ok=False)
+    assistant_files = AssistantFiles(assistant_root) if assistant_root else None
+    if assistant_write_paths and assistant_files is None:
+        raise AgentError('Assistant file writes require an explicitly selected assistant root.')
+    assistant_write_paths = tuple(assistant_files.canonical_path(path) for path in assistant_write_paths) if assistant_files else ()
+    if len(set(assistant_write_paths)) != len(assistant_write_paths):
+        raise AgentError('Assistant file write paths must be unique.')
     client: InferenceProvider = create_inference_provider(provider_name, base)
     identity = client.model(model)
     packet = project.takeover()
     public_packet = {**packet, 'state': {k: v for k, v in packet['state'].items() if k != 'files'}}
-    broker = Broker(project, output, writes, test_config)
-    system = ('You are a local coding agent. Follow the supplied authoritative project instructions and newest memory. '
+    broker = Broker(project, output, writes, test_config, assistant_root=assistant_files,
+                    assistant_write_paths=assistant_write_paths)
+    if broker.assistant_files is not None:
+        public_packet['assistant_location'] = {
+            'root': str(broker.assistant_files.root),
+            'access': 'read-only except exact paths authorized for this task',
+            'authorized_write_paths': sorted(broker.allowed_assistant_writes),
+            'excluded': 'private/system paths, hidden entries, links, and secret-like content',
+        }
+    system = ('You are a general local assistant with project-aware coding tools. Follow the supplied authoritative project instructions and newest memory. '
+              'The startup packet already contains the current authoritative memory loaded from the selected project’s '
+              '.local/PROJECT_CONTEXT.md and .local/DURABLE_MEMORY.md files. These private files are intentionally '
+              'excluded from ordinary project listing/search tools. Never claim they are missing because a listing or '
+              'Search did not show them, and never recommend creating, tracking, or copying replacement memory files. '
+              'If the user asks to load, check, show, or inspect project memory or a project handover, answer from the supplied startup packet. '
+              'Name both authoritative sources, report whether they loaded, and summarize the newest handoff objective, current status, constraints, and next action. '
+              'Do not search for these private files with list_files or ordinary location search. A read_file call on either authoritative memory path only verifies loaded status; its line bounds are irrelevant. '
+              'If the packet marks memory missing or unreadable, report that exact status without guessing. Do not give a vague “already loaded/no further action” answer when the user asks what it contains. '
+              'If asked about adding manuals or teaching material, explain that local text/PDF files can be read from the selected assistant folder using location tools. This terminal does not accept file uploads. '
+              'The model weights are not changed; the material can guide the current task, and lasting guidance requires a distilled update through the reviewed project-memory adapter and explicit operator authorization. '
+              'Apply the user’s saved programming and UX principles from current project memory when relevant. Prefer clear, focused changes and verification; for interfaces consider task clarity, continuity, feedback, accessibility, error prevention, and recovery. Do not start unrelated cleanup. '
+              'When assistant_location is supplied, use its location tools for files under that root, even outside the selected Git project. '
+              'Location reads are bounded. Write tools work only on exact authorized paths listed in assistant_location; no other file may be written or created. '
+              'Never claim to inspect a file unless a tool returned its contents. No location delete tool exists. '
+              'Use read_location_file for UTF-8 text and read_location_pdf for PDF pages. PDF extraction requires the local pypdf package; no OCR is available. '
               'Read tools before claiming file facts. Git and actual tool receipts are authoritative. Never fabricate tool/test results. '
               'Recall does not resume holds. Only exact operator-authorized paths may be edited. No deletes, installs, hardware, secrets or network tools. '
               'Use tool errors/test failures to correct your implementation within the task. Finish with the finish tool. '
@@ -648,6 +727,7 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
               'An operator-issued write permit already authorizes its exact paths and task; '
               'do not ask the user to reconfirm an authorized edit. '
               'Never interpret a tool error as permission to bypass a safety restriction. '
+              'If a tool call fails, never repeat the same tool with identical arguments. Correct the arguments once if the task still needs it; otherwise report the blocker without claiming success. '
               'If a permitted operation fails, choose a valid permitted alternative or finish with the blocker. '
               'Prefer project-relative tool paths such as README.md. '
               'For read-only takeover, explain architecture, current hold/task and next action without changing files.'
@@ -683,9 +763,12 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
     ]
     log = output/'events.jsonl'
     result = {'status': 'running', 'provider': provider_name, 'model': model, 'model_digest': identity['digest'], 'project_id': project.identity,
-              'endpoint': base, 'context': context, 'steps': 0, 'writes': [], 'commands': [], 'cloud_fallback': False,
+              'endpoint': base, 'context': context, 'steps': 0, 'writes': [],
+              'assistant_file_writes': [], 'commands': [], 'cloud_fallback': False,
               'host_capabilities': capability_report(),
-              'operator_policy':{'write_paths':list(writes),'hold_in_current_heading':packet['hold_in_current_heading'],
+              'operator_policy':{'write_paths':list(writes),
+                                 'assistant_file_write_paths':list(assistant_write_paths),
+                                 'hold_in_current_heading':packet['hold_in_current_heading'],
                                  'verified_commit':packet['state']['commit'],'model_next_actions_are_proposals':True,
                                  'notice':'No project work is resumed by inspection. Existing holds require explicit task-specific authorization.'}}
     atomic_write(output/'result.json', encoded(result))
@@ -728,6 +811,20 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
             if calls:
                 calls = validate_native_tool_calls(calls, active_tools)
                 calls = defer_premature_finish(calls)
+
+            # General assistant turns may end with a normal prose response. Do
+            # not inject the coding-agent recovery recipe after a valid answer;
+            # it can cause unrelated repository tools to run for no reason.
+            if assistant_files is not None and not calls and message.get('content', '').strip():
+                result.update(
+                    status='complete',
+                    summary={
+                        'summary': message['content'].strip(),
+                        'unfinished': [],
+                        'next_actions': [],
+                    },
+                )
+                break
 
             if calls_from_text:
                 # Keep validated text calls in their original protocol. Recasting
@@ -804,7 +901,8 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
         raise
     finally:
         actual_tests, receipt_integrity = verify_test_receipts(broker.commands, project, output)
-        result.update(seconds=time.monotonic()-started, writes=broker.writes, commands=broker.commands,
+        result.update(seconds=time.monotonic()-started, writes=broker.writes,
+                      assistant_file_writes=broker.assistant_writes, commands=broker.commands,
                       verified_test_status=actual_tests,
                       receipt_integrity=receipt_integrity,
                       model_metrics={**usage,

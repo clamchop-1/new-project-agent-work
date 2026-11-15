@@ -8,6 +8,7 @@ import sys
 import uuid
 
 from agent_core import AgentError, Project, atomic_write, encoded, digest, exclusive, save_handoff
+from assistant_files import AssistantFiles
 from local_agent import HUB, run_agent
 from model_router import get_models, choose_model
 from conversation_session import load_session
@@ -76,6 +77,10 @@ def main():
     parser.add_argument('--project', choices=selectors,
                         default='KronosStage' if 'KronosStage' in configured_projects else next(iter(configured_projects)))
     parser.add_argument('--task');parser.add_argument('--task-file',type=Path)
+    parser.add_argument('--assistant-root', type=Path,
+                        help='Assistant file root, usually the PowerShell current directory; reads are broad and writes require exact paths.')
+    parser.add_argument('--assistant-write-path', action='append', default=[],
+                        help='Authorize one exact relative text-file path for this task only.')
     parser.add_argument('--model',default=config['inference']['model']);parser.add_argument('--endpoint',default=config['inference']['endpoint'])
     parser.add_argument('--write-path',action='append',default=[])
     parser.add_argument(
@@ -90,19 +95,26 @@ def main():
     parser.add_argument('--conversation', action='store_true')
     args=parser.parse_args()
 
+    assistant_write_paths = ()
+    if args.assistant_write_path:
+        if args.action != 'run' or not args.assistant_root:
+            raise AgentError('Assistant file write paths require a run with an explicit assistant root.')
+        assistant_scope = AssistantFiles(args.assistant_root)
+        assistant_write_paths = tuple(
+            assistant_scope.canonical_path(path) for path in args.assistant_write_path
+        )
+        if len(set(assistant_write_paths)) != len(assistant_write_paths):
+            raise AgentError('Assistant file write paths must be unique.')
+
     # Reject unauthorized conversation use before project preparation.
     if args.conversation:
         if args.action != 'run':
             raise AgentError(
                 'Conversation history is supported only for run actions.'
             )
-        if config['projects'][selectors[args.project]]['name'] != 'LocalAgentSandbox':
-            raise AgentError(
-                'Conversation history is currently sandbox-only.'
-            )
         if args.permit or args.write_path:
             raise AgentError(
-                'Conversation history cannot be combined with write permits.'
+                'Conversation history cannot be combined with project write permits.'
             )
 
     if args.action == 'config':
@@ -159,6 +171,11 @@ def main():
                 permit['used']=True;atomic_write(permit_path,encoded(permit))
             parent=new_directory('runs');packet=snapshot(project,parent)
             packet['logical_project_id'] = logical_project_id
+            if args.assistant_root:
+                packet['assistant_location'] = {
+                    'root': str(args.assistant_root.resolve()),
+                    'access': 'read-only',
+                }
             from platform_capabilities import capability_report
             packet['host_capabilities'] = capability_report()
             atomic_write(parent/'takeover.json', encoded(packet))
@@ -176,10 +193,6 @@ def main():
                         print('LOCAL MODEL ROUTING: ' + json.dumps(routing), flush=True)
                     conversation = ()
                     if args.conversation:
-                        if selected_project_name != 'LocalAgentSandbox':
-                            raise AgentError(
-                                'Conversation history is currently sandbox-only.'
-                            )
                         if writes:
                             raise AgentError(
                                 'Conversation history cannot be combined with write permits.'
@@ -197,10 +210,13 @@ def main():
                         conversation=conversation,
                         provider_name=config['inference']['provider'],
                         test_config=test_config,
+                        assistant_root=args.assistant_root,
+                        assistant_write_paths=assistant_write_paths,
                     )
             finally:
                 atomic_write(parent/'post-run.json',encoded({'state':project.state(),'memory':packet['memory_snapshot'],
-                              'task':task,'run':str(parent/'execution'),'logical_project_id':logical_project_id}))
+                              'task':task,'run':str(parent/'execution'),'logical_project_id':logical_project_id,
+                              'assistant_location': packet.get('assistant_location')}))
             result.setdefault('project_id', project.identity)
             result.setdefault('commands', [])
             result['logical_project_id'] = logical_project_id
