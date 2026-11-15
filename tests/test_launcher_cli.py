@@ -59,6 +59,7 @@ class LauncherCliTests(FixtureCase):
                 self.run_cli(['run', '--project', 'LocalAgentRepairFixture', '--permit', permit_path])
                 self.assertEqual(run_mock.call_count, 1)
                 self.assertEqual(run_mock.call_args.kwargs['writes'], ('calculator.py', 'stats.py'))
+                self.assertEqual(run_mock.call_args.kwargs['provider_name'], 'ollama')
 
             self.assertTrue(json.loads(Path(permit_path).read_text(encoding='utf-8'))['used'])
             with patch.object(agent, 'run_agent') as run_mock:

@@ -2,13 +2,21 @@
 from unittest.mock import patch
 
 from inference_provider import InferenceProvider
-from local_agent import Ollama
+from agent_core import AgentError
+from local_agent import Ollama, create_inference_provider
 from agent_config import DEFAULT_ENDPOINT
 
 
 class InferenceProviderContractTests(unittest.TestCase):
     def test_local_ollama_implements_model_level_contract(self):
         self.assertIsInstance(Ollama(DEFAULT_ENDPOINT), InferenceProvider)
+
+    def test_factory_builds_configured_local_provider_and_rejects_unknown(self):
+        provider = create_inference_provider('ollama', DEFAULT_ENDPOINT)
+        self.assertIsInstance(provider, InferenceProvider)
+        self.assertEqual(provider.base, DEFAULT_ENDPOINT)
+        with self.assertRaises(AgentError):
+            create_inference_provider('remote_ollama', DEFAULT_ENDPOINT)
 
     def test_chat_maps_contract_to_non_streaming_local_ollama_request(self):
         client = Ollama(DEFAULT_ENDPOINT)

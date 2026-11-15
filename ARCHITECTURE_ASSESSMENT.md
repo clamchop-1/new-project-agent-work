@@ -253,3 +253,7 @@ the current run has a pinned test configuration; the broker's existing checks
 remain authoritative. Validation on Windows passed 155 tests with one
 symlink-privilege skip. One prior full run had a transient disposable-fixture
 `git add` failure; the affected test file and subsequent full run passed.
+Inference construction now goes through a provider factory fed by the validated
+host configuration. Ollama remains the only supported provider and its pinned
+loopback endpoint policy is unchanged. The Windows suite now passes 156 tests
+with one symlink-privilege skip; no native macOS run has occurred.

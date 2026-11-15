@@ -182,6 +182,7 @@ def main():
                         parent/'execution',args.endpoint,
                         writes=writes,
                         conversation=conversation,
+                        provider_name=config['inference']['provider'],
                         test_config=(
                             project.root / '.local' / 'pinned-tests.json'
                         if selected_project_name in ('LocalAgentSandbox', 'LocalAgentRepairFixture')

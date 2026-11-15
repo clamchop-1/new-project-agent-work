@@ -62,6 +62,13 @@ class Ollama:
         return matches[0]
 
 
+def create_inference_provider(provider_name='ollama', endpoint=DEFAULT_ENDPOINT):
+    """Build only explicitly supported local inference providers."""
+    if provider_name != 'ollama':
+        raise AgentError('Configured inference provider is not supported locally.')
+    return Ollama(endpoint)
+
+
 def function(name, description, properties=None, required=None):
     return {'type': 'function', 'function': {'name': name, 'description': description,
         'parameters': {'type': 'object', 'properties': properties or {},
@@ -600,9 +607,10 @@ def model_tool_result(project, name, result):
     return presented
 
 
-def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), test_config=None, max_steps=16, context=16384, conversation=()):
+def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), test_config=None, max_steps=16, context=16384, conversation=(), provider_name='ollama'):
     output = Path(output);output.mkdir(parents=True, exist_ok=False)
-    client: InferenceProvider = Ollama(base);identity = client.model(model)
+    client: InferenceProvider = create_inference_provider(provider_name, base)
+    identity = client.model(model)
     packet = project.takeover()
     public_packet = {**packet, 'state': {k: v for k, v in packet['state'].items() if k != 'files'}}
     broker = Broker(project, output, writes, test_config)
@@ -649,7 +657,7 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
         }
     ]
     log = output/'events.jsonl'
-    result = {'status': 'running', 'model': model, 'model_digest': identity['digest'], 'project_id': project.identity,
+    result = {'status': 'running', 'provider': provider_name, 'model': model, 'model_digest': identity['digest'], 'project_id': project.identity,
               'endpoint': base, 'context': context, 'steps': 0, 'writes': [], 'commands': [], 'cloud_fallback': False,
               'host_capabilities': capability_report(),
               'operator_policy':{'write_paths':list(writes),'hold_in_current_heading':packet['hold_in_current_heading'],
