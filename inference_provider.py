@@ -10,6 +10,10 @@ class InferenceProvider(Protocol):
         """Verify and identify an installed model before starting a run."""
         ...
 
+    def models(self) -> Sequence[Mapping[str, Any]]:
+        """List models already available from this explicitly selected provider."""
+        ...
+
     def chat(
         self,
         model: str,

@@ -11,6 +11,14 @@ class InferenceProviderContractTests(unittest.TestCase):
     def test_local_ollama_implements_model_level_contract(self):
         self.assertIsInstance(Ollama(DEFAULT_ENDPOINT), InferenceProvider)
 
+    def test_models_uses_only_the_installed_local_tags_endpoint(self):
+        client = Ollama(DEFAULT_ENDPOINT)
+        with patch.object(client, 'request', return_value={
+            'models': [{'name': 'qwen3.5:4b'}],
+        }) as request:
+            self.assertEqual(client.models(), [{'name': 'qwen3.5:4b'}])
+        request.assert_called_once_with('/api/tags')
+
     def test_factory_builds_configured_local_provider_and_rejects_unknown(self):
         provider = create_inference_provider('ollama', DEFAULT_ENDPOINT)
         self.assertIsInstance(provider, InferenceProvider)

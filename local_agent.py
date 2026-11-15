@@ -54,12 +54,15 @@ class Ollama:
     def model(self, name):
         if 'cloud' in name.casefold():
             raise AgentError('Cloud model tags are forbidden.')
-        matches = [row for row in self.request('/api/tags').get('models', []) if row['name'] == name]
+        matches = [row for row in self.models() if row['name'] == name]
         if len(matches) != 1 or matches[0].get('remote_host') or matches[0].get('remote_model'):
             raise AgentError('An already installed, non-remote model is required; no download fallback.')
         if matches[0].get('details', {}).get('format') not in ('gguf', 'safetensors'):
             raise AgentError('Unverified local model format.')
         return matches[0]
+
+    def models(self):
+        return self.request('/api/tags').get('models', [])
 
 
 def create_inference_provider(provider_name='ollama', endpoint=DEFAULT_ENDPOINT):

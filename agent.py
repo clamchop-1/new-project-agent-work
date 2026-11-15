@@ -162,7 +162,11 @@ def main():
                 with exclusive(PRIVATE/'inference.lock','qwen'):
                     selected_model = args.model
                     if selected_model == 'auto':
-                        routing = choose_model(get_models(args.endpoint), task)
+                        provider_name = config['inference']['provider']
+                        routing = choose_model(
+                            get_models(args.endpoint, provider_name), task,
+                            provider_name,
+                        )
                         selected_model = routing['model']
                         print('LOCAL MODEL ROUTING: ' + json.dumps(routing), flush=True)
                     conversation = ()
