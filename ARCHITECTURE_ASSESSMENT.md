@@ -261,3 +261,25 @@ configured provider identifier in routing output. Remote endpoints and provider
 fallback remain disabled. Routing filters cloud and Ollama remote-model entries
 before selection. The Windows suite passed 160 tests with one symlink-privilege
 skip; native macOS execution remains unverified.
+
+## Windows standalone readiness review
+
+Windows can be developed and validated independently; a Mac is not a prerequisite
+for the portable core or local Ollama path. `WINDOWS_STANDALONE_SMOKE.md` defines
+a bounded read-only acceptance run using the registered repair fixture.
+
+The review confirmed that Windows-specific sharing-violation retries and
+PowerShell metadata execution are behind narrow branches/adapters. Remaining
+cross-platform risks include case-folded checkout identities on case-sensitive
+volumes, treating backslashes as path separators on POSIX, and killing only the
+direct subprocess on timeout. These need compatibility-preserving design and
+real-host tests before macOS acceptance; they do not require pausing Windows
+standalone work. Current Windows launcher pins Python 3.12 even though CI also
+tests Python 3.14; launcher-version portability should be measured before changing
+the established entry point. A read-only Windows standalone smoke through the
+Python 3.12 `.cmd` launcher completed and verified with Qwen 2.5 Coder: five file
+reads, three passing pinned tests, and marker `MAPLE-427`; zero writes and no cloud
+fallback. Two Qwen 3.5 attempts also completed the reads and tests but failed on
+an invalid nested native finish argument, which the strict validator correctly
+rejected. Evidence and limits are recorded in `WINDOWS_STANDALONE_SMOKE.md`; one
+model/task success does not establish general reliability.
