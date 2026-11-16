@@ -146,11 +146,10 @@ def run_task(project, model, task, assistant_root, assistant_write_paths=(), ver
     json_start = None
 
     for index, line in enumerate(lines):
-        if line.startswith("LOCAL MODEL ROUTING:"):
+        if line.startswith("MODEL ROUTING:") or line.startswith("LOCAL MODEL ROUTING:"):
             try:
-                routing = json.loads(
-                    line.split("LOCAL MODEL ROUTING:", 1)[1].strip()
-                )
+                prefix = "MODEL ROUTING:" if line.startswith("MODEL ROUTING:") else "LOCAL MODEL ROUTING:"
+                routing = json.loads(line.split(prefix, 1)[1].strip())
             except json.JSONDecodeError:
                 pass
 
@@ -170,8 +169,12 @@ def run_task(project, model, task, assistant_root, assistant_write_paths=(), ver
         print(output)
         return
 
+    routing = result.get('routing_decision') or routing
     if routing and not verbose:
-        print(f"Model: {routing.get('model', 'unknown')} (local)")
+        selected = routing.get('selected') or {}
+        provider = selected.get('provider_id', routing.get('provider', 'unknown'))
+        model = selected.get('model_id', routing.get('model', 'unknown'))
+        print(f"Model: {provider}/{model} (routing confidence: {routing.get('confidence', 'unknown')})")
 
     status = result.get("status", "unknown")
     summary = result.get("summary") or {}
@@ -283,6 +286,8 @@ def main():
             print("/status         Show current settings")
             print("/history        Show recent conversation for this project")
             print("/clear          Clear conversation for this project")
+            print("Ask naturally to search/read public web sources or YouTube captions.")
+            print("Explicitly ask to save, search saved sources, or forget a source.")
             print("/verbose        Toggle raw JSON output")
             print("/exit           Quit")
             continue

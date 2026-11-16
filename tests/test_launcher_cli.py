@@ -15,12 +15,31 @@ class LauncherCliTests(FixtureCase):
     def setUp(self):
         super().setUp()
         self.private = self.base / 'launcher-private'
+        self.config_file = self.base / 'launcher-config.json'
+        self.config_file.write_text(json.dumps({
+            'version': 1,
+            'projects': {'localagentrepairfixture': {
+                'name': 'LocalAgentRepairFixture', 'root': str(self.project.root),
+            }},
+            'inference': {'provider': 'ollama', 'model': 'qwen3:8b',
+                          'endpoint': 'http://127.0.0.1:11434'},
+        }), encoding='utf-8')
+        self.config_path_patch = patch.object(
+            agent, 'config_path', return_value=self.config_file,
+        )
+        self.config_path_patch.start()
+        self.addCleanup(self.config_path_patch.stop)
         self.task_file = self.base / 'approved-task.md'
         self.task_file.write_text('Repair only calculator.py and stats.py.\n', encoding='utf-8')
 
     def run_cli(self, argv):
         output = io.StringIO()
-        with patch.object(sys, 'argv', ['agent.py', *argv]), contextlib.redirect_stdout(output):
+        discovered = ([{
+            'provider_id': 'ollama', 'model_id': 'qwen3:8b',
+            'model_digest': None, 'available': True, 'authorized': True,
+        }], [])
+        with patch.object(agent, 'discover_candidates', return_value=discovered), \
+             patch.object(sys, 'argv', ['agent.py', *argv]), contextlib.redirect_stdout(output):
             agent.main()
         return output.getvalue()
 
@@ -31,6 +50,7 @@ class LauncherCliTests(FixtureCase):
 
     def test_pinned_test_capability_is_opt_in_and_project_scoped(self):
         captured_test_configs = []
+        captured_routing = []
 
         def fake_run(project, model, task, output, endpoint, **kwargs):
             output.mkdir(parents=True)
@@ -41,20 +61,26 @@ class LauncherCliTests(FixtureCase):
                 'commands': [],
             }))
             captured_test_configs.append(kwargs['test_config'])
+            captured_routing.append(kwargs['routing_decision'])
             return {
                 'status': 'complete',
                 'summary': summary,
                 'operator_policy': {'write_paths': list(kwargs['writes'])},
                 'verified_test_status': 'not_run',
+                'routing_decision': kwargs['routing_decision'],
             }
 
         with self.patched_launcher()[0], self.patched_launcher()[1]:
             with patch.object(agent, 'run_agent', side_effect=fake_run):
-                self.run_cli([
+                rendered = self.run_cli([
                     'run', '--project', 'LocalAgentRepairFixture',
                     '--task', 'Inspect source only.',
                 ])
                 self.assertIsNone(captured_test_configs[-1])
+                decision = json.loads(rendered)['routing_decision']
+                self.assertEqual(decision['selected']['provider_id'], 'ollama')
+                self.assertEqual(decision['confidence'], 'low')
+                self.assertIsNotNone(captured_routing[-1])
 
                 self.run_cli([
                     'run', '--project', 'LocalAgentRepairFixture',
@@ -67,10 +93,20 @@ class LauncherCliTests(FixtureCase):
                 )
 
                 with patch.object(agent, 'PROJECTS', {'UnapprovedProject': str(self.project.root)}):
-                    self.run_cli([
-                        'run', '--project', 'UnapprovedProject',
-                        '--task', 'Run tests.', '--allow-pinned-tests',
-                    ])
+                    unapproved_config = self.base / 'unapproved-agent-config.json'
+                    unapproved_config.write_text(json.dumps({
+                        'version': 1,
+                        'projects': {'unapprovedproject': {
+                            'name': 'UnapprovedProject', 'root': str(self.project.root),
+                        }},
+                        'inference': {'provider': 'ollama', 'model': 'qwen3:8b',
+                                      'endpoint': 'http://127.0.0.1:11434'},
+                    }), encoding='utf-8')
+                    with patch.object(agent, 'config_path', return_value=unapproved_config):
+                        self.run_cli([
+                            'run', '--project', 'UnapprovedProject',
+                            '--task', 'Run tests.', '--allow-pinned-tests',
+                        ])
                     self.assertIsNone(captured_test_configs[-1])
 
     def test_approval_is_single_use_and_exact_scope_is_enforced_at_run(self):
@@ -140,7 +176,7 @@ class LauncherCliTests(FixtureCase):
             with patch.object(agent, 'run_agent', side_effect=fake_run):
                 run_output = self.run_cli([
                     'run', '--project', 'LocalAgentRepairFixture',
-                    '--task', 'Prepare a reviewable handoff.',
+                    '--task', 'Prepare a disposable reviewable handoff ' + self.base.name,
                 ])
             run_directory = json.loads(run_output)['run']
             prepared = self.run_cli([

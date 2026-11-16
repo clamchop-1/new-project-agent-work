@@ -10,10 +10,13 @@ import uuid
 from agent_core import AgentError, Project, atomic_write, encoded, digest, exclusive, save_handoff
 from assistant_files import AssistantFiles
 from local_agent import HUB, run_agent
-from model_router import get_models, choose_model
+from model_router import discover_candidates, route_model, read_recent_performance
+from model_registry import (ModelRegistryError, append_performance_evidence,
+                            load_registry)
 from conversation_session import load_session
 from agent_config import (config_path, default_projects, load_config,
-                          legacy_name_map, selector_map)
+                          legacy_name_map, selector_map, DEFAULT_ENDPOINT,
+                          validate_endpoint)
 
 REPAIR_ROOT = (HUB / '.local/tests/live-repair-001/repo').resolve()
 REPAIR_WRITE_PATHS = frozenset({'calculator.py', 'stats.py'})
@@ -29,6 +32,137 @@ def validate_write_paths(project_name, write_paths):
         if not paths or len(paths) != len(set(paths)) or not set(paths) <= REPAIR_WRITE_PATHS:
             raise AgentError('Repair fixture permits may authorize only calculator.py and stats.py.')
     return paths
+
+
+def approve_provider_fallback(proposal):
+    print('Provider fallback request: '
+          + proposal['from_provider'] + '/' + proposal['from_model'] + ' -> '
+          + proposal['to_provider'] + '/' + proposal['to_model'])
+    if proposal.get('data_sharing'):
+        print('Approval permits sending this task context to the configured remote inference provider.')
+    return input('Approve this provider change for this run? Type YES to approve: ').strip() == 'YES'
+
+
+def parse_capability_minimums(values):
+    parsed = {}
+    for item in values:
+        try:
+            name, raw_score = item.split('=', 1)
+            score = float(raw_score)
+        except (ValueError, TypeError) as exc:
+            raise AgentError('Capability minimums must use capability=0..1 format.') from exc
+        if name in parsed or not 0 <= score <= 1:
+            raise AgentError('Capability minimums must be unique and between zero and one.')
+        parsed[name] = score
+    return parsed
+
+
+def provider_specs(config, endpoint, mode, provider_override=None):
+    inference = config['inference']
+    remote = inference.get('remote')
+    local_endpoint = validate_endpoint(endpoint if inference['provider'] == 'ollama'
+                                       else DEFAULT_ENDPOINT)
+    if mode == 'configured':
+        provider = provider_override or inference['provider']
+        if provider == 'ollama':
+            return {'ollama': {'endpoint': local_endpoint}}
+        if provider == 'ssh_tunnel_ollama' and isinstance(remote, dict) and remote.get('enabled') is True:
+            return {'ssh_tunnel_ollama': {
+                'endpoint': f"http://127.0.0.1:{remote['port']}", 'profile': remote,
+            }}
+        raise AgentError('Requested provider is not explicitly authorized by host configuration.')
+    specs = {'ollama': {'endpoint': local_endpoint}}
+    if mode == 'remote_allowed' and isinstance(remote, dict) and remote.get('enabled') is True:
+        specs['ssh_tunnel_ollama'] = {
+            'endpoint': f"http://127.0.0.1:{remote['port']}", 'profile': remote,
+        }
+    if provider_override and provider_override not in specs:
+        raise AgentError('Requested provider is not authorized for the selected routing mode.')
+    return specs
+
+
+def _record_verified_performance(result, execution_directory, registry_path):
+    status = result.get('verified_test_status')
+    integrity = result.get('receipt_integrity')
+    if status not in ('passed', 'failed') or not isinstance(integrity, dict) or not integrity.get('valid'):
+        return False
+    routing = result.get('routing_decision') or {}
+    selected = routing.get('selected') or {}
+    provider = result.get('provider') or selected.get('provider_id')
+    model = result.get('model') or selected.get('model_id')
+    if provider not in ('ollama', 'ssh_tunnel_ollama') or not isinstance(model, str):
+        return False
+    result_path = Path(execution_directory) / 'result.json'
+    try:
+        import hashlib
+        evidence_hash = hashlib.sha256(result_path.read_bytes()).hexdigest()
+        inference_seconds = 0.0
+        generation_seconds = 0.0
+        events_path = Path(execution_directory) / 'events.jsonl'
+        if events_path.is_file():
+            for line in events_path.read_text(encoding='utf-8').splitlines():
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if type(event.get('step')) is int and type(event.get('seconds')) in (int, float):
+                    inference_seconds += max(0.0, float(event['seconds']))
+                    duration = (event.get('timings') or {}).get('eval_duration')
+                    if type(duration) in (int, float) and duration > 0:
+                        generation_seconds += duration / 1_000_000_000
+        task_categories = routing.get('task_classification', {}).get('categories', [])
+        metrics = result.get('model_metrics') or {}
+        observed_at = datetime.now(timezone.utc).isoformat()
+        record = {
+            'schema_version': 1,
+            'provider_id': provider,
+            'model_id': model,
+            'model_digest': result.get('model_digest'),
+            'task_category': task_categories[0] if task_categories else 'general_reasoning',
+            'test_or_benchmark_id': 'verified_test_receipts',
+            'latency_ms': max(0, int(inference_seconds * 1000)),
+            'tokens_per_second': (
+                metrics.get('completion_tokens', 0) / generation_seconds
+                if generation_seconds > 0 else None
+            ),
+            'context_tokens': int(metrics.get('max_prompt_tokens', 0)),
+            'outcome': 'success' if status == 'passed' else 'failure',
+            'verification': 'test_receipt',
+            'timestamp': observed_at,
+            'evidence_ref': {
+                'kind': 'run_result',
+                'uri': str(result_path.relative_to(HUB)).replace('\\', '/'),
+                'sha256': evidence_hash,
+                'observed_at': observed_at,
+            },
+        }
+        append_performance_evidence(registry_path, record)
+        return True
+    except (OSError, ValueError, ModelRegistryError):
+        return False
+
+
+def _may_defer_to_configured_fallback(route, provider_id, model_id, policy):
+    if policy.get('mode', 'disabled') == 'disabled':
+        return False
+    substitutions = policy.get('substitutions', [])
+    if not any(row.get('from_provider') == provider_id
+               and row.get('from_model') in (model_id, '*')
+               for row in substitutions):
+        return False
+    for candidate in route.get('candidate_models', []):
+        if (candidate.get('provider_id') == provider_id
+                and candidate.get('model_id') == model_id):
+            reasons = candidate.get('excluded_reasons', [])
+            return reasons == ['model_unavailable']
+    errors = route.get('provider_discovery_errors', [])
+    return any(error.get('provider_id') == provider_id and error.get('code') in {
+        'unavailable', 'connection_lost', 'service_unavailable', 'timeout',
+        'tunnel_unavailable', 'tunnel_timeout', 'model_missing',
+    } for error in errors) or not any(
+        row.get('provider_id') == provider_id and row.get('model_id') == model_id
+        for row in route.get('candidate_models', [])
+    )
 
 
 def new_directory(kind):
@@ -82,6 +216,15 @@ def main():
     parser.add_argument('--assistant-write-path', action='append', default=[],
                         help='Authorize one exact relative text-file path for this task only.')
     parser.add_argument('--model',default=config['inference']['model']);parser.add_argument('--endpoint',default=config['inference']['endpoint'])
+    parser.add_argument('--provider', choices=['ollama', 'ssh_tunnel_ollama'])
+    parser.add_argument('--routing-mode', choices=['configured', 'local_only', 'remote_allowed'], default='configured')
+    parser.add_argument('--role', help='Task-specific agent role for routing; does not grant tools or permissions.')
+    parser.add_argument('--context', type=int, default=16384)
+    parser.add_argument('--max-context', type=int, default=32768)
+    parser.add_argument('--max-memory-gib', type=float)
+    parser.add_argument('--minimum-capability', action='append', default=[], metavar='CAPABILITY=0..1')
+    parser.add_argument('--preferred-model', action='append', default=[])
+    parser.add_argument('--exclude-model', action='append', default=[])
     parser.add_argument('--write-path',action='append',default=[])
     parser.add_argument(
         '--allow-pinned-tests', action='store_true',
@@ -182,15 +325,58 @@ def main():
             prepare_bridges(project,parent,packet)
             try:
                 with exclusive(PRIVATE/'inference.lock','qwen'):
-                    selected_model = args.model
-                    if selected_model == 'auto':
-                        provider_name = config['inference']['provider']
-                        routing = choose_model(
-                            get_models(args.endpoint, provider_name), task,
-                            provider_name,
-                        )
-                        selected_model = routing['model']
-                        print('LOCAL MODEL ROUTING: ' + json.dumps(routing), flush=True)
+                    fallback_policy = config['inference'].get(
+                        'fallback', {'mode': 'disabled', 'substitutions': []}
+                    )
+                    if args.context < 1 or args.max_context < args.context or args.max_context > 131072:
+                        raise AgentError('Requested and maximum context values are invalid.')
+                    minimums = parse_capability_minimums(args.minimum_capability)
+                    specs = provider_specs(config, args.endpoint, args.routing_mode, args.provider)
+                    candidates, discovery_errors = discover_candidates(specs)
+                    registry_path = PRIVATE / 'model-capabilities.json'
+                    evidence_path = PRIVATE / 'model-performance.jsonl'
+                    registry = load_registry(registry_path)
+                    performance = read_recent_performance(evidence_path)
+                    explicit_model = None if args.model == 'auto' else args.model
+                    route = route_model(
+                        task, candidates, registry, performance_evidence=performance,
+                        requested_context=args.context, max_context=args.max_context,
+                        provider_mode=args.routing_mode,
+                        authorized_providers=tuple(specs),
+                        provider_filter=args.provider,
+                        minimum_capabilities=minimums,
+                        preferred_models=args.preferred_model,
+                        excluded_models=args.exclude_model,
+                        conservative_default=(config['inference']['model'] if args.model == 'auto' else None),
+                        model_override=explicit_model,
+                        agent_role=args.role,
+                        resource_limits=({'max_memory_gib': args.max_memory_gib}
+                                         if args.max_memory_gib is not None else None),
+                        provider_errors=discovery_errors,
+                    )
+                    if route['selected'] is None:
+                        # Preserve Milestone 2 preflight fallback for an explicitly
+                        # configured provider/model pair; this is not a router claim
+                        # that the unavailable provider is usable.
+                        configured_provider = args.provider or config['inference']['provider']
+                        if (args.routing_mode == 'configured'
+                                and _may_defer_to_configured_fallback(
+                                    route, configured_provider, args.model, fallback_policy)):
+                            provider_name = configured_provider
+                            selected_model = args.model
+                            route['status'] = 'uncertain'
+                            route['selected'] = {'provider_id': provider_name,
+                                                 'model_id': selected_model,
+                                                 'model_digest': None}
+                            route['reason'] = 'Configured model retained for the independent preflight fallback policy.'
+                        else:
+                            raise AgentError('No available model satisfies the routing constraints. Review the routing explanation and model registry.')
+                    else:
+                        provider_name = route['selected']['provider_id']
+                        selected_model = route['selected']['model_id']
+                    selected_spec = specs[provider_name]
+                    selected_endpoint = selected_spec['endpoint']
+                    selected_profile = selected_spec.get('profile')
                     conversation = ()
                     if args.conversation:
                         if writes:
@@ -205,13 +391,20 @@ def main():
 
                     result=run_agent(
                         project,selected_model,task,
-                        parent/'execution',args.endpoint,
+                        parent/'execution',selected_endpoint,
                         writes=writes,
                         conversation=conversation,
-                        provider_name=config['inference']['provider'],
+                        provider_name=provider_name,
+                        context=args.context,
                         test_config=test_config,
                         assistant_root=args.assistant_root,
                         assistant_write_paths=assistant_write_paths,
+                        provider_profile=selected_profile,
+                        remote_profile=config['inference'].get('remote'),
+                        fallback_policy=fallback_policy,
+                        fallback_approval=(approve_provider_fallback
+                                           if fallback_policy['mode'] == 'ask' else None),
+                        routing_decision=route,
                     )
             finally:
                 atomic_write(parent/'post-run.json',encoded({'state':project.state(),'memory':packet['memory_snapshot'],
@@ -221,9 +414,13 @@ def main():
             result.setdefault('commands', [])
             result['logical_project_id'] = logical_project_id
             atomic_write(parent/'execution'/'result.json', encoded(result))
+            _record_verified_performance(
+                result, parent/'execution', PRIVATE/'model-performance.jsonl'
+            )
             print(json.dumps({'run':str(parent),'logical_project_id':logical_project_id,
                               'status':result['status'],'summary':result.get('summary'),
-                              'operator_policy':result['operator_policy'],'verified_test_status':result['verified_test_status']},indent=2));return
+                              'operator_policy':result['operator_policy'],'verified_test_status':result['verified_test_status'],
+                              'routing_decision': result.get('routing_decision')},indent=2));return
         if args.action=='prepare-handoff':
             if not args.run_directory:raise AgentError('Select an actual saved run.')
             run=args.run_directory.resolve()

@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import patch
 import model_router
 from model_router import choose_model, get_models
+from inference_provider import ProviderFailure
 
 MODELS = [
     "qwen3.8:27b",
@@ -17,14 +18,19 @@ class ModelRouterTests(unittest.TestCase):
         self.assertEqual(result["model"], "qwen3:8b")
         self.assertEqual(result['provider'], 'ollama')
         self.assertFalse(result["cloud_used"])
+        self.assertEqual(result['status'], 'uncertain')
+        self.assertEqual(result['confidence'], 'low')
 
-    def test_coding_falls_back_to_qwen25_if_qwen3_unavailable(self):
+    def test_uncertain_routing_uses_only_configured_default_then_available_candidate(self):
         result = choose_model(["qwen2.5-coder:7b-instruct"], "Write Python tests")
         self.assertEqual(result["model"], "qwen2.5-coder:7b-instruct")
 
-    def test_qwen35_is_not_automatically_routed(self):
-        with self.assertRaises(RuntimeError):
-            choose_model(["qwen3.5:4b"], "Write Python tests")
+    def test_name_alone_never_asserts_a_capability_or_excludes_a_model(self):
+        result = choose_model(["qwen3.5:4b"], "Write Python tests")
+        self.assertEqual(result['status'], 'uncertain')
+        self.assertEqual(result['selected_evidence']['capability_sources'], {})
+        self.assertIn('capabilities_context_tool_calling_memory',
+                      result['candidate_models'][0]['uncertainties'])
     def test_model_discovery_uses_configured_provider_contract(self):
         provider = type('FakeProvider', (), {
             'models': lambda self: [{'name': 'qwen3.5:4b'}],
@@ -34,6 +40,33 @@ class ModelRouterTests(unittest.TestCase):
             self.assertEqual(get_models('http://127.0.0.1:11434', 'ollama'),
                              ['qwen3.5:4b'])
         factory.assert_called_once_with('ollama', 'http://127.0.0.1:11434')
+
+    def test_candidate_discovery_checks_health_records_digest_and_closes(self):
+        class FakeProvider:
+            closed = False
+            def health_check(self): return {'healthy': True}
+            def models(self): return [{'name': 'model-a', 'digest': 'sha256:abc'}]
+            def close(self): self.closed = True
+        provider = FakeProvider()
+        with patch.object(model_router, 'create_inference_provider', return_value=provider):
+            candidates, errors = model_router.discover_candidates({
+                'ollama': {'endpoint': 'http://127.0.0.1:11434'},
+            })
+        self.assertEqual(errors, [])
+        self.assertEqual(candidates[0]['model_digest'], 'sha256:abc')
+        self.assertTrue(provider.closed)
+
+    def test_candidate_discovery_does_not_hide_authentication_failures(self):
+        class FakeProvider:
+            def health_check(self):
+                raise ProviderFailure('authentication', 'Authentication denied.')
+            def models(self): return []
+            def close(self): pass
+        with patch.object(model_router, 'create_inference_provider', return_value=FakeProvider()):
+            with self.assertRaises(ProviderFailure):
+                model_router.discover_candidates({
+                    'ollama': {'endpoint': 'http://127.0.0.1:11434'},
+                })
 
     def test_model_discovery_rejects_unsupported_provider_without_fallback(self):
         with self.assertRaises(ValueError):
@@ -57,7 +90,9 @@ class ModelRouterTests(unittest.TestCase):
 
     def test_complex_reasoning(self):
         result = choose_model(MODELS, "Debug complex architecture")
-        self.assertEqual(result["model"], "qwen3.8:27b")
+        self.assertEqual(result["model"], "qwen3:8b")
+        self.assertIn('debugging', result['task_classification']['categories'])
+        self.assertIn('architecture_planning', result['task_classification']['categories'])
 
     def test_general_assistance(self):
         result = choose_model(MODELS, "Explain this project")

@@ -34,6 +34,22 @@ that material for the current task. Lasting guidance must be distilled and saved
 through the reviewed project-memory adapter; this does not change model weights.
 The terminal accepts local paths, not uploaded attachments.
 
+## Public web research and saved sources
+
+Ask the assistant to search the public web, read an HTTPS page, or retrieve a
+public YouTube transcript. Retrieval does not log in, submit forms, run page
+scripts, or download video media. It refuses redirects, nonstandard HTTPS ports,
+private/reserved addresses, non-HTML page responses, and oversized responses.
+Search snippets, page text, and captions are untrusted source material; ask for
+citations and the assistant will cite the source URLs it actually read.
+
+To keep a source, explicitly ask the assistant to save or remember it. Saved
+pages and transcripts, with URL, title, retrieval date, and content hash, live in
+the ignored `.local/sources/sources.jsonl` file. Ask to search saved sources or
+forget one; forgetting removes its record and content from the corpus. This is local
+retrieval-backed reference storage, not model-weight training. The corpus is
+limited to 20 MB and each retrieved text is limited to 16,000 characters.
+
 ## Launch local Qwen
 
 In normal PowerShell, this uses the existing Ollama server and installed
@@ -105,8 +121,274 @@ Platform detection does not add a general shell capability.
 Configuration, registered roots, memory, and run history remain local to each
 installation. Stable logical project IDs can match across installations, while
 each host resolves its own root and retains its own checkout-bound approvals and
-receipts. The current provider profile is still local Ollama on IPv4 loopback;
-LAN inference and remote execution are separate future phases.
+receipts. The default provider remains local Ollama on IPv4 loopback. Version 3
+configuration can explicitly select Ollama through a managed SSH local forward.
+Version 1 and version 2 configurations remain readable for local operation; the
+older unmanaged remote profile is rejected. The SSH transport is inference-only;
+all tools and authorization remain on Windows. Direct LAN Ollama and remote
+execution are not supported.
+
+### Explicit Mac inference profile (prepared; hardware not validated)
+
+Remote inference is disabled by default. When explicitly selected, the Windows
+agent starts a run-scoped OpenSSH tunnel, verifies the enrolled host key, and
+checks that the listener belongs to that exact SSH process. The Mac Ollama
+service must listen only on its own loopback interface. Do not bind it to
+LAN/public interfaces or configure router forwarding.
+
+Version 3 keeps the local provider active unless the operator changes `provider`
+to `ssh_tunnel_ollama` and sets `remote.enabled` to `true`. The forwarded port
+must be in 20000–29999 and must match the endpoint exactly. The remote profile
+records a stable profile ID, SSH alias, expected SSH host-key SHA-256 fingerprint,
+and the `ssh-agent` credential reference. Credential values and private keys do
+not belong in this file. Configure the SSH alias to use the pinned `known_hosts`
+entry and confirm its fingerprint out of band before starting the tunnel.
+
+```json
+{
+  "version": 3,
+  "projects": {
+    "kronosstage": {"name": "KronosStage", "root": "D:/Workspaces/KronosStage"}
+  },
+  "inference": {
+    "provider": "ollama",
+    "model": "qwen3:8b",
+    "endpoint": "http://127.0.0.1:11434",
+    "remote": {
+      "enabled": false,
+      "profile_id": "mac_studio",
+      "port": 22001,
+      "ssh_host_alias": "mac-studio-inference",
+      "ssh_host_key_sha256": "SHA256:REPLACE_WITH_VERIFIED_FINGERPRINT",
+      "credential_ref": "ssh-agent",
+      "known_hosts_file": "C:/Users/you/.ssh/mac_known_hosts",
+      "ssh_config_file": "C:/Users/you/.ssh/mac_config"
+    }
+  }
+}
+```
+
+Selecting remote inference requires both `provider: "ssh_tunnel_ollama"` and
+`endpoint: "http://127.0.0.1:22001"`; the remote profile must be enabled. The
+app rejects arbitrary hosts, ports, credentials in URLs, query strings,
+fragments, and redirects. Requests remain non-streaming, bounded to 2 MiB
+responses, and use the fixed Ollama API path allowlist. The remote model receives
+only inference prompts and tool schemas/results; it gets no Windows filesystem,
+shell, repository, approval, or broker connection. Tool proposals are validated
+and executed by the Windows broker.
+
+Before launching OpenSSH, the agent runs `ssh-keygen -F` against the explicitly
+selected known-hosts file and hashes the returned public host key; it requires
+one exact match with the configured fingerprint. OpenSSH then uses that same
+known-hosts file with strict checking, public-key-only batch authentication,
+password prompts disabled, agent forwarding disabled, cleared forwards, and
+`ExitOnForwardFailure`. The SSH process is started with `-N` and only the fixed
+`127.0.0.1:PORT:127.0.0.1:11434` forward. Windows listener ownership must match
+the spawned process before any HTTP request is sent. Tunnel process and listener
+ownership are checked again before each request, and only the owned process is
+terminated during cleanup. A stale/missing listener, wrong key, occupied port,
+or SSH failure aborts inference by default. A configured version 4 fallback may
+change provider only under the explicit fallback policy below.
+
+#### Host-key enrollment and Mac prerequisites
+
+1. On the Mac's local console, inspect its SSH host key fingerprint, for example
+   with `sudo ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub -E sha256`.
+   Transfer the public host key to Windows through a trusted out-of-band method;
+   do not trust `ssh-keyscan` output as enrollment evidence.
+2. Put the exact host public key in a dedicated Windows known-hosts file under
+   the configured alias. Set the configured SHA-256 fingerprint to the value
+   verified from the Mac console. The manager compares it with the key actually
+   returned by `ssh-keygen -F` for that alias.
+3. Create a dedicated Windows SSH config file with that alias, the Mac's private
+   network address, SSH username, and port. Do not add `ProxyCommand`, local
+   commands, or unrelated forwarding rules. Use a public key loaded in the
+   Windows OpenSSH agent; never put private key text in agent configuration.
+4. On the Mac, enable Remote Login only for the dedicated account/key. Restrict
+   that `authorized_keys` entry to forwarding with the OpenSSH options
+   `restrict,port-forwarding,permitopen="127.0.0.1:11434"`; use a dedicated key.
+   Configure Ollama to listen on `127.0.0.1:11434` only.
+5. Save the explicit `known_hosts_file` and `ssh_config_file` paths in the
+   ignored host-local agent configuration. The app starts and stops the tunnel
+   per run; it does not keep a background SSH process alive.
+
+If startup fails, check the enrolled fingerprint, alias, selected SSH config,
+OpenSSH availability, agent-loaded public key, and Mac Remote Login logs. An
+occupied forwarded port is rejected rather than reused. If a run is interrupted,
+the owned SSH child is terminated and waited on, then killed only if that same
+child does not exit; unrelated SSH processes are not enumerated or terminated.
+If cleanup cannot confirm listener release, remote inference remains unavailable
+until the port is clear and a new run revalidates the host key.
+
+### Controlled provider fallback (configuration version 4)
+
+Windows Ollama remains the default provider. Version 4 adds a fallback policy;
+the default is `disabled`, which stops a run on provider failure. Fallback is
+preflight only: a failed health/model check may switch providers before task
+context is sent. Inference requests are never automatically replayed and a
+failure during generation stops the run. There is no cloud fallback.
+
+The policy supports four modes:
+
+- `disabled`: do not substitute providers.
+- `ask`: display the source and target model, then require the operator to type
+  `YES`. If the target is remote, the prompt explicitly says task context will
+  be sent to the configured Mac provider.
+- `local_only`: use only exact Windows Ollama substitutions.
+- `approved`: permit only rows with both `operator_approved` and
+  `data_sharing_authorized` set to `true`.
+
+Each substitution binds an exact provider/model pair (or an explicit `*` source
+model), target model, and maximum context. Target models are rediscovered and
+verified before the run; the context ceiling must cover the requested context.
+Authentication, host identity, redirect, malformed response, and other
+security errors fail closed and do not trigger fallback. Keep remote enabled
+only when explicitly selecting it or configuring an intentional remote
+substitution.
+
+Example Windows-local primary with ask-before-remote fallback:
+
+```json
+"fallback": {
+  "mode": "ask",
+  "substitutions": [{
+    "from_provider": "ollama", "from_model": "qwen3:8b",
+    "to_provider": "ssh_tunnel_ollama", "to_model": "qwen3:14b",
+    "max_context": 32768,
+    "operator_approved": false,
+    "data_sharing_authorized": false
+  }]
+}
+```
+
+Place this object alongside `provider`, `model`, `endpoint`, and `remote` under
+`inference` in a version 4 host-local configuration. The remote profile uses
+the same managed SSH settings documented above. These provider choices never
+change Windows tool authorization: all model tool calls are revalidated and
+executed by the Windows broker. Tunnel, authentication, health, timeout,
+cancellation, and provider errors are recorded using sanitized error codes;
+credentials and full prompts are not included in provider diagnostics.
+
+Automated provider/tunnel tests use mocks. The Mac has not arrived, so real
+host-key enrollment, macOS SSH behavior, Ollama service compatibility, and
+performance remain unverified.
+
+Actual Mac connectivity and host identity remain unvalidated until the hardware
+is available. The listener ownership query uses Windows `Get-NetTCPConnection`;
+unsupported or failed ownership checks fail closed.
+
+### Evidence-based model routing
+
+The launcher treats the **agent role**, **model**, and **provider** as separate
+inputs. A role such as `reviewer` is descriptive routing context; it grants no
+tools or permissions. Models are discovered from authorized providers at run
+time. Windows Ollama remains the default. The SSH-tunneled provider is considered
+only when the host configuration enables it and the operator selects
+`--routing-mode remote_allowed` or has configured it as the primary provider.
+Routing never changes the independent Milestone 2 fallback policy.
+
+Task classification uses bounded deterministic keyword rules and can assign
+several categories (for example, debugging plus test generation). The router
+first excludes unavailable, unauthorized, explicitly excluded, context- or
+memory-incompatible models, and models with measured capability scores below a
+minimum. It then ranks eligible candidates by operator preference, recent
+verified outcomes, capability evidence, measured latency, and stable provider
+and model identifiers. Outcome rates and latency affect ranking only after at
+least three recent receipts in the same task category; smaller samples remain
+visible but do not rank models. Missing evidence produces a low-confidence
+`uncertain` decision. With `--model auto`, the configured model is the
+conservative default when it is available and has no known constraint failure.
+Model names and model-reported claims do not establish capabilities.
+
+The version 1 registry is an operator-maintained, private file at
+`.local/model-capabilities.json`; it is not created automatically and is
+ignored by Git. Profiles are keyed by provider, model ID, and digest. Capability
+values range from 0 to 1 and every value carries a provenance source:
+`verified_measurement`, `operator_provided`, or `unverified_estimate`. Verified
+measurements require timestamped SHA-256 evidence references. Context,
+tool-calling, estimated memory, limitations, and benchmark references are
+separate fields. The router discards verified profile measurements older than
+90 days; a changed digest no longer matches its profile.
+
+Example profile (replace identifiers and evidence references with operator-
+verified values; do not copy these sample scores as facts):
+
+```json
+{
+  "schema_version": 1,
+  "models": [{
+    "provider_id": "ollama",
+    "model_id": "qwen3:8b",
+    "model_digest": "sha256:ACTUAL_OLLAMA_DIGEST",
+    "capabilities": {
+      "code_generation": {
+        "value": 0.7,
+        "source": "verified_measurement",
+        "evidence_refs": [{
+          "kind": "pinned_test_report",
+          "uri": ".local/evaluations/qwen3-code.json",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "observed_at": "2026-11-15T12:00:00+00:00"
+        }]
+      },
+      "test_generation": {
+        "value": 0.7,
+        "source": "operator_provided",
+        "evidence_refs": []
+      }
+    },
+    "tool_calling": {
+      "value": true,
+      "source": "operator_provided",
+      "evidence_refs": []
+    },
+    "context_window": {
+      "value": 32768,
+      "source": "operator_provided",
+      "evidence_refs": []
+    },
+    "estimated_memory_gib": {
+      "value": 8,
+      "source": "unverified_estimate",
+      "evidence_refs": []
+    },
+    "known_limitations": ["Evidence is task-specific."],
+    "benchmark_evidence": []
+  }]
+}
+```
+
+The private `.local/model-performance.jsonl` store receives records only when
+the host has an unchanged test receipt with a passing or failing result. It
+records inference-call latency, throughput when available, context usage,
+provider/model identity, task category, timestamp, and a hash-bound run-result
+reference. It does not treat model prose as verification. Rows older than 90
+days are ignored. Passing tests are evidence of those tests only; they do not
+prove that every natural-language task requirement was met.
+
+Examples:
+
+```powershell
+# Automatic local route; reports an uncertain selection if profiles are absent.
+agent.py run --project KronosStage --task "Debug and add regression tests" --model auto --routing-mode local_only
+
+# Explicit model override, still checked for availability, provider authorization,
+# context, exclusions, and any registered capability failures.
+agent.py run --project KronosStage --task "Review the parser" --model qwen3:8b --role reviewer --context 16384 --max-context 32768
+
+# Allow discovery across Windows and an explicitly enabled SSH-tunneled Mac profile.
+agent.py run --project KronosStage --task "Plan the migration" --model auto --routing-mode remote_allowed --preferred-model ssh_tunnel_ollama/qwen3:14b --exclude-model qwen3.5:4b
+
+# Operator-declared minimums and a conservative memory ceiling.
+agent.py run --project KronosStage --task "Generate tests" --model auto --minimum-capability test_generation=0.7 --max-memory-gib 24
+```
+
+The structured `routing_decision` is included in the run result and CLI JSON;
+it lists classifications, candidate exclusions, evidence sources, confidence,
+constraints, and selected provider/model. It contains no task prompt. The public
+`model_router.route_model` interface also accepts agent role, priority, provider
+availability, resource limits, and estimated workload for later scheduler use;
+this milestone does not implement a scheduler or concurrent agents.
 
 For deterministic inspection without any model request:
 
