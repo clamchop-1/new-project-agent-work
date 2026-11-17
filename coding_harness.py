@@ -344,6 +344,13 @@ class LegacyExecutionContext:
     conversation: tuple[Mapping[str, Any], ...] = ()
     assistant_root: Path | None = None
     assistant_write_paths: tuple[str, ...] = ()
+    allowed_tools: tuple[str, ...] | None = None
+    role_instructions: str = ''
+    provider_profile: Mapping[str, Any] | None = None
+    remote_profile: Mapping[str, Any] | None = None
+    fallback_policy: Mapping[str, Any] | None = None
+    fallback_approval: Any = None
+    routing_decision: Mapping[str, Any] | None = None
 
     @property
     def project_id(self) -> str:
@@ -425,6 +432,13 @@ class HarnessRun:
                     max_tool_calls=self.request.budgets.max_tool_calls,
                     cancel_event=self._cancel,
                     event_callback=self._event_callback,
+                    allowed_tools=ctx.allowed_tools,
+                    role_instructions=ctx.role_instructions,
+                    provider_profile=ctx.provider_profile,
+                    remote_profile=ctx.remote_profile,
+                    fallback_policy=ctx.fallback_policy,
+                    fallback_approval=ctx.fallback_approval,
+                    routing_decision=ctx.routing_decision,
                 )
         except BaseException as exc:  # Preserve harness failures as a terminal record.
             self.error = str(exc)[:1000]
@@ -467,10 +481,18 @@ class HarnessRun:
                 if path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == row.get('sha256'):
                     receipts.append(EvidenceReference('command_receipt', str(path.resolve()),
                                                       row['sha256']))
+        summary = dict(raw.get('summary')) if isinstance(raw.get('summary'), Mapping) else {}
+        # Host-produced fields remain separate from the model's own finish claim.
+        for key in ('verified_test_status', 'receipt_integrity',
+                    'completion_classification', 'model_metrics', 'writes',
+                    'provider', 'model', 'model_digest', 'routing_decision',
+                    'error', 'provider_error'):
+            if key in raw:
+                summary['host_' + key] = raw[key]
         result = HarnessResult(
             SCHEMA_VERSION, self.request.run_id, self.adapter.harness_id,
             self.adapter.version, status, raw_status,
-            raw.get('summary') if isinstance(raw.get('summary'), Mapping) else {},
+            summary,
             None, tuple(evidence), tuple(receipts),
         )
         with self._lock:

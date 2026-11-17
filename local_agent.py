@@ -323,9 +323,11 @@ TOOLS = [
 
 
 class Broker:
-    def __init__(self, project, run, writes=(), test_config=None, assistant_root=None, assistant_write_paths=()):
+    def __init__(self, project, run, writes=(), test_config=None, assistant_root=None,
+                 assistant_write_paths=(), allowed_tools=None):
         self.project, self.run = project, Path(run)
         self.allowed_writes = set(writes)
+        self.allowed_tools = None if allowed_tools is None else frozenset(allowed_tools)
         self.test_config = test_config
         self.commands, self.writes = [], []
         self.assistant_writes = []
@@ -455,6 +457,8 @@ class Broker:
         return {**receipt, 'output': text}
 
     def call(self, name, args):
+        if self.allowed_tools is not None and name not in self.allowed_tools:
+            raise AgentError('Tool is not permitted for this agent role.')
         if name == 'search_web':
             return search_web(**args)
         if name == 'read_web_page':
@@ -912,7 +916,7 @@ def model_tool_result(project, name, result):
     return presented
 
 
-def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), test_config=None, max_steps=16, context=16384, conversation=(), provider_name='ollama', assistant_root=None, assistant_write_paths=(), max_tool_calls=None, cancel_event=None, event_callback=None, provider_profile=None, remote_profile=None, fallback_policy=None, fallback_approval=None, routing_decision=None):
+def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), test_config=None, max_steps=16, context=16384, conversation=(), provider_name='ollama', assistant_root=None, assistant_write_paths=(), max_tool_calls=None, cancel_event=None, event_callback=None, provider_profile=None, remote_profile=None, fallback_policy=None, fallback_approval=None, routing_decision=None, allowed_tools=None, role_instructions=''):
     output = Path(output);output.mkdir(parents=True, exist_ok=False)
     assistant_files = AssistantFiles(assistant_root) if assistant_root else None
     if assistant_write_paths and assistant_files is None:
@@ -920,6 +924,15 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
     assistant_write_paths = tuple(assistant_files.canonical_path(path) for path in assistant_write_paths) if assistant_files else ()
     if len(set(assistant_write_paths)) != len(assistant_write_paths):
         raise AgentError('Assistant file write paths must be unique.')
+    if allowed_tools is not None:
+        known_tools = {tool['function']['name'] for tool in TOOLS}
+        if (not isinstance(allowed_tools, (tuple, list, set, frozenset))
+                or 'finish' not in allowed_tools or set(allowed_tools) - known_tools):
+            raise AgentError('Agent role tool grant is malformed.')
+        allowed_tools = frozenset(allowed_tools)
+    if not isinstance(role_instructions, str) or len(role_instructions) > 2000:
+        raise AgentError('Agent role instructions exceed the bounded text limit.')
+    no_secrets(role_instructions)
     fallback_policy = fallback_policy or {'mode': 'disabled', 'substitutions': []}
     original_provider, original_model = provider_name, model
     fallback_record = None
@@ -1007,7 +1020,8 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
         packet = project.takeover()
         public_packet = {**packet, 'state': {k: v for k, v in packet['state'].items() if k != 'files'}}
         broker = Broker(project, output, writes, test_config, assistant_root=assistant_files,
-                        assistant_write_paths=assistant_write_paths)
+                        assistant_write_paths=assistant_write_paths,
+                        allowed_tools=allowed_tools)
     except BaseException:
         try:
             client.close()
@@ -1021,7 +1035,9 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
             'authorized_write_paths': sorted(broker.allowed_assistant_writes),
             'excluded': 'private/system paths, hidden entries, links, and secret-like content',
         }
-    system = ('You are a general local assistant with project-aware coding tools. Follow the supplied authoritative project instructions and newest memory. '
+    system = ((('Agent role responsibilities: ' + role_instructions + '\n')
+               if role_instructions else '')
+              + 'You are a general local assistant with project-aware coding tools. Follow the supplied authoritative project instructions and newest memory. '
               'The startup packet already contains the current authoritative memory loaded from the selected project’s '
               '.local/PROJECT_CONTEXT.md and .local/DURABLE_MEMORY.md files. These private files are intentionally '
               'excluded from ordinary project listing/search tools. Never claim they are missing because a listing or '
@@ -1111,6 +1127,9 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
             if (output/'STOP').exists(): raise AgentError('Operator emergency STOP requested.')
             if len(encoded(messages)) > 54000: raise AgentError('Context budget reached; save a bounded handoff and continue in a new session.')
             active_tools=available_tools(TOOLS, test_config=test_config)
+            if allowed_tools is not None:
+                active_tools = [tool for tool in active_tools
+                                if tool['function']['name'] in allowed_tools]
             if len(encoded(messages)) > 47000:
                 active_tools=[tool for tool in active_tools if tool['function']['name']=='finish']
                 messages.append({'role':'user','content':'The bounded read budget is nearly used. Finish now using only observed evidence and mark remaining unknowns; do not request more source.'})

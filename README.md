@@ -558,3 +558,13 @@ Use `--dry-run` to check whether Git accepts the push without updating the remot
 The helper never stages or commits files; it reports uncommitted work so it is
 clear that only existing commits are uploaded. Configure the intended `origin`
 remote before using it.
+
+## Multi-agent orchestration
+
+Milestone 4 adds an operator-approved task graph with role-scoped agents,
+model-router integration, bounded scheduling, detached task worktrees, and
+evidence-backed integration proposals. See
+[MULTI_AGENT_ORCHESTRATION.md](MULTI_AGENT_ORCHESTRATION.md) for role
+permissions, resource defaults, review gates, and CLI examples. Resource
+measurements are mocked until host capacity is measured; task changes remain in
+worktrees until explicitly reviewed and integrated by the operator.
