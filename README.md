@@ -1,5 +1,7 @@
 # Local assistant setup
 
+Project-scoped searchable knowledge, retrieval, and recovery commands are documented in [KNOWLEDGE_RETRIEVAL.md](KNOWLEDGE_RETRIEVAL.md).
+
 This local assistant uses Ollama and Qwen for general help and project-aware coding.
 From PowerShell, run `agent` in the folder or drive root you want it to access.
 Bounded current-folder reads include PDF text extraction; one-task text edits and

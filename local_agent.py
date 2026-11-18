@@ -81,8 +81,10 @@ class Ollama:
             raise ProviderFailure('malformed_response', 'Inference provider returned malformed tool-call data.')
         return response
     def request(self, path, payload=None, timeout=180):
-        if path not in ('/api/version', '/api/tags', '/api/ps', '/api/chat'):
+        if path not in ('/api/version', '/api/tags', '/api/ps', '/api/chat', '/api/embed'):
             raise AgentError('Endpoint is not on the local inference allowlist.')
+        if path == '/api/embed' and self.tunnel is not None:
+            raise AgentError('Embedding requests are limited to Windows loopback Ollama.')
         if type(timeout) not in (int, float) or not 0 < timeout <= MAX_INFERENCE_TIMEOUT_SECONDS:
             raise AgentError('Inference request timeout is outside the configured bound.')
         body = encoded(payload) if payload is not None else None

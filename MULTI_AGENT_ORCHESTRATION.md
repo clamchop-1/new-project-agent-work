@@ -96,8 +96,35 @@ python -B orchestrate.py integrate --run-id RUN_ID --proposal-sha256 PROPOSAL_SH
 
 Integration rechecks the proposal content, baseline, project memory, approved
 paths, and leases, then calls the existing `Broker.write` for each file. It does
-not automatically merge task branches. Conflicts or partial broker failures
-are recorded and require operator handling.
+not automatically merge task branches. Before writing, it creates a durable
+`.local/orchestration/<run>/integration/journal.json` containing the Git baseline
+and each target's before/after hash. The journal is atomically refreshed after
+each successful write. A crash between replacing a target and refreshing the
+journal is detected by checking the target against both hashes.
+
+If integration is interrupted, inspect without changing files:
+
+```powershell
+python -B orchestrate.py integration-recovery --run-id RUN_ID
+```
+
+Targets are classified as `before`, `after`, or `conflict`. A conflict matches
+neither reviewed hash and must be preserved for manual reconciliation. After
+reviewing the paths and confirming the approved proposal digest, an operator can
+resume remaining compare-and-swap writes:
+
+```powershell
+python -B orchestrate.py integration-reconcile --run-id RUN_ID `
+  --proposal-sha256 PROPOSAL_SHA256 --recovery-action resume
+```
+
+If every target already matches its reviewed after hash, `accept_applied` records
+that outcome. Recovery verifies the proposal, original approval, Git commit and
+branch, unrelated file contents, and target hashes. It skips applied targets and
+writes only targets still at their exact before hash. It never resets or deletes
+work. An unresolved journal blocks task execution and new proposals. If evidence
+cannot be verified, preserve the run and reconcile manually; there is no
+automatic rollback.
 
 Use `pause`, `resume`, and `cancel` with the run ID to control a live run. Use
 `status` to inspect current and terminal state. A crashed run can be reopened
@@ -125,11 +152,17 @@ Mac Studio has not been measured or validated; do not increase limits based on
 assumed capacity. The initial implementation allows a single Developer
 ancestor to feed read-only QA/Review tasks, but does not combine independent
 developer worktrees. Integration supports bounded UTF-8 text files and stops
-when diffs exceed its review limit. Failed multi-file integration can be
-partial; inspect its receipts and resolve it manually. Candidate lessons are
-not trusted skills. RAG, autonomous skill promotion, model training, and
-fine-tuning remain out of scope.
+when diffs exceed its review limit. Interrupted multi-file integration is
+journaled; verified work can be resumed idempotently, while conflicts require
+manual operator reconciliation. Candidate lessons remain separate from trusted
+skills. The project-scoped, evidence-reviewed skill lifecycle and operator CLI are
+documented in [PERSISTENT_SKILLS.md](PERSISTENT_SKILLS.md). RAG, model training,
+and fine-tuning were out of scope for the initial orchestration milestone. The
+project-scoped retrieval layer is now documented in
+[KNOWLEDGE_RETRIEVAL.md](KNOWLEDGE_RETRIEVAL.md); retrieved documents and skills
+are bounded reference data and do not grant permissions.
 
-The next milestone should validate real host resource measurements and
-operational recovery, then add the separately reviewed Milestone 5 lesson
-validation workflow without weakening the candidate/skill/model separation.
+The next milestone should validate real host resource measurements and operational
+recovery. The knowledge index builds on the approved skill and project-memory
+provenance boundaries; local embedding compatibility remains unverified until an
+installed embedding model is explicitly selected.

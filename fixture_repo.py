@@ -2,7 +2,23 @@
 import json
 from pathlib import Path
 import subprocess
+import time
 from agent_core import Project, file_hash
+
+
+def _git(*args, retry_object_write=False):
+    """Run a fixture Git command with enough failure detail to diagnose races."""
+    for attempt in range(4):
+        result = subprocess.run(['git', *args], capture_output=True)
+        if result.returncode == 0:
+            return result
+        detail = result.stderr.decode('utf-8', errors='replace')
+        transient_object_denial = ('unable to write file .git/objects/' in detail
+                                   and 'Permission denied' in detail)
+        if not retry_object_write or not transient_object_denial or attempt == 3:
+            raise RuntimeError('Fixture Git command failed: ' + ' '.join(args[:3]) + ': '
+                               + detail[:500])
+        time.sleep(0.1 * (attempt + 1))
 
 
 def make_fixture(root):
@@ -30,10 +46,11 @@ class StatsTests(unittest.TestCase):
 '''}
     for name, text in files.items():
         path = root/name;path.parent.mkdir(exist_ok=True);path.write_text(text, encoding='utf-8')
-    subprocess.run(['git', 'init', '--initial-branch=main', str(root)], check=True, capture_output=True)
-    subprocess.run(['git', '-C', str(root), 'add', '-A'], check=True, capture_output=True)
-    subprocess.run(['git', '-C', str(root), '-c', 'user.name=Local Agent Fixture', '-c',
-                    'user.email=fixture@example.invalid', 'commit', '-m', 'Seed controlled validation fixture'], check=True, capture_output=True)
+    _git('init', '--initial-branch=main', str(root))
+    _git('-C', str(root), 'add', '-A', retry_object_write=True)
+    _git('-C', str(root), '-c', 'user.name=Local Agent Fixture', '-c',
+         'user.email=fixture@example.invalid', 'commit', '-m', 'Seed controlled validation fixture',
+         retry_object_write=True)
     local = root/'.local';local.mkdir()
     for name in ('PROJECT_CONTEXT.md', 'DURABLE_MEMORY.md'):
         (local/name).write_text('## CURRENT CODEX HANDOFF\n\nOriginating agent: codex\nTask marker: CEDAR-994. Fix average and add clamp. Tests are unfinished.\nPreserve instructions and all unrelated work.\n\n## OLDER HANDOFF\n\nHISTORY_ONLY_826; never automatically load this section.\n', encoding='utf-8')

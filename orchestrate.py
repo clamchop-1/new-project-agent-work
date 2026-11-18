@@ -49,7 +49,8 @@ def _service(project_selector, routing_mode='configured', provider_override=None
 def _parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=['decompose', 'propose', 'approve', 'run', 'status', 'pause',
-                                           'resume', 'cancel', 'integration-proposal', 'integrate'])
+                                           'resume', 'cancel', 'integration-proposal', 'integrate',
+                                           'integration-recovery', 'integration-reconcile'])
     parser.add_argument('--project', default='LocalCodingAgent')
     parser.add_argument('--run-id')
     parser.add_argument('--plan', type=Path)
@@ -59,6 +60,7 @@ def _parser():
     parser.add_argument('--task', action='append', default=[])
     parser.add_argument('--write-grant', action='append', default=[], metavar='TASK_ID=PATH')
     parser.add_argument('--proposal-sha256')
+    parser.add_argument('--recovery-action', choices=['resume', 'accept_applied'])
     parser.add_argument('--routing-mode', choices=['configured', 'local_only', 'remote_allowed'], default='configured')
     parser.add_argument('--provider', choices=['ollama', 'ssh_tunnel_ollama'])
     parser.add_argument('--test-config')
@@ -120,6 +122,12 @@ def main(argv=None):
             if not args.task:
                 raise AgentError('integration-proposal requires one or more --task ids.')
             result = service.prepare_integration(args.run_id, tuple(args.task))
+        elif args.action == 'integration-recovery':
+            result = service.integration_recovery(args.run_id)
+        elif args.action == 'integration-reconcile':
+            if not args.proposal_sha256 or not args.recovery_action:
+                raise AgentError('integration-reconcile requires --proposal-sha256 and --recovery-action.')
+            result = service.reconcile_integration(args.run_id, args.proposal_sha256, args.recovery_action)
         else:
             if not args.proposal_sha256:
                 raise AgentError('integrate requires --proposal-sha256 as explicit operator approval.')

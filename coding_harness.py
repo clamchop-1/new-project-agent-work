@@ -226,6 +226,13 @@ class HarnessEvent:
                 raise HarnessContractError('Candidate source and evidence references must be lists.')
             if not isinstance(self.payload['source_hashes'], list):
                 raise HarnessContractError('Candidate source hashes must be a list.')
+            if (not isinstance(self.payload['candidate_lesson_ref'], str)
+                    or not self.payload['candidate_lesson_ref']
+                    or len(self.payload['candidate_lesson_ref']) > 256
+                    or len(self.payload['source_refs']) > 32
+                    or len(self.payload['evidence_refs']) > 32
+                    or len(self.payload['source_hashes']) > 32):
+                raise HarnessContractError('Candidate event references exceed their bounds.')
             for digest in self.payload['source_hashes']:
                 if not isinstance(digest, str) or len(digest) != 64 or any(
                         char not in '0123456789abcdef' for char in digest):
