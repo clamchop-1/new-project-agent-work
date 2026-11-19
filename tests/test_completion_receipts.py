@@ -92,6 +92,29 @@ class CompletionReceiptIntegrationTests(FixtureCase):
         self.assertFalse(integrity['valid'])
         self.assertIn('output hash changed', integrity['errors'][0])
 
+    def test_current_passing_suite_can_be_reused_but_tampered_output_cannot(self):
+        from local_agent import reuse_successful_call
+        root = self.project.root
+        (root / 'stats.py').write_text(
+            'def clamp(value, low, high):\n    return min(max(value, low), high)\n',
+            encoding='utf-8')
+        original = (root / 'calculator.py').read_text(encoding='utf-8')
+        self.assertIn('len(values) + 1', original)
+        (root / 'calculator.py').write_text(
+            'def average(values):\n    if not values:\n        raise ValueError("empty")\n'
+            '    return sum(values) / len(values)\n', encoding='utf-8')
+        output = self.base / 'passing'
+        output.mkdir()
+        broker = Broker(self.project, output, test_config=self.test_config)
+        previous = broker.execute('tests')
+        self.assertEqual(previous['exit_code'], 0)
+        files = self.project.state()['files']
+        self.assertTrue(reuse_successful_call(
+            'run_tests', previous, broker, self.project, output, files)['reused_result'])
+        Path(previous['output_path']).write_bytes(b'changed')
+        self.assertIsNone(reuse_successful_call(
+            'run_tests', previous, broker, self.project, output, files))
+
     def test_unauthorized_write_block_is_recorded_in_incomplete_result(self):
         output = self.base / 'blocked_run'
         messages = iter([

@@ -406,6 +406,41 @@ class RunAgentValidationTests(FixtureCase):
         self.assertTrue(any(row['category'] == 'protocol'
                             for row in result['blocked_operations']))
 
+    def test_successful_discovery_and_current_reads_are_reused_without_dispatch(self):
+        name = 'calculator.py'
+        path = self.project.root / name
+        first = {'role': 'assistant', 'tool_calls': [
+            tool('list_files', {}), tool('read_file', {'path': name}),
+        ]}
+        finish = {'role': 'assistant', 'tool_calls': [
+            tool('finish', {'summary': 'Read the file.', 'unfinished': [], 'next_actions': []}),
+        ]}
+        output = self.base / 'reused'
+        responses = iter([first, first, finish])
+
+        def request(client, endpoint, payload):
+            return {'message': next(responses)}
+
+        with patch('local_agent.Ollama.model', return_value={'digest': 'fixture'}), patch(
+                'local_agent.Ollama.request', autospec=True, side_effect=request):
+            result = run_agent(self.project, 'fixture', 'Read calculator.py', output, max_steps=3)
+        rows = [json.loads(line) for line in (output / 'events.jsonl').read_bytes().splitlines()]
+        reused = [row for row in rows if row.get('result', {}).get('reused_result')]
+        self.assertEqual([row['tool'] for row in reused], ['list_files', 'read_file'])
+        self.assertEqual(reused[1]['result']['sha256'], file_hash(path))
+        self.assertTrue(all(row['broker_dispatch_seconds'] is None for row in reused))
+        self.assertEqual(result['status'], 'complete')
+        self.assertEqual(len([row for row in rows if 'inference_attempt' in row]), 3)
+
+    def test_host_progress_is_advisory_and_leaves_failed_tests_outstanding(self):
+        from local_agent import host_progress, TOOLS
+        broker = Broker(self.project, self.base / 'evidence')
+        finish = [tool for tool in TOOLS if tool['function']['name'] == 'finish']
+        message = host_progress(finish, {'run_tests'}, {'run_tests'}, [], broker, 'failed', [])
+        self.assertIn('"available_tools": ["finish"]', message['content'])
+        self.assertIn('"required_operations_outstanding": ["run_tests"]', message['content'])
+        self.assertIn('"authorized_project_paths": []', message['content'])
+
     def test_required_tests_can_repeat_after_authorized_source_change(self):
         output = self.base / 'tests_after_edit_execution'
         (self.project.root / 'stats.py').write_text(

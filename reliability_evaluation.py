@@ -2,7 +2,6 @@
 import argparse
 import json
 from pathlib import Path
-import subprocess
 import threading
 from time import monotonic
 import uuid
@@ -10,7 +9,8 @@ import uuid
 from agent_config import load_config
 from agent_core import Project, atomic_write, digest, encoded, file_hash
 from fixture_repo import _git
-from local_agent import HUB, run_agent, verify_test_receipts
+from local_agent import HUB, run_agent
+from reliability_rubric import score
 
 
 PRICING = '''def subtotal(quantity, unit_price):
@@ -79,7 +79,7 @@ def fixture(batch, name, faults):
     return Project(root), pinned
 
 
-def evaluate(batch, name, inference, wall_seconds):
+def evaluate(batch, name, inference, wall_seconds, progress_guidance=False):
     writes, task, faults = SCENARIOS[name]
     project, pinned = fixture(batch, name, faults)
     before = project.state()['files']
@@ -102,6 +102,7 @@ def evaluate(batch, name, inference, wall_seconds):
             required_operations=('read_file', 'run_tests') + (('replace_text',) if writes else ()),
             completion_policy='file_modification' if writes else 'read_only_analysis',
             cancel_event=cancel,
+            progress_guidance=progress_guidance,
         )
     except Exception as exc:
         result_file = out / 'result.json'
@@ -113,26 +114,9 @@ def evaluate(batch, name, inference, wall_seconds):
     trace = out / 'events.jsonl'
     rows = [json.loads(line) for line in trace.read_bytes().splitlines()] if trace.is_file() else []
     tools = [row for row in rows if 'tool' in row]
-    tests, integrity = verify_test_receipts(result.get('commands', []), project, out)
-    after = project.state()['files']
-    changed = {key for key in before.keys() | after.keys() if before.get(key) != after.get(key)}
-    receipts = {row['path']: row['after'] for row in result.get('writes', [])}
-    outcome_matches = (result.get('status') == 'incomplete' and
-                       bool(result.get('summary', {}).get('unfinished'))) if name == 'insufficient' else (
-                           result.get('status') == 'complete')
-    summary = result.get('summary', {}).get('summary', '')
-    expected_markers = {
-        'unfamiliar': ('SUBTOTAL=21', 'TOTAL=23', 'LIMIT_MIN=1', 'LIMIT_MAX=100'),
-        'no-change': ('NO_CHANGE_NEEDED',),
-    }
-    outcome_matches = outcome_matches and all(
-        marker in summary for marker in expected_markers.get(name, ()))
-    refactor_ok = name != 'refactor' or 'service_fee' in (project.root / 'pricing.py').read_text()
-    passed = (outcome_matches and changed == set(writes) and tests == 'passed'
-              and integrity['valid'] and set(receipts) == changed
-              and all(after[path] == value for path, value in receipts.items()) and refactor_ok)
+    acceptance = score(name, writes, project, out, before, result, rows)
     lesson = None
-    if passed and writes and result.get('completion_classification') == 'completed_verified':
+    if acceptance['passed'] and writes and result.get('completion_classification') == 'completed_verified':
         procedure = 'Use the pinned suite to verify the final bytes of every authorized edit.'
         lesson = {
             'status': 'candidate', 'project_id': project.identity,
@@ -142,21 +126,32 @@ def evaluate(batch, name, inference, wall_seconds):
         }
     return {
         'task': name, 'project_id': project.identity, 'status': result.get('status'),
-        'passed': passed,
-        'authorized_writes': writes, 'changed': sorted(changed), 'test_status': tests,
-        'receipt_integrity': integrity, 'tool_calls': len(tools),
+        **acceptance,
+        'objective': task, 'authorized_writes': writes, 'project_root': str(project.root),
+        'initial_files_sha256': before,
+        'model_digest': result.get('model_digest'), 'context': result.get('context'),
+        'write_receipts': result.get('writes', []), 'command_receipts': result.get('commands', []),
+        'actual_operations': [row['tool'] for row in tools if row.get('broker_dispatch_seconds') is not None],
+        'tool_calls': len(tools),
         'rejected_calls': sum('error' in row['result'] for row in tools),
-        'repeated_calls': sum('Repeated identical tool call' in row['result'].get('error', '') for row in tools),
+        'rejected_before_dispatch': sum(row.get('tool_batch_rejected', 0) for row in rows),
+        'repeated_calls': sum(row['result'].get('reused_result', False)
+                              or 'Repeated identical tool call' in row['result'].get('error', '') for row in tools),
+        'reused_calls': sum(row['result'].get('reused_result', False) for row in tools),
         'inference_requests': result.get('inference_attempts', 0),
         'steps': result.get('steps', 0),
         'elapsed_seconds': round(monotonic() - started, 3), 'deadline_reached': cancel.is_set(),
         'model_latency_seconds': round(sum(row['seconds'] for row in rows if 'message' in row), 3),
+        'inference_attempt_seconds': result.get('inference_attempt_seconds'),
+        'broker_dispatch_seconds': result.get('broker_dispatch_seconds'),
         'ollama_generation_seconds': round(sum(
             (row.get('timings', {}).get('eval_duration') or 0) / 1e9 for row in rows), 3),
         'peak_context_utilization': result.get('model_metrics', {}).get('max_context_utilization'),
         'retries': result.get('inference_retries', 0),
         'finish_schema_retries': result.get('finish_schema_retries', 0),
         'classification': result.get('completion_classification'),
+        'recovery_state': result.get('recovery_state'),
+        'recovery_run_id': result.get('recovery_run_id'),
         'candidate_lesson': lesson,
         'error': result.get('error'), 'evidence': str(out),
     }
@@ -166,6 +161,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('scenarios', nargs='*', choices=None)
     parser.add_argument('--wall-seconds', type=int, default=75)
+    parser.add_argument('--prompt', choices=('baseline', 'progress'), default='baseline')
     args = parser.parse_args()
     cases = args.scenarios or list(SCENARIOS)
     if set(cases) - SCENARIOS.keys() or len(cases) != len(set(cases)):
@@ -179,7 +175,8 @@ def main():
     report = HUB / '.local' / 'runs' / batch / 'evaluation.json'
     results = []
     for name in cases:
-        row = evaluate(batch, name, inference, args.wall_seconds)
+        row = evaluate(batch, name, inference, args.wall_seconds, args.prompt == 'progress')
+        row.update(prompt=args.prompt, wall_seconds=args.wall_seconds)
         results.append(row)
         atomic_write(report, encoded(results))
         print(json.dumps(row), flush=True)

@@ -41,7 +41,7 @@ class ToolHistoryTests(FixtureCase):
         self.assertNotIn('tool_calls', assistant)
         self.assertEqual(json.loads(assistant['content']), request)
         self.assertEqual(json.loads(receipt['content'])['path'], 'AGENTS.md')
-        self.assertEqual(rows[0]['message']['content'], raw)
+        self.assertEqual(next(row['message']['content'] for row in rows if 'message' in row), raw)
         audit = next(row for row in rows if row.get('tool') == 'read_file')
         self.assertEqual(audit['arguments']['path'], absolute)
         self.assertEqual(audit['result']['path'], absolute)

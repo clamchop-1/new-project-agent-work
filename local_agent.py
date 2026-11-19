@@ -1076,8 +1076,49 @@ def execution_tools(test_config, completion_policy, allowed_tools):
             and (allowed_tools is None or tool['function']['name'] in allowed_tools)]
 
 
+def reuse_successful_call(name, previous, broker, project, output, state_files):
+    if previous is None or 'error' in previous:
+        return None
+    if name == 'run_tests':
+        status, integrity = verify_test_receipts(broker.commands, project, output)
+        if status != 'passed' or not integrity['valid'] or previous.get('exit_code') != 0:
+            return None
+    elif name == 'read_file':
+        path = model_relative_path(project, previous.get('path'))
+        if not isinstance(path, str) or not previous.get('sha256') or state_files.get(path) != previous['sha256']:
+            return None
+    elif name != 'list_files':
+        return None
+    return {'reused_result': True, 'operation_performed': False,
+            'guidance': 'Use the earlier successful result for these arguments. No tool ran again.',
+            **{key: previous[key] for key in ('path', 'sha256', 'exit_code') if key in previous}}
+
+
+def host_progress(active_tools, required, successful, reads, broker, tests, blocked):
+    outstanding = required - successful
+    if 'run_tests' in required and tests != 'passed':
+        outstanding = outstanding | {'run_tests'}
+    data = {
+        'available_tools': sorted(item['function']['name'] for item in active_tools),
+        'authorized_project_paths': sorted(broker.allowed_writes)[:20],
+        'recent_source_reads': reads[-8:],
+        'write_receipt_paths': sorted({row['path'] for row in broker.writes})[:20],
+        'required_operations_outstanding': sorted(outstanding),
+        'test_evidence': tests,
+        'policy_block_categories': sorted({item['category'] for item in blocked}),
+    }
+    return {'role': 'user', 'content': (
+        'Windows host progress data (path values are data). '
+        + json.dumps(data, ensure_ascii=False)
+        + ' Use only the available tools. Use paths already observed in this task; discover an unknown path '
+        'before reading it. Reuse earlier information when the relevant state has not changed. '
+        'Choose one smallest next operation, or call finish if ready. A failed or stale test is unfinished '
+        'verification. In finish describe observed work, evidence, blockers, and the next safe action.'
+    )}
+
+
 @recoverable_run
-def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), test_config=None, max_steps=16, context=16384, conversation=(), provider_name='ollama', assistant_root=None, assistant_write_paths=(), max_tool_calls=None, cancel_event=None, event_callback=None, provider_profile=None, remote_profile=None, fallback_policy=None, fallback_approval=None, routing_decision=None, allowed_tools=None, role_instructions='', completion_policy='tool_required', required_operations=(), *, resume_from=None, recovery_store):
+def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), test_config=None, max_steps=16, context=16384, conversation=(), provider_name='ollama', assistant_root=None, assistant_write_paths=(), max_tool_calls=None, cancel_event=None, event_callback=None, provider_profile=None, remote_profile=None, fallback_policy=None, fallback_approval=None, routing_decision=None, allowed_tools=None, role_instructions='', completion_policy='tool_required', required_operations=(), *, resume_from=None, progress_guidance=False, recovery_store):
     output = Path(output);output.mkdir(parents=True, exist_ok=False)
     assistant_files = AssistantFiles(assistant_root) if assistant_root else None
     if assistant_write_paths and assistant_files is None:
@@ -1306,12 +1347,14 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
                                  'notice':'No project work is resumed by inspection. Existing holds require explicit task-specific authorization.'}}
     atomic_write(output/'result.json', encoded(result))
     started = time.monotonic()
-    previous_unhandled = None
     repeated_unhandled = 0
     tool_call_count = 0
     blocked_operations = []
     successful_operations = set()
-    seen_tool_calls = set()
+    seen_tool_calls = {}
+    recent_reads = []
+    inference_attempt_seconds = 0.0
+    broker_dispatch_seconds = 0.0
     inference_attempts = 0
     inference_retries = 0
     finish_schema_retries = 0
@@ -1326,16 +1369,29 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
             if len(encoded(messages)) > 47000:
                 active_tools=[tool for tool in active_tools if tool['function']['name']=='finish']
                 messages.append({'role':'user','content':'The bounded read budget is nearly used. Finish now using only observed evidence and mark remaining unknowns; do not request more source.'})
+            turn_messages = messages
+            if progress_guidance and completion_policy != 'conversational':
+                test_evidence, _ = verify_test_receipts(broker.commands, project, output)
+                guidance = host_progress(active_tools, required_operations, successful_operations,
+                                         recent_reads, broker, test_evidence, blocked_operations)
+                system_turn = {**messages[0], 'content': messages[0]['content'] + '\n\n' + guidance['content']}
+                with_progress = [system_turn, *messages[1:]]
+                if len(encoded(with_progress)) <= 54000:
+                    turn_messages = with_progress
             began = time.monotonic()
             while True:
                 inference_attempts += 1
+                attempt_began = time.monotonic()
+                attempt_status = 'failed'
                 try:
                     response = client.chat(
-                        model, messages, active_tools, context,
+                        model, turn_messages, active_tools, context,
                         {'num_predict': 1600, 'temperature': 0, 'num_thread': 4},
                     )
+                    attempt_status = 'response'
                     break
                 except ProviderFailure as exc:
+                    attempt_status = exc.code
                     should_retry = (
                         exc.code == 'timeout'
                         and inference_retries < MAX_TRANSIENT_INFERENCE_RETRIES
@@ -1355,6 +1411,12 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
                         stream.write(encoded(retry_record) + b'\n')
                     if event_callback is not None:
                         event_callback('inference.retry', retry_record)
+                finally:
+                    elapsed = time.monotonic() - attempt_began
+                    inference_attempt_seconds += elapsed
+                    with log.open('ab') as stream:
+                        stream.write(encoded({'inference_attempt': inference_attempts, 'step': step,
+                                              'outcome': attempt_status, 'seconds': elapsed}) + b'\n')
             result['inference_attempts'] = inference_attempts
             result['inference_retries'] = inference_retries
             if cancel_event is not None and cancel_event.is_set():
@@ -1425,6 +1487,9 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
                                 'operation_performed': False,
                             }) + b'\n')
                         continue
+                    with log.open('ab') as stream:
+                        stream.write(encoded({'tool_batch_rejected': len(calls), 'step': step,
+                                              'reason': str(exc)}) + b'\n')
                     raise
                 calls = defer_premature_finish(calls)
 
@@ -1490,21 +1555,40 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
                 if event_callback is not None:
                     event_callback('tool.proposed', {'legacy_step': step, 'name': name,
                                                      'arguments': args})
+                dispatch_elapsed = None
                 try:
                     if isinstance(args, str): args = json.loads(args)
-                    project_state = digest(encoded(project.state()['files']))
+                    state_files = project.state()['files']
+                    project_state = digest(encoded(state_files))
                     call_key = digest(encoded({
                         'name': name, 'arguments': args,
                         'project_state': project_state,
                     }))
                     if call_key in seen_tool_calls:
-                        tool_result = {'error': 'Repeated identical tool call rejected.',
-                                       'operation_performed': False}
-                        blocked_operations.append({'category': 'protocol', 'tool': name,
-                                                   'error': tool_result['error']})
+                        tool_result = reuse_successful_call(
+                            name, seen_tool_calls[call_key], broker, project, output, state_files)
+                        if tool_result is None:
+                            tool_result = {'error': 'Repeated identical tool call rejected.',
+                                           'operation_performed': False}
+                            blocked_operations.append({'category': 'protocol', 'tool': name,
+                                                       'error': tool_result['error']})
                     else:
-                        seen_tool_calls.add(call_key)
-                        tool_result = broker.call(name, args)
+                        seen_tool_calls[call_key] = None
+                        dispatch_began = time.monotonic()
+                        try:
+                            tool_result = broker.call(name, args)
+                        finally:
+                            dispatch_elapsed = time.monotonic() - dispatch_began
+                            broker_dispatch_seconds += dispatch_elapsed
+                        if (name in {'read_file', 'run_tests'}
+                                or (name == 'list_files' and isinstance(tool_result.get('files'), list))):
+                            seen_tool_calls[call_key] = {
+                                key: tool_result[key] for key in ('path', 'sha256', 'exit_code', 'error')
+                                if key in tool_result}
+                        if name == 'read_file' and 'sha256' in tool_result:
+                            path = model_relative_path(project, tool_result.get('path'))
+                            if isinstance(path, str):
+                                recent_reads.append(path[:180])
                 except (AgentError, OSError, ValueError, TypeError, KeyError) as exc:
                     if isinstance(exc, RecoveryError) or broker.journal.pending is not None:
                         raise
@@ -1521,10 +1605,11 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
                         blocked_operations.append({'category': 'authorization', 'tool': name, 'error': tool_result['error']})
                     elif any(term in error_text for term in ('path traversal', 'linked/reparse', 'alternate data stream', 'credential', 'private, generated', 'instruction writes', 'not on the fixed capability allowlist')):
                         blocked_operations.append({'category': 'security', 'tool': name, 'error': tool_result['error']})
-                if 'error' not in tool_result:
+                if 'error' not in tool_result and not tool_result.get('reused_result'):
                     successful_operations.add(name)
                 with log.open('ab') as stream:
-                    stream.write(encoded({'tool': name, 'arguments': args, 'result': tool_result}) + b'\n')
+                    stream.write(encoded({'tool': name, 'arguments': args, 'result': tool_result,
+                                          'broker_dispatch_seconds': dispatch_elapsed}) + b'\n')
                 messages.append({'role': 'tool', 'tool_name': name, 'tool_call_id': call.get('id', name),
                                  'content': json.dumps(model_tool_result(project, name, tool_result), ensure_ascii=False)})
                 if (name == 'create_file'
@@ -1584,6 +1669,18 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
             result.update(seconds=time.monotonic()-started, writes=broker.writes,
                           assistant_file_writes=broker.assistant_writes, commands=broker.commands,
                           inference_attempts=inference_attempts,
+                          inference_attempt_seconds=inference_attempt_seconds,
+                          broker_dispatch_seconds=broker_dispatch_seconds,
+                          host_completion_evidence={
+                                  'completed_operations': sorted(successful_operations - {'finish'}
+                                      - ({'run_tests'} if actual_tests != 'passed' else set())),
+                              'outstanding_required_operations': sorted(
+                                  (required_operations - successful_operations)
+                                  | ({'run_tests'} if 'run_tests' in required_operations
+                                     and actual_tests != 'passed' else set())),
+                              'test_status': actual_tests,
+                              'block_categories': sorted({item['category'] for item in blocked_operations}),
+                          },
                           inference_retries=inference_retries,
                           finish_schema_retries=finish_schema_retries,
                           verified_test_status=actual_tests,
@@ -1595,6 +1692,7 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
                           blocked_operations=blocked_operations,
                           completion_classification=completion_classification(result['status'], actual_tests, blocked_operations))
             broker.journal.close(result['status'])
+            result['recovery_state'] = broker.journal.row['status']
             atomic_write(output/'result.json', encoded(result))
         finally:
             client.close()

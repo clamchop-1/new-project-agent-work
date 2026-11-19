@@ -158,7 +158,9 @@ class ModelToolResultTests(FixtureCase):
             'local_agent.Ollama.request', autospec=True, side_effect=request,
         ):
             result = run_agent(self.project, 'mock-local', 'Inspect and test read-only', output,
-                               test_config=self.test_config)
+                               test_config=self.test_config, progress_guidance=True)
+        self.assertIn('Windows host progress data', seen[2][0]['content'])
+        self.assertIn('"test_evidence": "failed"', seen[2][0]['content'])
         read_message = seen[1][-1]
         self.assertEqual(read_message['role'], 'tool')
         self.assertEqual(read_message['tool_name'], 'read_file')

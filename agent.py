@@ -467,6 +467,8 @@ def main():
             print(json.dumps({'run':str(parent),'logical_project_id':logical_project_id,
                               'status':result['status'],'summary':result.get('summary'),
                               'operator_policy':result['operator_policy'],'verified_test_status':result['verified_test_status'],
+                              'completion_classification':result.get('completion_classification'),
+                              'host_completion_evidence':result.get('host_completion_evidence'),
                               'routing_decision': result.get('routing_decision')},indent=2));return
         if args.action=='prepare-handoff':
             if not args.run_directory:raise AgentError('Select an actual saved run.')

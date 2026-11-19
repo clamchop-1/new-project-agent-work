@@ -496,7 +496,7 @@ class HarnessRun:
         summary = dict(raw.get('summary')) if isinstance(raw.get('summary'), Mapping) else {}
         # Host-produced fields remain separate from the model's own finish claim.
         for key in ('verified_test_status', 'receipt_integrity',
-                    'completion_classification', 'model_metrics', 'writes',
+                    'completion_classification', 'host_completion_evidence', 'model_metrics', 'writes',
                     'provider', 'model', 'model_digest', 'routing_decision',
                     'error', 'provider_error'):
             if key in raw:
