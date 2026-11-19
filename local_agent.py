@@ -27,6 +27,8 @@ HUB = Path(__file__).resolve().parent
 MAX_INFERENCE_REQUEST_BYTES = 1024 * 1024
 MAX_INFERENCE_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_INFERENCE_TIMEOUT_SECONDS = 180
+MAX_TRANSIENT_INFERENCE_RETRIES = 1
+MAX_FINISH_SCHEMA_RETRIES = 1
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -857,6 +859,32 @@ def unsupported_tool_markup(content):
     ))
 
 
+FINISH_SCHEMA_ERRORS = frozenset({
+    'Wrapped native tool arguments must be an object.',
+    'Invalid wrapped native tool JSON.',
+    'Invalid native tool JSON.',
+    'Native tool arguments must be an object.',
+    'Unexpected native tool argument.',
+    'Missing required native tool argument.',
+    'Invalid native tool argument type.',
+})
+
+
+def is_recoverable_finish_schema_error(message, calls, error, calls_from_text=False):
+    """Retry only one validated-protocol finish call rejected for a known schema error."""
+    native_calls = message.get('tool_calls') if isinstance(message, dict) else None
+    native_protocol = isinstance(native_calls, list) and len(native_calls) == 1
+    text_protocol = calls_from_text and not native_calls
+    if (not isinstance(calls, list) or len(calls) != 1
+            or not (native_protocol or text_protocol)
+            or not isinstance(calls[0], dict)
+            or not isinstance(calls[0].get('function'), dict)
+            or calls[0]['function'].get('name') != 'finish'
+            or not isinstance(error, AgentError)):
+        return False
+    return str(error) in FINISH_SCHEMA_ERRORS
+
+
 def verify_test_receipts(commands, project, run_directory):
     """Trust only unchanged command receipts and output bound to this run/project."""
     run_root = Path(run_directory).resolve()
@@ -1157,6 +1185,9 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
               'provider_fallback': fallback_record,
               'completion_policy': completion_policy,
               'required_operations': sorted(required_operations),
+              'inference_attempts': 0,
+              'inference_retries': 0,
+              'finish_schema_retries': 0,
               'routing_decision': routing_decision,
               'host_capabilities': capability_report(),
               'operator_policy':{'write_paths':list(writes),
@@ -1172,6 +1203,9 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
     blocked_operations = []
     successful_operations = set()
     seen_tool_calls = set()
+    inference_attempts = 0
+    inference_retries = 0
+    finish_schema_retries = 0
     usage = {'prompt_tokens': 0, 'completion_tokens': 0, 'responses': 0, 'max_prompt_tokens': 0}
     try:
         for step in range(max_steps):
@@ -1194,10 +1228,36 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
                 active_tools=[tool for tool in active_tools if tool['function']['name']=='finish']
                 messages.append({'role':'user','content':'The bounded read budget is nearly used. Finish now using only observed evidence and mark remaining unknowns; do not request more source.'})
             began = time.monotonic()
-            response = client.chat(
-                model, messages, active_tools, context,
-                {'num_predict': 1600, 'temperature': 0, 'num_thread': 4},
-            )
+            while True:
+                inference_attempts += 1
+                try:
+                    response = client.chat(
+                        model, messages, active_tools, context,
+                        {'num_predict': 1600, 'temperature': 0, 'num_thread': 4},
+                    )
+                    break
+                except ProviderFailure as exc:
+                    should_retry = (
+                        exc.code == 'timeout'
+                        and inference_retries < MAX_TRANSIENT_INFERENCE_RETRIES
+                        and not (cancel_event is not None and cancel_event.is_set())
+                        and not (output/'STOP').exists()
+                    )
+                    if not should_retry:
+                        raise
+                    inference_retries += 1
+                    retry_record = {
+                        'inference_retry': inference_retries,
+                        'step': step,
+                        'attempt': inference_attempts,
+                        'reason_code': exc.code,
+                    }
+                    with log.open('ab') as stream:
+                        stream.write(encoded(retry_record) + b'\n')
+                    if event_callback is not None:
+                        event_callback('inference.retry', retry_record)
+            result['inference_attempts'] = inference_attempts
+            result['inference_retries'] = inference_retries
             if cancel_event is not None and cancel_event.is_set():
                 raise AgentError('Harness cancellation requested.')
             message = response['message']
@@ -1221,7 +1281,52 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
                 calls = parse_text_tool_call(message, active_tools)
                 calls_from_text = bool(calls)
             if calls:
-                calls = validate_native_tool_calls(calls, active_tools)
+                try:
+                    calls = validate_native_tool_calls(calls, active_tools)
+                except AgentError as exc:
+                    if (finish_schema_retries < MAX_FINISH_SCHEMA_RETRIES
+                            and is_recoverable_finish_schema_error(
+                                message, calls, exc, calls_from_text)):
+                        finish_schema_retries += 1
+                        result['finish_schema_retries'] = finish_schema_retries
+                        if calls_from_text:
+                            messages.append({
+                                'role': 'assistant',
+                                'content': message.get('content', ''),
+                            })
+                        else:
+                            rejected = message['tool_calls'][0]
+                            messages.append(message)
+                            messages.append({
+                                'role': 'tool',
+                                'tool_name': 'finish',
+                                'tool_call_id': rejected.get('id', 'finish'),
+                                'content': json.dumps({
+                                    'error': 'Finish was rejected before execution because its arguments did not match the registered schema.',
+                                    'operation_performed': False,
+                                }),
+                            })
+                        messages.append({
+                            'role': 'user',
+                            'content': (
+                                'The previous single finish call was rejected by Windows '
+                                'before execution. No operation was performed. Resubmit '
+                                'only the registered finish tool with summary as a string, '
+                                'unfinished as an array of strings, and next_actions as an '
+                                'array of strings. Use [] for empty arrays. Do not encode '
+                                'arrays as strings, and do not claim unfinished operations '
+                                'are complete.'
+                            ),
+                        })
+                        with log.open('ab') as stream:
+                            stream.write(encoded({
+                                'finish_schema_retry': finish_schema_retries,
+                                'step': step,
+                                'reason': str(exc),
+                                'operation_performed': False,
+                            }) + b'\n')
+                        continue
+                    raise
                 calls = defer_premature_finish(calls)
 
             # General assistant turns may end with a normal prose response. Do
@@ -1371,6 +1476,9 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
                     'required test receipt is missing, invalid, stale, or failed')
             result.update(seconds=time.monotonic()-started, writes=broker.writes,
                           assistant_file_writes=broker.assistant_writes, commands=broker.commands,
+                          inference_attempts=inference_attempts,
+                          inference_retries=inference_retries,
+                          finish_schema_retries=finish_schema_retries,
                           verified_test_status=actual_tests,
                           receipt_integrity=receipt_integrity,
                           model_metrics={**usage,

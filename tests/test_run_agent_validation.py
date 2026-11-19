@@ -1,4 +1,5 @@
 import json
+import threading
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,6 +7,7 @@ from unittest.mock import patch
 
 from agent_core import AgentError, file_hash
 from local_agent import Broker, run_agent
+from inference_provider import ProviderFailure
 from test_shared_memory import FixtureCase
 
 
@@ -186,6 +188,138 @@ class RunAgentValidationTests(FixtureCase):
         )
         self.assertEqual(result["status"], "complete")
         self.assertEqual(result["writes"], [])
+
+    def test_malformed_single_finish_gets_one_schema_correction_turn(self):
+        expected = {'summary': 'Finished', 'unfinished': [], 'next_actions': []}
+        executed, result = self.execute([
+            {'role': 'assistant', 'tool_calls': [tool('finish', {
+                'summary': 'Finished', 'unfinished': 'None', 'next_actions': 'None',
+            })]},
+            {'role': 'assistant', 'tool_calls': [tool('finish', expected)]},
+        ], max_steps=2)
+
+        self.assertEqual(executed, [('finish', expected)])
+        self.assertEqual(result['status'], 'complete')
+        self.assertEqual(result['finish_schema_retries'], 1)
+        self.assertEqual(result['steps'], 2)
+
+    def test_malformed_text_finish_gets_schema_correction_without_parser_relaxation(self):
+        expected = {'summary': 'Finished', 'unfinished': [], 'next_actions': []}
+        executed, result = self.execute([
+            {'role': 'assistant', 'content': json.dumps({
+                'name': 'finish',
+                'arguments': {'summary': 'Finished', 'unfinished': 'None', 'next_actions': 'None'},
+            })},
+            {'role': 'assistant', 'tool_calls': [tool('finish', expected)]},
+        ], max_steps=2)
+
+        self.assertEqual(executed, [('finish', expected)])
+        self.assertEqual(result['status'], 'complete')
+        self.assertEqual(result['finish_schema_retries'], 1)
+
+    def test_repeated_malformed_finish_fails_after_one_correction(self):
+        invalid = {'summary': 'Finished', 'unfinished': 'None', 'next_actions': 'None'}
+        executed, result = self.execute([
+            {'role': 'assistant', 'tool_calls': [tool('finish', invalid)]},
+            {'role': 'assistant', 'tool_calls': [tool('finish', invalid)]},
+        ], failure=True, max_steps=2)
+
+        self.assertEqual(executed, [])
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['finish_schema_retries'], 1)
+
+    def test_transient_inference_timeout_retries_once_without_replaying_tools(self):
+        output = self.base / 'timeout_retry_execution'
+        responses = iter([
+            {'role': 'assistant', 'tool_calls': [tool('read_file', {
+                'path': 'calculator.py',
+            })]},
+            {'role': 'assistant', 'tool_calls': [tool('finish', {
+                'summary': 'Read completed.', 'unfinished': [], 'next_actions': [],
+            })]},
+        ])
+        request_count = 0
+        broker_names = []
+
+        def fake_request(client, endpoint, payload):
+            nonlocal request_count
+            request_count += 1
+            if request_count == 2:
+                raise ProviderFailure('timeout', 'Inference request timed out.', retryable=True)
+            return {'message': next(responses)}
+
+        def fake_broker(instance, name, arguments):
+            broker_names.append(name)
+            if name == 'finish':
+                return {**arguments, 'operation_performed': False}
+            return {'operation_performed': False}
+
+        with patch('local_agent.Ollama.model',
+                   return_value={'digest': 'mock-local-model'}), patch(
+            'local_agent.Ollama.request', autospec=True, side_effect=fake_request
+        ), patch.object(Broker, 'call', autospec=True, side_effect=fake_broker):
+            result = run_agent(self.project, 'mock-local-model', 'Read calculator.py',
+                               output, max_steps=2)
+
+        self.assertEqual(result['status'], 'complete')
+        self.assertEqual(request_count, 3)
+        self.assertEqual(result['inference_attempts'], 3)
+        self.assertEqual(result['inference_retries'], 1)
+        self.assertEqual(broker_names, ['read_file', 'finish'])
+        retry_rows = [json.loads(line) for line in (output / 'events.jsonl').read_text(encoding='utf-8').splitlines()
+                      if 'inference_retry' in line]
+        self.assertEqual(len(retry_rows), 1)
+
+    def test_cancelled_timeout_is_not_retried_and_closes_provider(self):
+        output = self.base / 'cancelled_timeout_execution'
+        cancel_event = threading.Event()
+        request_count = 0
+
+        def fake_request(client, endpoint, payload):
+            nonlocal request_count
+            request_count += 1
+            if request_count == 1:
+                return {'message': {'role': 'assistant', 'content': 'No tool needed.'}}
+            cancel_event.set()
+            raise ProviderFailure('timeout', 'Inference request timed out.', retryable=True)
+
+        close = patch('local_agent.Ollama.close')
+        with patch('local_agent.Ollama.model',
+                   return_value={'digest': 'mock-local-model'}), patch(
+            'local_agent.Ollama.request', autospec=True, side_effect=fake_request
+        ), close as close_provider:
+            with self.assertRaises(ProviderFailure):
+                run_agent(self.project, 'mock-local-model', 'Read calculator.py',
+                          output, max_steps=2, cancel_event=cancel_event)
+
+        result = json.loads((output / 'result.json').read_text(encoding='utf-8'))
+        self.assertEqual(request_count, 2)
+        self.assertEqual(result['inference_attempts'], 2)
+        self.assertEqual(result['inference_retries'], 0)
+        close_provider.assert_called_once()
+
+    def test_second_timeout_ends_after_the_single_retry(self):
+        output = self.base / 'timeout_exhausted_execution'
+        request_count = 0
+
+        def fake_request(client, endpoint, payload):
+            nonlocal request_count
+            request_count += 1
+            raise ProviderFailure('timeout', 'Inference request timed out.', retryable=True)
+
+        with patch('local_agent.Ollama.model',
+                   return_value={'digest': 'mock-local-model'}), patch(
+            'local_agent.Ollama.request', autospec=True, side_effect=fake_request
+        ):
+            with self.assertRaises(ProviderFailure):
+                run_agent(self.project, 'mock-local-model', 'Read calculator.py',
+                          output, max_steps=2)
+
+        result = json.loads((output / 'result.json').read_text(encoding='utf-8'))
+        self.assertEqual(request_count, 2)
+        self.assertEqual(result['inference_attempts'], 2)
+        self.assertEqual(result['inference_retries'], 1)
+        self.assertEqual(result['status'], 'failed')
 
     def test_general_assistant_prose_finishes_without_coding_recovery(self):
         answer = "The requested reference pages were read successfully."
