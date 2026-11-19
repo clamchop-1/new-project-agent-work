@@ -9,7 +9,7 @@ import uuid
 
 from agent_core import AgentError, Project, atomic_write, encoded, digest, exclusive, save_handoff
 from assistant_files import AssistantFiles
-from local_agent import HUB, run_agent
+from local_agent import HUB, TOOLS, run_agent
 from model_router import discover_candidates, route_model, read_recent_performance
 from model_registry import (ModelRegistryError, append_performance_evidence,
                             load_registry)
@@ -236,6 +236,14 @@ def main():
     parser.add_argument('--agent',choices=['codex','claude','qwen'],default='qwen')
     parser.add_argument('--history-index',type=int);parser.add_argument('--authorize-history',action='store_true')
     parser.add_argument('--conversation', action='store_true')
+    parser.add_argument('--completion-policy',
+                        choices=['conversational', 'read_only_analysis',
+                                 'tool_required', 'file_modification'],
+                        help='Host-selected completion contract; write permits default to file_modification.')
+    parser.add_argument('--require-operation', action='append', default=[],
+                        choices=sorted(tool['function']['name'] for tool in TOOLS
+                                       if tool['function']['name'] != 'finish'),
+                        help='Require this registered operation before finish; repeat for multiple requirements.')
     args=parser.parse_args()
 
     assistant_write_paths = ()
@@ -389,6 +397,11 @@ def main():
                     if args.allow_pinned_tests and selected_project_name in PINNED_TEST_PROJECTS:
                         test_config = project.root / '.local' / 'pinned-tests.json'
 
+                    completion_policy = args.completion_policy or (
+                        'file_modification' if writes or assistant_write_paths
+                        else 'tool_required'
+                    )
+
                     result=run_agent(
                         project,selected_model,task,
                         parent/'execution',selected_endpoint,
@@ -405,6 +418,8 @@ def main():
                         fallback_approval=(approve_provider_fallback
                                            if fallback_policy['mode'] == 'ask' else None),
                         routing_decision=route,
+                        completion_policy=completion_policy,
+                        required_operations=tuple(args.require_operation),
                     )
             finally:
                 atomic_write(parent/'post-run.json',encoded({'state':project.state(),'memory':packet['memory_snapshot'],

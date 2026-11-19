@@ -358,6 +358,8 @@ class LegacyExecutionContext:
     fallback_policy: Mapping[str, Any] | None = None
     fallback_approval: Any = None
     routing_decision: Mapping[str, Any] | None = None
+    completion_policy: str = 'tool_required'
+    required_operations: tuple[str, ...] = ()
 
     @property
     def project_id(self) -> str:
@@ -446,6 +448,8 @@ class HarnessRun:
                     fallback_policy=ctx.fallback_policy,
                     fallback_approval=ctx.fallback_approval,
                     routing_decision=ctx.routing_decision,
+                    completion_policy=ctx.completion_policy,
+                    required_operations=ctx.required_operations,
                 )
         except BaseException as exc:  # Preserve harness failures as a terminal record.
             self.error = str(exc)[:1000]

@@ -68,9 +68,11 @@ class UnhandledRecoveryTests(FixtureCase):
             for messages in seen_messages
             for message in messages
             if message.get("role") == "user"
-            and "Recovery guidance:" in message.get("content", "")
+            and "Completion contract:" in message.get("content", "")
         ]
         self.assertTrue(recovery_messages)
+        self.assertTrue(all('registered finish tool' in text for text in recovery_messages))
+        self.assertTrue(all('list_files' not in text for text in recovery_messages))
 
 
     def test_valid_tool_call_resets_recovery_budget(self):

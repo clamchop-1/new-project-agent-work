@@ -612,6 +612,7 @@ class OrchestrationService:
             role_instructions=role.responsibilities,
             provider_profile=provider_spec.get('profile'), remote_profile=provider_spec.get('profile'),
             fallback_policy=self.fallback_policy, routing_decision=routing,
+            completion_policy='delegated',
         )
         handle = None
         try:
@@ -1232,6 +1233,8 @@ class OrchestrationService:
                 remote_profile=provider_spec.get('profile'),
                 fallback_policy=run_state.get('fallback_policy'), routing_decision=routing,
                 conversation=self._message_context(run_state, graph, task),
+                completion_policy=('file_modification' if write_grant else 'delegated'),
+                required_operations=(('run_tests',) if task.role == 'qa' else ()),
             )
             if control['cancelled'].is_set():
                 return {'status': 'cancelled', 'agent_status': 'not_started',

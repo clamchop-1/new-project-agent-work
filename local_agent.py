@@ -817,6 +817,46 @@ def completion_classification(status, test_status, blocked_operations=()):
     return 'incomplete'
 
 
+COMPLETION_POLICIES = frozenset({
+    'conversational', 'read_only_analysis', 'tool_required',
+    'file_modification', 'delegated',
+})
+
+
+def validate_completion_policy(policy, required_operations, writes, test_config,
+                               assistant_write_paths):
+    """Validate host-declared completion requirements before contacting a model."""
+    if policy not in COMPLETION_POLICIES:
+        raise AgentError('Unknown completion policy.')
+    if (not isinstance(required_operations, (tuple, list, set, frozenset))
+            or any(not isinstance(name, str) or name not in {
+                tool['function']['name'] for tool in TOOLS
+            } - {'finish'} for name in required_operations)):
+        raise AgentError('Required completion operations are malformed.')
+    required_operations = frozenset(required_operations)
+    if policy == 'conversational' and (required_operations or writes or test_config
+                                       or assistant_write_paths):
+        raise AgentError('Conversational completion cannot declare execution or write requirements.')
+    if policy == 'read_only_analysis' and (writes or assistant_write_paths
+                                           or required_operations & {'create_file', 'replace_text',
+                                                                    'edit_location_file', 'create_location_file'}):
+        raise AgentError('Read-only analysis cannot declare write capabilities or requirements.')
+    if policy == 'file_modification' and not (writes or assistant_write_paths):
+        raise AgentError('File modification completion requires an explicit write permit.')
+    return required_operations
+
+
+def unsupported_tool_markup(content):
+    """Recognize common non-protocol tool markup so it cannot count as prose."""
+    if not isinstance(content, str):
+        return False
+    lowered = content.casefold()
+    return any(marker in lowered for marker in (
+        '<function=', '<tool_call>', '<tool_call ', '</tool_call>',
+        '<|tool_call|>', '<|python|>',
+    ))
+
+
 def verify_test_receipts(commands, project, run_directory):
     """Trust only unchanged command receipts and output bound to this run/project."""
     run_root = Path(run_directory).resolve()
@@ -918,7 +958,7 @@ def model_tool_result(project, name, result):
     return presented
 
 
-def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), test_config=None, max_steps=16, context=16384, conversation=(), provider_name='ollama', assistant_root=None, assistant_write_paths=(), max_tool_calls=None, cancel_event=None, event_callback=None, provider_profile=None, remote_profile=None, fallback_policy=None, fallback_approval=None, routing_decision=None, allowed_tools=None, role_instructions=''):
+def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), test_config=None, max_steps=16, context=16384, conversation=(), provider_name='ollama', assistant_root=None, assistant_write_paths=(), max_tool_calls=None, cancel_event=None, event_callback=None, provider_profile=None, remote_profile=None, fallback_policy=None, fallback_approval=None, routing_decision=None, allowed_tools=None, role_instructions='', completion_policy='tool_required', required_operations=()):
     output = Path(output);output.mkdir(parents=True, exist_ok=False)
     assistant_files = AssistantFiles(assistant_root) if assistant_root else None
     if assistant_write_paths and assistant_files is None:
@@ -935,6 +975,10 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
     if not isinstance(role_instructions, str) or len(role_instructions) > 2000:
         raise AgentError('Agent role instructions exceed the bounded text limit.')
     no_secrets(role_instructions)
+    required_operations = validate_completion_policy(
+        completion_policy, required_operations, writes, test_config,
+        assistant_write_paths,
+    )
     fallback_policy = fallback_policy or {'mode': 'disabled', 'substitutions': []}
     original_provider, original_model = provider_name, model
     fallback_record = None
@@ -1061,7 +1105,7 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
               'Use forget_saved_source only when the user explicitly asks to forget or remove a saved source. '
               'Read tools before claiming file facts. Git and actual tool receipts are authoritative. Never fabricate tool/test results. '
               'Recall does not resume holds. Only exact operator-authorized paths may be edited. No arbitrary shell, installs, hardware or secrets access. Network access is limited to the public HTTPS retrieval tools above. '
-              'Use tool errors/test failures to correct your implementation within the task. Finish with the finish tool. '
+              'Use tool errors/test failures to correct your implementation within the task. '
               'For an existing file, use read_file first, then replace_text with the exact sha256 returned by read_file, '
               'the exact existing old text, and the replacement new text. '
               'Use create_file only for a new file that does not exist; it never overwrites. '
@@ -1079,9 +1123,12 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
               'Close both the arguments object and the outer call object. A valid finish call is '
               '{"name":"finish","arguments":{"summary":"Observed results","unfinished":[],"next_actions":[]}}. '
               'Include requested findings and any observed task marker in summary; do not defer reporting observed '
-              'facts. The finish summary must describe the inspected source behavior, report the actual test '
-              'outcome, and quote any task-requested marker literally from the observed file content. Do not omit a'
-              ' requested observation merely because the tests passed.')
+              'facts. Report only observed evidence in the finish summary. '
+              'Completion policy: ' + completion_policy + '. '
+              + ('This is a tool-free conversational task. Give the answer directly in plain text; do not emit tool-call markup.'
+                 if completion_policy == 'conversational' else
+                 'Call finish only after the host-declared required operations are complete: '
+                 + json.dumps(sorted(required_operations)) + '. Put remaining work in unfinished; do not claim completion if any required operation is outstanding.'))
     from conversation_session import bound_turns
 
     # Conversation is untrusted context, never authorization.
@@ -1108,6 +1155,8 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
               'endpoint': base, 'context': context, 'steps': 0, 'writes': [],
               'assistant_file_writes': [], 'commands': [], 'cloud_fallback': False,
               'provider_fallback': fallback_record,
+              'completion_policy': completion_policy,
+              'required_operations': sorted(required_operations),
               'routing_decision': routing_decision,
               'host_capabilities': capability_report(),
               'operator_policy':{'write_paths':list(writes),
@@ -1121,6 +1170,8 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
     repeated_unhandled = 0
     tool_call_count = 0
     blocked_operations = []
+    successful_operations = set()
+    seen_tool_calls = set()
     usage = {'prompt_tokens': 0, 'completion_tokens': 0, 'responses': 0, 'max_prompt_tokens': 0}
     try:
         for step in range(max_steps):
@@ -1129,6 +1180,13 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
             if (output/'STOP').exists(): raise AgentError('Operator emergency STOP requested.')
             if len(encoded(messages)) > 54000: raise AgentError('Context budget reached; save a bounded handoff and continue in a new session.')
             active_tools=available_tools(TOOLS, test_config=test_config)
+            if completion_policy == 'conversational':
+                active_tools = []
+            elif completion_policy == 'read_only_analysis':
+                write_tools = {'replace_text', 'create_file', 'edit_location_file',
+                               'create_location_file', 'save_source', 'forget_saved_source'}
+                active_tools = [tool for tool in active_tools
+                                if tool['function']['name'] not in write_tools]
             if allowed_tools is not None:
                 active_tools = [tool for tool in active_tools
                                 if tool['function']['name'] in allowed_tools]
@@ -1169,7 +1227,9 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
             # General assistant turns may end with a normal prose response. Do
             # not inject the coding-agent recovery recipe after a valid answer;
             # it can cause unrelated repository tools to run for no reason.
-            if assistant_files is not None and not calls and message.get('content', '').strip():
+            if (completion_policy == 'conversational' and not calls
+                    and message.get('content', '').strip()
+                    and not unsupported_tool_markup(message.get('content', ''))):
                 result.update(
                     status='complete',
                     summary={
@@ -1200,15 +1260,15 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
                 messages.append({
                     'role': 'user',
                     'content': (
-                        'Recovery guidance: The project and task are already selected. '
-                        'Do not ask the operator to provide file paths again. '
-                        'Use list_files with empty arguments to discover available '
-                        'relative paths, then read_file with a listed relative path. '
-                        'Use run_tests with empty arguments to execute the approved '
-                        'pinned tests. Invoke an actual permitted tool call; prose '
-                        'alone does not establish execution. Finish using the '
-                        'finish tool and report only observed results. '
-                        'Do not bypass authorization or tool validation.'
+                        'Completion contract: this task is conversational and tool-free. '
+                        'Return a plain-text answer without tool-call markup.'
+                        if completion_policy == 'conversational' else
+                        'Completion contract: execution is complete only after the host-declared '
+                        'operations ' + json.dumps(sorted(required_operations)) +
+                        ' have succeeded and you call the registered finish tool with the required '
+                        'schema. Report outstanding work in unfinished. Do not inspect unrelated '
+                        'project files or invent additional operations. Never bypass authorization '
+                        'or tool validation.'
                     )
                 })
                 continue
@@ -1228,7 +1288,19 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
                                                      'arguments': args})
                 try:
                     if isinstance(args, str): args = json.loads(args)
-                    tool_result = broker.call(name, args)
+                    project_state = digest(encoded(project.state()['files']))
+                    call_key = digest(encoded({
+                        'name': name, 'arguments': args,
+                        'project_state': project_state,
+                    }))
+                    if call_key in seen_tool_calls:
+                        tool_result = {'error': 'Repeated identical tool call rejected.',
+                                       'operation_performed': False}
+                        blocked_operations.append({'category': 'protocol', 'tool': name,
+                                                   'error': tool_result['error']})
+                    else:
+                        seen_tool_calls.add(call_key)
+                        tool_result = broker.call(name, args)
                 except (AgentError, OSError, ValueError, TypeError, KeyError) as exc:
                     tool_result = {'error': str(exc)[:500], 'operation_performed': False}
                 if event_callback is not None:
@@ -1243,6 +1315,8 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
                         blocked_operations.append({'category': 'authorization', 'tool': name, 'error': tool_result['error']})
                     elif any(term in error_text for term in ('path traversal', 'linked/reparse', 'alternate data stream', 'credential', 'private, generated', 'instruction writes', 'not on the fixed capability allowlist')):
                         blocked_operations.append({'category': 'security', 'tool': name, 'error': tool_result['error']})
+                if 'error' not in tool_result:
+                    successful_operations.add(name)
                 with log.open('ab') as stream:
                     stream.write(encoded({'tool': name, 'arguments': args, 'result': tool_result}) + b'\n')
                 messages.append({'role': 'tool', 'tool_name': name, 'tool_call_id': call.get('id', name),
@@ -1262,10 +1336,24 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
                         )
                     })
                 if name == 'finish' and 'error' not in tool_result:
-                    result.update(status='complete', summary=tool_result)
+                    blockers = []
+                    if tool_result.get('unfinished'):
+                        blockers.append('finish reported unfinished work')
+                    missing = required_operations - successful_operations
+                    if missing:
+                        blockers.append('required operations not completed: ' + ', '.join(sorted(missing)))
+                    if completion_policy == 'file_modification' and not (broker.writes or broker.assistant_writes):
+                        blockers.append('no authorized file-write receipt was produced')
+                    if blocked_operations:
+                        blockers.append('one or more operations were blocked by host policy')
+                    if blockers:
+                        result.update(status='incomplete', summary=tool_result,
+                                      completion_blockers=blockers)
+                    else:
+                        result.update(status='complete', summary=tool_result)
                     break
             result['steps'] = step + 1
-            if result['status'] == 'complete': break
+            if result['status'] in {'complete', 'incomplete'}: break
         if result['status'] == 'running': result['status'] = 'step_limit'
     except BaseException as exc:
         result.update(status='failed', error=str(exc)[:1000])
@@ -1276,6 +1364,11 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
     finally:
         try:
             actual_tests, receipt_integrity = verify_test_receipts(broker.commands, project, output)
+            if (result['status'] == 'complete' and 'run_tests' in required_operations
+                    and actual_tests != 'passed'):
+                result['status'] = 'incomplete'
+                result.setdefault('completion_blockers', []).append(
+                    'required test receipt is missing, invalid, stale, or failed')
             result.update(seconds=time.monotonic()-started, writes=broker.writes,
                           assistant_file_writes=broker.assistant_writes, commands=broker.commands,
                           verified_test_status=actual_tests,

@@ -124,11 +124,49 @@ class ManagedSshTunnel:
             '-o', 'PermitLocalCommand=no',
             '-o', 'ProxyCommand=none',
             '-o', 'ProxyJump=none',
-            '-o', 'ClearAllForwardings=yes',
+            # ClearAllForwardings=yes also removes the explicit -L below.
+            # Check the effective forwarding plan before launch instead.
+            '-o', 'ClearAllForwardings=no',
             '-o', 'ExitOnForwardFailure=yes',
             '-L', f"127.0.0.1:{p['port']}:127.0.0.1:11434",
             '-N', p['ssh_host_alias'],
         ]
+
+    def _verify_forward_plan(self):
+        """Require the effective SSH config to contain only this local forward."""
+        argv = self._argv()
+        argv[argv.index('-N')] = '-G'
+        try:
+            result = self._run(
+                argv, capture_output=True, text=True,
+                timeout=IDENTITY_TIMEOUT_SECONDS, check=False,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ProviderFailure(
+                'forwarding_unverified',
+                'Could not verify the effective SSH forwarding configuration.',
+                security=True,
+            ) from exc
+        if result.returncode != 0:
+            raise ProviderFailure(
+                'forwarding_unverified',
+                'Windows OpenSSH could not verify the effective forwarding configuration.',
+                security=True,
+            )
+        forwards = {'localforward': [], 'remoteforward': [], 'dynamicforward': []}
+        for line in (result.stdout or '').splitlines():
+            key, separator, value = line.partition(' ')
+            if key in forwards and separator:
+                forwards[key].append(value.strip())
+        expected = f"[127.0.0.1]:{self.profile['port']} [127.0.0.1]:11434"
+        if (forwards['localforward'] != [expected]
+                or forwards['remoteforward'] or forwards['dynamicforward']):
+            raise ProviderFailure(
+                'forwarding_unverified',
+                'SSH configuration contains unexpected or unverifiable forwarding rules.',
+                security=True,
+            )
 
     def _listener_pids(self):
         port = self.profile['port']
@@ -185,6 +223,7 @@ class ManagedSshTunnel:
             self._validate_profile()
             verify_enrolled_host(self.profile['ssh_host_alias'], self.profile['known_hosts_file'],
                                  self.profile['ssh_host_key_sha256'], self._run, self._which)
+            self._verify_forward_plan()
             if self._process is not None:
                 if self._process.poll() is not None:
                     self._process = None

@@ -80,6 +80,10 @@ class TunnelTests(unittest.TestCase):
         run = Mock(side_effect=lambda argv, **kwargs: (
             SimpleNamespace(returncode=0, stdout=self.key_line)
             if 'ssh-keygen' in argv[0]
+            else SimpleNamespace(
+                returncode=0,
+                stdout=f"localforward [127.0.0.1]:{self.profile['port']} [127.0.0.1]:11434\n",
+            ) if '-G' in argv
             else SimpleNamespace(returncode=0, stdout=','.join(map(str, listener_state['pids'])))
         ))
         manager = ManagedSshTunnel(
@@ -102,6 +106,10 @@ class TunnelTests(unittest.TestCase):
                 state['pids'] = set()
             return (SimpleNamespace(returncode=0, stdout=self.key_line)
                     if 'ssh-keygen.exe' in argv[0]
+                    else SimpleNamespace(
+                        returncode=0,
+                        stdout=f"localforward [127.0.0.1]:{self.profile['port']} [127.0.0.1]:11434\n",
+                    ) if '-G' in argv
                     else SimpleNamespace(returncode=0, stdout=','.join(map(str, state['pids']))))
         run.side_effect = listener_side_effect
 
@@ -110,7 +118,7 @@ class TunnelTests(unittest.TestCase):
         self.assertIn('BatchMode=yes', argv)
         self.assertIn('StrictHostKeyChecking=yes', argv)
         self.assertIn('ExitOnForwardFailure=yes', argv)
-        self.assertIn('ClearAllForwardings=yes', argv)
+        self.assertIn('ClearAllForwardings=no', argv)
         self.assertIn('ForwardAgent=no', argv)
         self.assertIn('PasswordAuthentication=no', argv)
         self.assertIn('PreferredAuthentications=publickey', argv)
@@ -123,6 +131,33 @@ class TunnelTests(unittest.TestCase):
     def test_unexpected_listener_rejects_occupied_port_without_starting_ssh(self):
         manager, _, popen, _ = self._manager({'pids': {888}})
         with self.assertRaisesRegex(AgentError, 'already occupied'):
+            manager.ensure_ready()
+        popen.assert_not_called()
+
+    def test_unexpected_configured_forward_is_rejected_before_ssh_launch(self):
+        manager, _, popen, run = self._manager({'pids': set()})
+        expected = f"localforward [127.0.0.1]:{self.profile['port']} [127.0.0.1]:11434"
+        run.side_effect = lambda argv, **kwargs: (
+            SimpleNamespace(returncode=0, stdout=self.key_line)
+            if 'ssh-keygen.exe' in argv[0]
+            else SimpleNamespace(returncode=0, stdout=(
+                expected + '\nlocalforward [127.0.0.1]:22002 [127.0.0.1]:11434\n'
+            )) if '-G' in argv
+            else SimpleNamespace(returncode=0, stdout='')
+        )
+        with self.assertRaisesRegex(AgentError, 'unexpected or unverifiable forwarding'):
+            manager.ensure_ready()
+        popen.assert_not_called()
+
+    def test_effective_forward_plan_query_failure_fails_closed(self):
+        manager, _, popen, run = self._manager({'pids': set()})
+        run.side_effect = lambda argv, **kwargs: (
+            SimpleNamespace(returncode=0, stdout=self.key_line)
+            if 'ssh-keygen.exe' in argv[0]
+            else SimpleNamespace(returncode=1, stdout='') if '-G' in argv
+            else SimpleNamespace(returncode=0, stdout='')
+        )
+        with self.assertRaisesRegex(AgentError, 'could not verify the effective forwarding'):
             manager.ensure_ready()
         popen.assert_not_called()
 
@@ -165,6 +200,11 @@ class TunnelTests(unittest.TestCase):
         def listener_side_effect(argv, **kwargs):
             if 'ssh-keygen.exe' in argv[0]:
                 return SimpleNamespace(returncode=0, stdout=self.key_line)
+            if '-G' in argv:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=f"localforward [127.0.0.1]:{self.profile['port']} [127.0.0.1]:11434\n",
+                )
             return SimpleNamespace(returncode=0, stdout=(
                 str(process.pid) if popen.called and process.alive else
                 ('999' if popen.called else '')
@@ -181,6 +221,11 @@ class TunnelTests(unittest.TestCase):
         def listener_owner_changes(argv, **kwargs):
             if 'ssh-keygen.exe' in argv[0]:
                 return SimpleNamespace(returncode=0, stdout=self.key_line)
+            if '-G' in argv:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=f"localforward [127.0.0.1]:{self.profile['port']} [127.0.0.1]:11434\n",
+                )
             return SimpleNamespace(returncode=0,
                                    stdout='' if not popen.called else '999')
         run.side_effect = listener_owner_changes

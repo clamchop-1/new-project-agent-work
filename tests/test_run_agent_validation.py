@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_core import AgentError
+from agent_core import AgentError, file_hash
 from local_agent import Broker, run_agent
 from test_shared_memory import FixtureCase
 
@@ -20,8 +20,9 @@ def tool(name, arguments):
 
 class RunAgentValidationTests(FixtureCase):
 
-    def execute(self, responses, failure=False, assistant_root=None):
+    def execute(self, responses, failure=False, assistant_root=None, **run_options):
         output = self.base / "execution"
+        run_options.setdefault('max_steps', 2)
         replies = iter(responses)
 
         def fake_request(client, endpoint, payload):
@@ -59,13 +60,13 @@ class RunAgentValidationTests(FixtureCase):
                     run_agent(
                         self.project, "mock-local-model",
                         "Read calculator.py", output,
-                        max_steps=2, assistant_root=assistant_root
+                        assistant_root=assistant_root, **run_options
                     )
             else:
                 run_agent(
                     self.project, "mock-local-model",
                     "Read calculator.py", output,
-                    max_steps=2, assistant_root=assistant_root
+                    assistant_root=assistant_root, **run_options
                 )
 
             executed = [
@@ -188,15 +189,192 @@ class RunAgentValidationTests(FixtureCase):
 
     def test_general_assistant_prose_finishes_without_coding_recovery(self):
         answer = "The requested reference pages were read successfully."
-        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as folder:
-            executed, result = self.execute([
-                {"role": "assistant", "content": answer}
-            ], assistant_root=Path(folder))
+        executed, result = self.execute([
+            {"role": "assistant", "content": answer}
+        ], completion_policy='conversational')
 
         self.assertEqual(executed, [])
         self.assertEqual(result["status"], "complete")
         self.assertEqual(result["summary"]["summary"], answer)
         self.assertEqual(result["completion_classification"], "completed_not_tested")
+
+    def test_conversational_policy_rejects_execution_requirements(self):
+        with self.assertRaises(AgentError):
+            self.execute([], completion_policy='conversational',
+                         required_operations=('read_file',))
+
+    def test_missing_finish_signal_does_not_complete_tool_required_run(self):
+        executed, result = self.execute([
+            {"role": "assistant", "content": "The answer is 42."}
+        ], max_steps=2)
+
+        self.assertEqual(executed, [])
+        self.assertEqual(result['status'], 'step_limit')
+        self.assertNotEqual(result['completion_classification'], 'completed_not_tested')
+
+    def test_finish_with_missing_required_test_receipt_is_incomplete(self):
+        executed, result = self.execute([
+            {"role": "assistant", "tool_calls": [
+                tool('run_tests', {})
+            ]},
+            {"role": "assistant", "tool_calls": [
+                tool('finish', {'summary': 'Finished', 'unfinished': [], 'next_actions': []})
+            ]},
+        ], test_config=self.test_config, required_operations=('run_tests',))
+
+        self.assertEqual([name for name, _ in executed], ['run_tests', 'finish'])
+        self.assertEqual(result['status'], 'incomplete')
+        self.assertEqual(result['verified_test_status'], 'not_run')
+        self.assertIn('required test receipt', ' '.join(result['completion_blockers']))
+
+    def test_finish_with_unfinished_operations_is_not_successful(self):
+        executed, result = self.execute([
+            {"role": "assistant", "tool_calls": [tool('finish', {
+                'summary': 'Partially done', 'unfinished': ['run required tests'],
+                'next_actions': ['Run tests'],
+            })]}
+        ])
+
+        self.assertEqual([name for name, _ in executed], ['finish'])
+        self.assertEqual(result['status'], 'incomplete')
+        self.assertIn('finish reported unfinished work', result['completion_blockers'])
+
+    def test_file_modification_requires_a_write_receipt(self):
+        executed, result = self.execute([
+            {"role": "assistant", "tool_calls": [tool('create_file', {
+                'path': 'new.txt', 'content': 'new content',
+            })]},
+            {"role": "assistant", "tool_calls": [tool('finish', {
+                'summary': 'Created file', 'unfinished': [], 'next_actions': [],
+            })]},
+        ], writes=('new.txt',), completion_policy='file_modification')
+
+        self.assertEqual([name for name, _ in executed], ['create_file', 'finish'])
+        self.assertEqual(result['status'], 'incomplete')
+        self.assertIn('no authorized file-write receipt was produced',
+                      result['completion_blockers'])
+
+    def test_repeated_identical_tool_call_is_rejected_and_cannot_complete(self):
+        executed, result = self.execute([
+            {"role": "assistant", "tool_calls": [
+                tool('read_file', {'path': 'calculator.py'})
+            ]},
+            {"role": "assistant", "tool_calls": [
+                tool('read_file', {'path': 'calculator.py'})
+            ]},
+            {"role": "assistant", "tool_calls": [
+                tool('finish', {'summary': 'Finished', 'unfinished': [], 'next_actions': []})
+            ]},
+        ], max_steps=3)
+
+        self.assertEqual([name for name, _ in executed], ['read_file', 'finish'])
+        self.assertEqual(result['status'], 'incomplete')
+        self.assertTrue(any(row['category'] == 'protocol'
+                            for row in result['blocked_operations']))
+
+    def test_required_tests_can_repeat_after_authorized_source_change(self):
+        output = self.base / 'tests_after_edit_execution'
+        (self.project.root / 'stats.py').write_text(
+            'def clamp(value, low, high):\n    return min(max(value, low), high)\n',
+            encoding='utf-8',
+        )
+        self.project.git('add', 'stats.py')
+        self.project.git('-c', 'user.name=Local Agent Fixture',
+                         '-c', 'user.email=fixture@example.invalid',
+                         'commit', '-m', 'Seed passing clamp implementation')
+        calculator = self.project.root / 'calculator.py'
+        old = calculator.read_text(encoding='utf-8')
+        corrected = (
+            'def average(values):\n'
+            '    if not values:\n'
+            '        raise ValueError("average of empty sequence")\n'
+            '    return sum(values) / len(values)\n'
+        )
+        sha = file_hash(calculator)
+        replies = iter([
+            {'role': 'assistant', 'tool_calls': [tool('run_tests', {})]},
+            {'role': 'assistant', 'tool_calls': [tool('read_file', {
+                'path': 'calculator.py',
+            })]},
+            {'role': 'assistant', 'tool_calls': [tool('replace_text', {
+                'path': 'calculator.py', 'expected_sha256': sha,
+                'old': old, 'new': corrected,
+            })]},
+            {'role': 'assistant', 'tool_calls': [tool('run_tests', {})]},
+            {'role': 'assistant', 'tool_calls': [tool('finish', {
+                'summary': 'Corrected average; pinned tests passed.',
+                'unfinished': [], 'next_actions': [],
+            })]},
+        ])
+
+        def fake_request(client, endpoint, payload):
+            return {'message': next(replies)}
+
+        with patch('local_agent.Ollama.model',
+                   return_value={'digest': 'mock-local-model'}), patch(
+            'local_agent.Ollama.request', autospec=True, side_effect=fake_request
+        ):
+            result = run_agent(
+                self.project, 'mock-local-model', 'Fix the fixture defect', output,
+                writes=('calculator.py',), test_config=self.test_config,
+                completion_policy='file_modification',
+                required_operations=('read_file', 'replace_text', 'run_tests'),
+                max_steps=5,
+            )
+
+        self.assertEqual(result['status'], 'complete', result)
+        self.assertEqual(result['verified_test_status'], 'passed')
+        self.assertEqual(len(result['writes']), 1)
+        self.assertEqual(len(result['commands']), 2)
+        self.assertEqual(result['completion_classification'], 'completed_verified')
+
+    def test_unsupported_markup_cannot_complete_as_prose(self):
+        executed, result = self.execute([
+            {"role": "assistant", "content": '<function=finish>{"summary":"done"}</function>'}
+        ], max_steps=1, completion_policy='conversational')
+
+        self.assertEqual(executed, [])
+        self.assertEqual(result['status'], 'step_limit')
+
+    def test_finish_is_single_call_and_validates_completion_schema(self):
+        expected = {'summary': 'Exact marker: PHASE2A_OK', 'unfinished': [], 'next_actions': []}
+        executed, result = self.execute([
+            {"role": "assistant", "tool_calls": [tool('finish', expected)]}
+        ])
+
+        self.assertEqual(executed, [('finish', expected)])
+        self.assertEqual(result['status'], 'complete')
+        self.assertEqual(result['summary']['summary'], 'Exact marker: PHASE2A_OK')
+        self.assertEqual(result['steps'], 1)
+        self.assertEqual(result['writes'], [])
+
+    def test_unauthorized_write_attempt_cannot_be_hidden_by_finish(self):
+        output = self.base / 'unauthorized_write_execution'
+        original = (self.project.root / 'calculator.py').read_bytes()
+        replies = iter([
+            {'role': 'assistant', 'tool_calls': [tool('create_file', {
+                'path': 'calculator.py', 'content': 'unauthorized replacement',
+            })]},
+            {'role': 'assistant', 'tool_calls': [tool('finish', {
+                'summary': 'Completed', 'unfinished': [], 'next_actions': [],
+            })]},
+        ])
+
+        def fake_request(client, endpoint, payload):
+            return {'message': next(replies)}
+
+        with patch('local_agent.Ollama.model',
+                   return_value={'digest': 'mock-local-model'}), patch(
+            'local_agent.Ollama.request', autospec=True, side_effect=fake_request
+        ):
+            result = run_agent(self.project, 'mock-local-model', 'Do not write',
+                               output, max_steps=2)
+
+        self.assertEqual(result['status'], 'incomplete')
+        self.assertEqual(result['writes'], [])
+        self.assertEqual((self.project.root / 'calculator.py').read_bytes(), original)
+        self.assertTrue(any(row['category'] == 'authorization'
+                            for row in result['blocked_operations']))
 
     def test_invalid_text_call_not_executed(self):
         executed, result = self.execute([
