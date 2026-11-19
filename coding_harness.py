@@ -24,6 +24,7 @@ EVENT_TYPES = frozenset({
     'tool.completed', 'approval.requested', 'artifact.reported',
     'run.cancel_requested', 'run.completed', 'run.failed',
     'run.incomplete', 'run.cancelled', 'run.timed_out', 'skill.candidate.proposed',
+    'inference.retry',
 })
 TERMINAL_EVENTS = frozenset({'run.completed', 'run.incomplete', 'run.failed', 'run.cancelled', 'run.timed_out'})
 

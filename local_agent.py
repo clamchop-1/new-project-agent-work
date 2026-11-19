@@ -1,12 +1,14 @@
 """Local-only Qwen tool loop with bounded, typed repository capabilities."""
 import argparse
 import copy
+from functools import wraps
 from datetime import datetime, timezone
 import http.client
 import json
 import os
 from pathlib import Path
 import re
+import select
 import socket
 import subprocess
 import sys
@@ -20,6 +22,7 @@ from agent_core import AgentError, Project, atomic_write, digest, encoded, exclu
 from platform_capabilities import available_tools, capability_report, host_tool_adapter
 from agent_config import DEFAULT_ENDPOINT, validate_endpoint
 from inference_provider import InferenceProvider, ProviderFailure
+from execution_recovery import RecoveryError, RecoveryStore
 from assistant_files import AssistantFiles
 from web_retrieval import SourceLibrary, read_web_page, read_youtube_transcript, search_web
 
@@ -110,13 +113,15 @@ class Ollama:
         watcher = None
         if self.cancel_event is not None:
             watcher = threading.Thread(target=self._watch_cancellation,
-                                      args=(connection, finished, self.cancel_event), daemon=True)
+                                      args=(connection.sock, finished, self.cancel_event), daemon=True)
             watcher.start()
         try:
             if self.cancel_event is not None and self.cancel_event.is_set():
                 raise ProviderFailure('cancelled', 'Inference request cancelled.')
             connection.request('POST' if body is not None else 'GET', path, body=body,
                                headers={'Content-Type': 'application/json'} if body is not None else {})
+            if self.cancel_event is not None and connection.sock is not None:
+                self._wait_for_response(connection.sock, self.cancel_event, timeout)
             response = connection.getresponse()
             if 300 <= response.status < 400:
                 raise ProviderFailure('redirect_rejected', 'Inference endpoint redirects are forbidden.', security=True)
@@ -168,6 +173,8 @@ class Ollama:
                 raise ProviderFailure('cancelled', 'Inference request cancelled.') from exc
             raise ProviderFailure('connection_lost', 'Inference connection closed unexpectedly.', retryable=True) from exc
         except http.client.HTTPException as exc:
+            if self.cancel_event is not None and self.cancel_event.is_set():
+                raise ProviderFailure('cancelled', 'Inference request cancelled.') from exc
             raise ProviderFailure('partial_response', 'Inference provider returned an incomplete HTTP response.') from exc
         finally:
             finished.set()
@@ -176,10 +183,26 @@ class Ollama:
                 watcher.join(timeout=0.5)
 
     @staticmethod
-    def _watch_cancellation(connection, finished, cancel_event):
+    def _wait_for_response(request_socket, cancel_event, timeout):
+        deadline = time.monotonic() + timeout
+        while not cancel_event.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ProviderFailure('timeout', 'Inference request timed out.', retryable=True)
+            readable, _, _ = select.select([request_socket], [], [], min(0.05, remaining))
+            if readable and not cancel_event.is_set():
+                return
+        raise ProviderFailure('cancelled', 'Inference request cancelled.')
+
+    @staticmethod
+    def _watch_cancellation(request_socket, finished, cancel_event):
         while not finished.wait(0.05):
             if cancel_event.is_set():
-                connection.close()
+                if request_socket is not None:
+                    try:
+                        request_socket.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
                 return
 
     def health_check(self):
@@ -334,6 +357,8 @@ class Broker:
         self.allowed_tools = None if allowed_tools is None else frozenset(allowed_tools)
         self.test_config = test_config
         self.commands, self.writes = [], []
+        self.journal = None
+        self.cancel_event = None
         self.assistant_writes = []
         self.allowed_assistant_writes = set(assistant_write_paths)
         self.dirty = bool(project.state()['status'].strip())
@@ -406,18 +431,34 @@ class Broker:
         no_secrets(content)
         if len(content.encode()) > 64000:
             raise AgentError('Source write exceeds size budget.')
+        raw = content.encode()
         if expected is None:
             if target.exists():
                 raise AgentError('Existing file preserved; creation cannot overwrite.')
             before = None
-            with target.open('xb') as stream:
-                stream.write(content.encode())
         else:
             if not target.is_file() or file_hash(target) != expected:
                 raise AgentError('File changed since inspection; edit refused.')
             before = expected
-            atomic_write(target, content.encode())
+        after = digest(raw)
+        if self.journal:
+            backup = target.read_bytes() if before and target.stat().st_size <= 1048576 else None
+            if backup is not None:
+                no_secrets(backup.decode('utf-8'))
+            self.journal.begin('project_write', path=canonical, before=before, after=after,
+                               backup=backup)
+        if before is None:
+            with target.open('xb') as stream:
+                stream.write(raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+        else:
+            atomic_write(target, raw)
         receipt = {'path': canonical, 'before': before, 'after': file_hash(target)}
+        if self.journal:
+            if receipt['after'] != after:
+                raise RecoveryError('Write result differs from the journaled intent.')
+            self.journal.record(receipt)
         self.writes.append(receipt)
         return receipt
 
@@ -436,28 +477,47 @@ class Broker:
             raise AgentError('Command is not on the fixed capability allowlist; no shell interpolation.')
         env = {k: v for k, v in os.environ.items() if not any(word in k.upper() for word in ('TOKEN', 'SECRET', 'API_KEY', 'PASSWORD'))}
         env.update(extra_env)
+        if self.journal:
+            self.journal.begin('command', command=name, path=path)
         began = time.monotonic()
         child = subprocess.Popen(command, cwd=self.project.root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         try:
-            output, _ = child.communicate(timeout=15)
-        except subprocess.TimeoutExpired:
-            child.kill();output, _ = child.communicate()
-            raise AgentError('Owned bounded command timed out; PID terminated.')
+            if self.journal:
+                self.journal.command_process(child_pid=child.pid)
+            deadline = began + 15
+            while True:
+                if self.cancel_event is not None and self.cancel_event.is_set():
+                    raise AgentError('Harness cancellation interrupted the owned command.')
+                if (self.run / 'STOP').exists():
+                    raise AgentError('Operator emergency STOP interrupted the owned command.')
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AgentError('Owned bounded command timed out; PID terminated.')
+                try:
+                    output, _ = child.communicate(timeout=min(remaining, 0.25))
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
         except BaseException:
             if child.poll() is None:child.kill()
             child.communicate(timeout=10)
+            if self.journal and not self.journal.broken:
+                self.journal.command_process(process_stopped=True)
             raise
         if len(output) > 32000:
             raise AgentError('Command output exceeds limit.')
         text = output.decode('utf-8', errors='replace');no_secrets(text)
         index = len(self.commands)
-        log = self.run/f'command-{index}.txt';log.write_bytes(output)
+        log = self.run.resolve()/f'command-{index}.txt';atomic_write(log, output)
         receipt = {'format': 'local-agent-command-receipt', 'project_id': self.project.identity,
                    'command': name, 'exit_code': child.returncode, 'seconds': time.monotonic()-began,
                    'worktree_content_sha256': digest(encoded(self.project.state()['files'])),
                    'output_path': str(log), 'output_sha256': file_hash(log)}
-        receipt_path = self.run/f'command-{index}.json';receipt_path.write_bytes(encoded(receipt))
-        self.commands.append({'path': str(receipt_path), 'sha256': file_hash(receipt_path)})
+        receipt_path = self.run.resolve()/f'command-{index}.json';atomic_write(receipt_path, encoded(receipt))
+        reference = {'path': str(receipt_path), 'sha256': file_hash(receipt_path)}
+        if self.journal:
+            self.journal.record(reference)
+        self.commands.append(reference)
         return {**receipt, 'output': text}
 
     def call(self, name, args):
@@ -509,10 +569,18 @@ class Broker:
             lock_folder.mkdir(parents=True, exist_ok=True)
             lock_path = lock_folder / ('assistant-file-' + digest(str(target).casefold().encode()) + '.lock')
             with exclusive(lock_path, uuid.uuid4().hex):
+                if self.journal:
+                    before = file_hash(target) if target.is_file() else None
+                    self.journal.begin('assistant_write', path=canonical, before=before,
+                                       after=digest(args['content'].encode()))
                 if name == 'edit_location_file':
                     receipt = self.assistant_files.write_text(**args)
                 else:
                     receipt = self.assistant_files.create_text(**args)
+                if self.journal:
+                    if receipt['after_sha256'] != self.journal.pending['after']:
+                        raise RecoveryError('Assistant write differs from journaled intent.')
+                    self.journal.record(receipt)
             self.assistant_writes.append(receipt)
             return receipt
         if name == 'search':
@@ -986,7 +1054,30 @@ def model_tool_result(project, name, result):
     return presented
 
 
-def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), test_config=None, max_steps=16, context=16384, conversation=(), provider_name='ollama', assistant_root=None, assistant_write_paths=(), max_tool_calls=None, cancel_event=None, event_callback=None, provider_profile=None, remote_profile=None, fallback_policy=None, fallback_approval=None, routing_decision=None, allowed_tools=None, role_instructions='', completion_policy='tool_required', required_operations=()):
+def recoverable_run(runner):
+    @wraps(runner)
+    def run(project, *args, **kwargs):
+        store = RecoveryStore(project)
+        with store.locked():
+            store.assert_clear()
+            return runner(project, *args, **kwargs, recovery_store=store)
+    return run
+
+
+def execution_tools(test_config, completion_policy, allowed_tools):
+    tools = available_tools(TOOLS, test_config=test_config)
+    if completion_policy == 'conversational':
+        return []
+    excluded = set()
+    if completion_policy == 'read_only_analysis':
+        excluded.update({'replace_text', 'create_file', 'edit_location_file',
+                         'create_location_file', 'save_source', 'forget_saved_source'})
+    return [tool for tool in tools if tool['function']['name'] not in excluded
+            and (allowed_tools is None or tool['function']['name'] in allowed_tools)]
+
+
+@recoverable_run
+def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), test_config=None, max_steps=16, context=16384, conversation=(), provider_name='ollama', assistant_root=None, assistant_write_paths=(), max_tool_calls=None, cancel_event=None, event_callback=None, provider_profile=None, remote_profile=None, fallback_policy=None, fallback_approval=None, routing_decision=None, allowed_tools=None, role_instructions='', completion_policy='tool_required', required_operations=(), *, resume_from=None, recovery_store):
     output = Path(output);output.mkdir(parents=True, exist_ok=False)
     assistant_files = AssistantFiles(assistant_root) if assistant_root else None
     if assistant_write_paths and assistant_files is None:
@@ -997,7 +1088,8 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
     if allowed_tools is not None:
         known_tools = {tool['function']['name'] for tool in TOOLS}
         if (not isinstance(allowed_tools, (tuple, list, set, frozenset))
-                or 'finish' not in allowed_tools or set(allowed_tools) - known_tools):
+                or (completion_policy != 'conversational' and 'finish' not in allowed_tools)
+                or set(allowed_tools) - known_tools):
             raise AgentError('Agent role tool grant is malformed.')
         allowed_tools = frozenset(allowed_tools)
     if not isinstance(role_instructions, str) or len(role_instructions) > 2000:
@@ -1007,6 +1099,13 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
         completion_policy, required_operations, writes, test_config,
         assistant_write_paths,
     )
+    tools = execution_tools(test_config, completion_policy, allowed_tools)
+    effective_grant = {item['function']['name'] for item in tools}
+    if resume_from:
+        if assistant_root:
+            raise RecoveryError('Recovery continuation is restricted to the selected project.')
+        recovery_store.resume_scope(resume_from, writes, assistant_write_paths,
+                                    effective_grant, test_config)
     fallback_policy = fallback_policy or {'mode': 'disabled', 'substitutions': []}
     original_provider, original_model = provider_name, model
     fallback_record = None
@@ -1096,6 +1195,15 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
         broker = Broker(project, output, writes, test_config, assistant_root=assistant_files,
                         assistant_write_paths=assistant_write_paths,
                         allowed_tools=allowed_tools)
+        broker.cancel_event = cancel_event
+        if resume_from:
+            recovery_store.resume_scope(resume_from, writes, assistant_write_paths,
+                                        effective_grant, test_config)
+            # Dirty state is allowed here only after rechecking the accepted checkpoint.
+            broker.dirty = False
+        broker.journal = recovery_store.start(output, writes, assistant_files,
+                                              assistant_write_paths, effective_grant,
+                                              test_config, required_operations, resume_from)
     except BaseException:
         try:
             client.close()
@@ -1184,6 +1292,7 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
               'assistant_file_writes': [], 'commands': [], 'cloud_fallback': False,
               'provider_fallback': fallback_record,
               'completion_policy': completion_policy,
+              'recovery_run_id': broker.journal.row['run_id'],
               'required_operations': sorted(required_operations),
               'inference_attempts': 0,
               'inference_retries': 0,
@@ -1213,17 +1322,7 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
                 raise AgentError('Harness cancellation requested.')
             if (output/'STOP').exists(): raise AgentError('Operator emergency STOP requested.')
             if len(encoded(messages)) > 54000: raise AgentError('Context budget reached; save a bounded handoff and continue in a new session.')
-            active_tools=available_tools(TOOLS, test_config=test_config)
-            if completion_policy == 'conversational':
-                active_tools = []
-            elif completion_policy == 'read_only_analysis':
-                write_tools = {'replace_text', 'create_file', 'edit_location_file',
-                               'create_location_file', 'save_source', 'forget_saved_source'}
-                active_tools = [tool for tool in active_tools
-                                if tool['function']['name'] not in write_tools]
-            if allowed_tools is not None:
-                active_tools = [tool for tool in active_tools
-                                if tool['function']['name'] in allowed_tools]
+            active_tools = tools
             if len(encoded(messages)) > 47000:
                 active_tools=[tool for tool in active_tools if tool['function']['name']=='finish']
                 messages.append({'role':'user','content':'The bounded read budget is nearly used. Finish now using only observed evidence and mark remaining unknowns; do not request more source.'})
@@ -1407,6 +1506,8 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
                         seen_tool_calls.add(call_key)
                         tool_result = broker.call(name, args)
                 except (AgentError, OSError, ValueError, TypeError, KeyError) as exc:
+                    if isinstance(exc, RecoveryError) or broker.journal.pending is not None:
+                        raise
                     tool_result = {'error': str(exc)[:500], 'operation_performed': False}
                 if event_callback is not None:
                     event_callback('tool.completed', {
@@ -1469,6 +1570,12 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
     finally:
         try:
             actual_tests, receipt_integrity = verify_test_receipts(broker.commands, project, output)
+            if result['status'] == 'complete' and broker.journal.row['operations']:
+                inspection = recovery_store.inspect(broker.journal.row['run_id'])
+                if not inspection['safe_to_reconcile']:
+                    broker.journal.row['status'] = 'interrupted'
+                    result.update(status='incomplete', completion_blockers=[
+                        'The current state or receipt integrity requires reconciliation.'])
             if (result['status'] == 'complete' and 'run_tests' in required_operations
                     and actual_tests != 'passed'):
                 result['status'] = 'incomplete'
@@ -1487,6 +1594,7 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
                               'max_context_utilization': usage['max_prompt_tokens'] / context if context else 0.0},
                           blocked_operations=blocked_operations,
                           completion_classification=completion_classification(result['status'], actual_tests, blocked_operations))
+            broker.journal.close(result['status'])
             atomic_write(output/'result.json', encoded(result))
         finally:
             client.close()

@@ -2,6 +2,7 @@
 from unittest.mock import Mock, patch
 import tempfile
 import threading
+import socket
 from pathlib import Path
 
 from inference_provider import InferenceProvider, ProviderFailure
@@ -123,6 +124,18 @@ class InferenceProviderContractTests(unittest.TestCase):
                 provider.request('/api/version')
         connection.close.assert_called_once()
 
+    def test_cancellation_interrupts_a_socket_waiting_for_response(self):
+        cancelled = threading.Event()
+        left, right = socket.socketpair()
+        with left, right:
+            timer = threading.Timer(0.05, cancelled.set)
+            timer.start()
+            try:
+                with self.assertRaisesRegex(ProviderFailure, 'cancelled'):
+                    Ollama._wait_for_response(left, cancelled, 2)
+            finally:
+                timer.cancel()
+
     def test_health_retries_only_one_transient_idempotent_probe(self):
         provider = Ollama(DEFAULT_ENDPOINT)
         transient = self._http_connection(503, b'')
@@ -196,9 +209,10 @@ class InferenceProviderContractTests(unittest.TestCase):
             'data_sharing_authorized': False,
         }]}
         with tempfile.TemporaryDirectory() as directory, patch(
-                'local_agent.create_inference_provider', return_value=failed):
+                'local_agent.create_inference_provider', return_value=failed), patch(
+                'execution_recovery.HUB', Path(directory)):
             with self.assertRaisesRegex(ProviderFailure, 'declined'):
-                run_agent(Mock(), 'windows-model', 'task',
+                run_agent(Mock(root=Path(directory), identity='a' * 64), 'windows-model', 'task',
                           Path(directory) / 'execution', fallback_policy=policy,
                           fallback_approval=lambda proposal: False)
         failed.close.assert_called_once()
@@ -214,9 +228,11 @@ class InferenceProviderContractTests(unittest.TestCase):
         }]}
         approval = Mock(return_value=True)
         with tempfile.TemporaryDirectory() as directory, patch(
-                'local_agent.create_inference_provider', return_value=failed):
+                'local_agent.create_inference_provider', return_value=failed), patch(
+                'execution_recovery.HUB', Path(directory)):
             with self.assertRaises(ProviderFailure) as caught:
-                run_agent(Mock(), 'windows-model', 'task', Path(directory) / 'execution',
+                run_agent(Mock(root=Path(directory), identity='a' * 64),
+                          'windows-model', 'task', Path(directory) / 'execution',
                           fallback_policy=policy, fallback_approval=approval)
         self.assertEqual(caught.exception.code, 'identity_mismatch')
         approval.assert_not_called()

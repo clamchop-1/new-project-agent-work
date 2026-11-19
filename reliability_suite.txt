@@ -1,0 +1,55 @@
+import ast
+from pathlib import Path
+import sys
+import unittest
+
+import pricing
+import rules
+
+
+class ReliabilityTests(unittest.TestCase):
+    def test_subtotal(self):
+        self.assertEqual(pricing.subtotal(3, 7), 21)
+        self.assertEqual(pricing.subtotal(0, 7), 0)
+
+    def test_service_charge(self):
+        self.assertEqual(pricing.total(3, 7), 23)
+        self.assertEqual(pricing.total(1, 5), 7)
+
+    def test_rule(self):
+        self.assertEqual(rules.service_charge(), 2)
+
+    def test_config(self):
+        self.assertTrue(rules.valid_limit(1))
+        self.assertTrue(rules.valid_limit(100))
+        self.assertFalse(rules.valid_limit(0))
+        self.assertFalse(rules.valid_limit(101))
+
+    def test_invalid_quantity(self):
+        with self.assertRaises(ValueError):
+            pricing.subtotal(-1, 7)
+
+    def test_generated_cases(self):
+        # Inspect a small declarative output. Never execute model-authored tests.
+        path = Path(sys.argv[1]) / 'test_cases.py'
+        tree = ast.parse(path.read_text(encoding='utf-8'))
+        cases = set()
+        for node in tree.body:
+            self.assertIsInstance(node, ast.Assert)
+            expression = node.test
+            self.assertIsInstance(expression, ast.Compare)
+            self.assertEqual(len(expression.ops), 1)
+            self.assertIsInstance(expression.ops[0], ast.Eq)
+            call = expression.left
+            self.assertIsInstance(call, ast.Call)
+            self.assertIsInstance(call.func, ast.Name)
+            self.assertEqual(call.func.id, 'subtotal')
+            self.assertEqual(len(call.args), 2)
+            self.assertFalse(call.keywords)
+            quantity, unit = (ast.literal_eval(arg) for arg in call.args)
+            expected = ast.literal_eval(expression.comparators[0])
+            self.assertTrue(all(type(item) is int for item in (quantity, unit, expected)))
+            self.assertEqual(pricing.subtotal(quantity, unit), expected)
+            cases.add((quantity, unit))
+        self.assertTrue(any(q == 0 for q, _ in cases))
+        self.assertTrue(any(q > 1 and u > 1 for q, u in cases))

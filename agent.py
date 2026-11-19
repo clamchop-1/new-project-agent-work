@@ -10,6 +10,7 @@ import uuid
 from agent_core import AgentError, Project, atomic_write, encoded, digest, exclusive, save_handoff
 from assistant_files import AssistantFiles
 from local_agent import HUB, TOOLS, run_agent
+from execution_recovery import RecoveryStore
 from model_router import discover_candidates, route_model, read_recent_performance
 from model_registry import (ModelRegistryError, append_performance_evidence,
                             load_registry)
@@ -207,7 +208,7 @@ def main():
     configured_projects = legacy_name_map(config)
     selectors = selector_map(config)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['config','inspect','run','approve','history','prepare-bridges','prepare-handoff','save-handoff'])
+    parser.add_argument('action', choices=['config','inspect','run','approve','history','prepare-bridges','prepare-handoff','save-handoff','recovery-inspect','recovery-reconcile'])
     parser.add_argument('--project', choices=selectors,
                         default='KronosStage' if 'KronosStage' in configured_projects else next(iter(configured_projects)))
     parser.add_argument('--task');parser.add_argument('--task-file',type=Path)
@@ -232,6 +233,10 @@ def main():
     )
     parser.add_argument('--resume-held-project',action='store_true')
     parser.add_argument('--permit',type=Path);parser.add_argument('--run-directory',type=Path)
+    parser.add_argument('--recovery-run', help='Recovery journal ID for inspection, reconciliation, or continuation.')
+    parser.add_argument('--recovery-action',
+                        choices=['accept', 'abort', 'restore', 'confirm-command-stopped'])
+    parser.add_argument('--review-sha256')
     parser.add_argument('--proposal',type=Path);parser.add_argument('--authorize-memory-save',action='store_true')
     parser.add_argument('--agent',choices=['codex','claude','qwen'],default='qwen')
     parser.add_argument('--history-index',type=int);parser.add_argument('--authorize-history',action='store_true')
@@ -279,6 +284,14 @@ def main():
     logical_project_id = selectors[args.project]
     selected_project_name = config['projects'][logical_project_id]['name']
     project=Project(configured_projects[selected_project_name])
+    recovery = RecoveryStore(project)
+    if args.action == 'recovery-inspect':
+        print(json.dumps(recovery.inspect(args.recovery_run), indent=2))
+        return
+    if args.action == 'recovery-reconcile':
+        print(json.dumps(recovery.reconcile(args.recovery_run, args.review_sha256,
+                                            args.recovery_action), indent=2))
+        return
     locks=PRIVATE/'locks';locks.mkdir(exist_ok=True)
     with exclusive(locks/(project.identity+'.lock'),args.agent):
         if args.action in ('inspect','prepare-bridges'):
@@ -298,18 +311,29 @@ def main():
             if not args.resume_held_project:raise AgentError('Existing project holds require an explicit, task-specific resume decision.')
             if not args.task_file or not args.write_path:raise AgentError('Reviewable task file and exact write paths are required.')
             state=project.state()
-            if state['status'].strip():raise AgentError('Existing worktree changes must be reviewed/isolated before edit authorization.')
+            if state['status'].strip() and not args.recovery_run:raise AgentError('Existing worktree changes must be reviewed/isolated before edit authorization.')
             write_paths = validate_write_paths(selected_project_name, args.write_path)
             for path in write_paths:project.path(path)
+            if args.recovery_run:
+                old, _ = recovery.load(args.recovery_run)
+                with recovery.locked():
+                    recovery.assert_clear()
+                    recovery.resume_scope(args.recovery_run, write_paths, (), old['scope']['tools'], None)
             folder=new_directory('approvals')
             permit={'project_id':project.identity,'state':state,'memory':project.memory_snapshot(),
                     'task':args.task_file.read_text(encoding='utf-8'),'write_paths':list(write_paths),'used':False}
+            if args.recovery_run:
+                permit['recovery_run'] = args.recovery_run
             atomic_write(folder/'permit.json',encoded(permit))
             print('Single-task edit permit: '+str(folder/'permit.json'));return
         if args.action=='run':
+            with recovery.locked():
+                recovery.assert_clear()
             task=args.task or (args.task_file.read_text(encoding='utf-8') if args.task_file else
                 'Perform a read-only takeover. Read relevant source and explain architecture, newest hold/task, unfinished work and next safe step. Do not edit or resume work.')
             writes=[]
+            if args.recovery_run and assistant_write_paths:
+                raise AgentError('Recovery continuation cannot write to assistant locations.')
             if args.permit:
                 permit_path=args.permit.resolve()
                 if not permit_path.is_relative_to(PRIVATE/'approvals'):raise AgentError('Use an operator-created permit in this launcher workspace.')
@@ -318,6 +342,8 @@ def main():
                     raise AgentError('Permit is used, cross-project or stale.')
                 if not args.task and not args.task_file:task=permit['task']
                 if task!=permit['task']:raise AgentError('Approved task changed.')
+                if permit.get('recovery_run') != args.recovery_run:
+                    raise AgentError('The write permit does not match this recovery checkpoint.')
                 writes=validate_write_paths(selected_project_name, permit['write_paths'])
                 permit['used']=True;atomic_write(permit_path,encoded(permit))
             parent=new_directory('runs');packet=snapshot(project,parent)
@@ -402,6 +428,11 @@ def main():
                         else 'tool_required'
                     )
 
+                    recovery_options = {}
+                    if args.recovery_run:
+                        previous, _ = recovery.load(args.recovery_run)
+                        recovery_options.update(resume_from=args.recovery_run,
+                                                allowed_tools=previous['scope']['tools'])
                     result=run_agent(
                         project,selected_model,task,
                         parent/'execution',selected_endpoint,
@@ -420,6 +451,7 @@ def main():
                         routing_decision=route,
                         completion_policy=completion_policy,
                         required_operations=tuple(args.require_operation),
+                        **recovery_options,
                     )
             finally:
                 atomic_write(parent/'post-run.json',encoded({'state':project.state(),'memory':packet['memory_snapshot'],

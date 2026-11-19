@@ -23,7 +23,7 @@ ALLOWED = (ast.Module, ast.FunctionDef, ast.arguments, ast.arg, ast.Return, ast.
            ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Is, ast.IsNot)
 
 
-def validate_source(text):
+def validate_source(text, *, allow_local_assignment=False):
     tree = ast.parse(text)
     if len(list(ast.walk(tree))) > 1000:
         raise ValueError('Pure fixture source exceeds AST limit')
@@ -34,9 +34,14 @@ def validate_source(text):
     for node in tree.body:
         if not isinstance(node, ast.FunctionDef) and not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)):
             raise ValueError('Only pure function definitions and a module docstring are allowed')
+    allowed = ALLOWED + (ast.Assign, ast.Store) if allow_local_assignment else ALLOWED
     for node in ast.walk(tree):
-        if not isinstance(node, ALLOWED):
+        if not isinstance(node, allowed):
             raise ValueError('Unsupported pure-fixture syntax: ' + type(node).__name__)
+        if isinstance(node, ast.Assign) and (
+                len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name)
+                or node.targets[0].id in SAFE_BUILTINS):
+            raise ValueError('Fixture assignment requires a single local non-builtin name')
         if isinstance(node, ast.Name) and node.id.startswith('__'):
             raise ValueError('Dunder access rejected')
         if isinstance(node, ast.FunctionDef):
@@ -69,11 +74,21 @@ def main():
 
     config = json.loads(config_path.read_bytes())
 
+    reliability = False
     if root.name.casefold() == 'localagentsandbox':
         expected = {
             'test_file': 'tests/test_verified_calculator.py',
             'test_sha256': 'ea91fa9f1bb1b6f984df3e7ace8a7faf8062ab2bb58e926ce02e10054547c98d',
             'modules': ['calculator'],
+        }
+    elif (root.parent.parent == (Path(__file__).resolve().parent / '.local' / 'tests').resolve()
+          and root.name == 'repo' and root.parent.name.startswith('phase2d-')
+          and config.get('test_file') == 'tests/test_reliability.py'):
+        reliability = True
+        expected = {
+            'test_file': 'tests/test_reliability.py',
+            'test_sha256': 'b4c8b7da38eaa3366fac6d01f20c6c06deda7949338dd52708d190bd909b0846',
+            'modules': ['pricing', 'rules'],
         }
     elif root.parent.parent == (Path(__file__).resolve().parent / '.local' / 'tests').resolve():
         expected = {
@@ -87,6 +102,19 @@ def main():
     if config != expected:
         raise ValueError('Pinned test configuration differs from approved values')
 
+    if reliability:
+        for relative in (config['test_file'], 'pricing.py', 'rules.py', 'test_cases.py'):
+            candidate = root / relative
+            for part in (candidate, *candidate.parents):
+                if part == root:
+                    break
+                metadata = part.lstat()
+                if part.is_symlink() or getattr(metadata, 'st_file_attributes', 0) & 0x400:
+                    raise ValueError('A reliability fixture path is linked')
+            if (not candidate.is_file() or candidate.stat().st_nlink != 1
+                    or candidate.stat().st_size > 65536):
+                raise ValueError('A reliability fixture file is outside the safe size or link limits')
+
     test = root / config['test_file']
     if hashlib.sha256(test.read_bytes()).hexdigest() != config['test_sha256']:
         raise ValueError('Pinned test changed; refusing execution')
@@ -98,7 +126,8 @@ def main():
             # failure instead of aborting test discovery with ImportError.
             sys.modules[name] = types.ModuleType(name)
             continue
-        tree = validate_source(source.read_text(encoding='utf-8-sig'))
+        tree = validate_source(source.read_text(encoding='utf-8-sig'),
+                               allow_local_assignment=reliability)
         module = types.ModuleType(name)
         namespace = {'__builtins__': dict(SAFE_BUILTINS), '__name__': name}
         exec(compile(tree, str(source), 'exec'), namespace)
