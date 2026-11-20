@@ -30,6 +30,7 @@ HUB = Path(__file__).resolve().parent
 MAX_INFERENCE_REQUEST_BYTES = 1024 * 1024
 MAX_INFERENCE_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_INFERENCE_TIMEOUT_SECONDS = 180
+INFERENCE_PROGRESS_INTERVAL_SECONDS = 15.0
 MAX_TRANSIENT_INFERENCE_RETRIES = 1
 MAX_FINISH_SCHEMA_RETRIES = 1
 
@@ -43,6 +44,7 @@ class Ollama:
     def __init__(self, base=DEFAULT_ENDPOINT, forwarded_profile=None):
         self.tunnel = None
         self.cancel_event = None
+        self.progress_callback = None
         if forwarded_profile is None:
             self.base = validate_endpoint(base)
         else:
@@ -120,8 +122,11 @@ class Ollama:
                 raise ProviderFailure('cancelled', 'Inference request cancelled.')
             connection.request('POST' if body is not None else 'GET', path, body=body,
                                headers={'Content-Type': 'application/json'} if body is not None else {})
-            if self.cancel_event is not None and connection.sock is not None:
-                self._wait_for_response(connection.sock, self.cancel_event, timeout)
+            if connection.sock is not None:
+                self._wait_for_response(
+                    connection.sock, self.cancel_event, timeout,
+                    progress_callback=self.progress_callback,
+                )
             response = connection.getresponse()
             if 300 <= response.status < 400:
                 raise ProviderFailure('redirect_rejected', 'Inference endpoint redirects are forbidden.', security=True)
@@ -183,15 +188,27 @@ class Ollama:
                 watcher.join(timeout=0.5)
 
     @staticmethod
-    def _wait_for_response(request_socket, cancel_event, timeout):
+    def _wait_for_response(request_socket, cancel_event, timeout,
+                           progress_callback=None,
+                           progress_interval=INFERENCE_PROGRESS_INTERVAL_SECONDS):
         deadline = time.monotonic() + timeout
-        while not cancel_event.is_set():
+        started = time.monotonic()
+        next_progress = started + progress_interval
+        while cancel_event is None or not cancel_event.is_set():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise ProviderFailure('timeout', 'Inference request timed out.', retryable=True)
             readable, _, _ = select.select([request_socket], [], [], min(0.05, remaining))
-            if readable and not cancel_event.is_set():
+            if readable and (cancel_event is None or not cancel_event.is_set()):
                 return
+            now = time.monotonic()
+            if progress_callback is not None and now >= next_progress:
+                try:
+                    progress_callback(round(now - started, 3))
+                except Exception:
+                    # Diagnostics must not change request or cancellation behavior.
+                    pass
+                next_progress = now + progress_interval
         raise ProviderFailure('cancelled', 'Inference request cancelled.')
 
     @staticmethod
@@ -351,11 +368,16 @@ TOOLS = [
 
 class Broker:
     def __init__(self, project, run, writes=(), test_config=None, assistant_root=None,
-                 assistant_write_paths=(), allowed_tools=None):
+                 assistant_write_paths=(), allowed_tools=None,
+                 require_test_after_each_write=False):
         self.project, self.run = project, Path(run)
         self.allowed_writes = set(writes)
         self.allowed_tools = None if allowed_tools is None else frozenset(allowed_tools)
         self.test_config = test_config
+        if type(require_test_after_each_write) is not bool:
+            raise AgentError('Per-write test verification policy must be boolean.')
+        self.require_test_after_each_write = require_test_after_each_write
+        self.write_needs_test = False
         self.commands, self.writes = [], []
         self.journal = None
         self.cancel_event = None
@@ -420,6 +442,10 @@ class Broker:
                 'total_lines': len(lines), 'text': selected, 'nested_instructions': nested}
 
     def write(self, path, content, expected=None):
+        if self.require_test_after_each_write and self.write_needs_test:
+            raise AgentError(
+                'A pinned test receipt is required after the previous authorized write before another write.'
+            )
         target = self.project.path(path)
         canonical = target.relative_to(self.project.root).as_posix()
         if canonical not in self.allowed_writes:
@@ -460,6 +486,8 @@ class Broker:
                 raise RecoveryError('Write result differs from the journaled intent.')
             self.journal.record(receipt)
         self.writes.append(receipt)
+        if self.require_test_after_each_write:
+            self.write_needs_test = True
         return receipt
 
     def execute(self, name, path=None):
@@ -518,6 +546,12 @@ class Broker:
         if self.journal:
             self.journal.record(reference)
         self.commands.append(reference)
+        if name == 'tests' and self.require_test_after_each_write:
+            test_status, integrity = verify_test_receipts(
+                self.commands, self.project, self.run
+            )
+            if integrity.get('valid') is True and test_status in {'passed', 'failed'}:
+                self.write_needs_test = False
         return {**receipt, 'output': text}
 
     def call(self, name, args):
@@ -614,7 +648,12 @@ class Broker:
         if name == 'create_file': return self.write(args['path'], args['content'])
         if name == 'run_tests': return self.execute('tests')
         if name == 'run_command': return self.execute(args['name'], args['path'])
-        if name == 'finish': return args
+        if name == 'finish':
+            if self.require_test_after_each_write and self.write_needs_test:
+                raise AgentError(
+                    'A pinned test receipt is required after the latest authorized write before finishing.'
+                )
+            return args
         raise AgentError('Unknown tool rejected.')
 
 
@@ -1117,8 +1156,74 @@ def host_progress(active_tools, required, successful, reads, broker, tests, bloc
     )}
 
 
+def validate_clarification_contract(finish_result, required_clarifications):
+    """Require unresolved requirements and explicit requests in the finish data."""
+    if not required_clarifications:
+        return True
+
+    ids = finish_result.get('clarification_ids')
+    unfinished = finish_result.get('unfinished')
+    next_actions = finish_result.get('next_actions')
+
+    if not isinstance(ids, list) or ids != list(required_clarifications):
+        return False
+
+    if not isinstance(unfinished, list) or not isinstance(next_actions, list):
+        return False
+
+    if any(not isinstance(item, str) or not item.strip() for item in unfinished):
+        return False
+
+    if any(not isinstance(item, str) or not item.strip() for item in next_actions):
+        return False
+
+    unresolved = re.compile(
+        r'\b(?:missing|unspecified|unknown|awaiting|awaits|need\w*|'
+        r'(?:has|have|had|was|were)\s+not\s+(?:been\s+)?'
+        r'(?:provided|specified|supplied)|not\s+(?:yet\s+)?'
+        r'(?:provided|specified|supplied))\b',
+        re.IGNORECASE,
+    )
+    current_implementation = re.compile(
+        r'\b(?:current|currently|existing|hardcoded|defined|implementation|'
+        r'implements|returns|fixed)\b',
+        re.IGNORECASE,
+    )
+    request = re.compile(
+        r'\b(?:ask|request|provide|specify|clarify|share|tell)\w*\b|\?',
+        re.IGNORECASE,
+    )
+    ignored_identifier_terms = {
+        'new', 'replacement', 'required', 'operator', 'clarification',
+        'missing', 'requested', 'desired', 'updated',
+    }
+
+    def words(value):
+        return set(re.sub(r'[_\W]+', ' ', value.casefold()).split())
+
+    def identifier_terms(identifier):
+        return set(identifier.split('_')) - ignored_identifier_terms
+
+    def identifies(value, identifier):
+        return identifier_terms(identifier) <= words(value)
+
+    for identifier in required_clarifications:
+        described = any(
+            identifies(item, identifier)
+            and (unresolved.search(item) or current_implementation.search(item))
+            for item in unfinished
+        )
+        requested = any(
+            request.search(item) and identifies(item, identifier)
+            for item in next_actions
+        )
+        if not described or not requested:
+            return False
+
+    return True
+
 @recoverable_run
-def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), test_config=None, max_steps=16, context=16384, conversation=(), provider_name='ollama', assistant_root=None, assistant_write_paths=(), max_tool_calls=None, cancel_event=None, event_callback=None, provider_profile=None, remote_profile=None, fallback_policy=None, fallback_approval=None, routing_decision=None, allowed_tools=None, role_instructions='', completion_policy='tool_required', required_operations=(), *, resume_from=None, progress_guidance=False, recovery_store):
+def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), test_config=None, max_steps=16, context=16384, conversation=(), provider_name='ollama', assistant_root=None, assistant_write_paths=(), max_tool_calls=None, cancel_event=None, event_callback=None, provider_profile=None, remote_profile=None, fallback_policy=None, fallback_approval=None, routing_decision=None, allowed_tools=None, role_instructions='', completion_policy='tool_required', required_operations=(), *, resume_from=None, progress_guidance=False, required_clarifications=(), require_test_after_each_write=False, recovery_store):
     output = Path(output);output.mkdir(parents=True, exist_ok=False)
     assistant_files = AssistantFiles(assistant_root) if assistant_root else None
     if assistant_write_paths and assistant_files is None:
@@ -1140,7 +1245,33 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
         completion_policy, required_operations, writes, test_config,
         assistant_write_paths,
     )
-    tools = execution_tools(test_config, completion_policy, allowed_tools)
+    if (not isinstance(required_clarifications, (tuple, list))
+            or len(required_clarifications) > 12
+            or any(not isinstance(item, str)
+                   or not 1 <= len(item) <= 80
+                   or not item.isascii()
+                   or not all(char.islower() or char.isdigit() or char == '_'
+                              for char in item)
+                   for item in required_clarifications)
+            or len(set(required_clarifications)) != len(required_clarifications)):
+        raise AgentError('Required clarification identifiers are malformed.')
+    required_clarifications = tuple(required_clarifications)
+    if type(require_test_after_each_write) is not bool:
+        raise AgentError('Per-write test verification policy must be boolean.')
+    if required_clarifications and completion_policy == 'conversational':
+        raise AgentError('Clarification contracts require a tool-based completion policy.')
+
+    tools = copy.deepcopy(execution_tools(test_config, completion_policy, allowed_tools))
+    if required_clarifications:
+        finish_schema = next(
+            item['function']['parameters'] for item in tools
+            if item['function']['name'] == 'finish'
+        )
+        finish_schema['properties']['clarification_ids'] = {
+            'type': 'array',
+            'items': {'type': 'string'},
+        }
+        finish_schema['required'].append('clarification_ids')
     effective_grant = {item['function']['name'] for item in tools}
     if resume_from:
         if assistant_root:
@@ -1235,7 +1366,8 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
         public_packet = {**packet, 'state': {k: v for k, v in packet['state'].items() if k != 'files'}}
         broker = Broker(project, output, writes, test_config, assistant_root=assistant_files,
                         assistant_write_paths=assistant_write_paths,
-                        allowed_tools=allowed_tools)
+                        allowed_tools=allowed_tools,
+                        require_test_after_each_write=require_test_after_each_write)
         broker.cancel_event = cancel_event
         if resume_from:
             recovery_store.resume_scope(resume_from, writes, assistant_write_paths,
@@ -1301,11 +1433,40 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
               '{"name":"finish","arguments":{"summary":"Observed results","unfinished":[],"next_actions":[]}}. '
               'Include requested findings and any observed task marker in summary; do not defer reporting observed '
               'facts. Report only observed evidence in the finish summary. '
+              'Distinguish existing implementation values from newly requested requirements. '
+              'If a task requires a replacement value, rule, or decision that the user has not supplied '
+              'and authorized evidence cannot establish it, do not invent it or assume the existing '
+              'implementation is the requested replacement. '
+              'Identify each specific missing input in unfinished and request clarification in next_actions. '
+              'Passing tests for the existing implementation do not establish missing requirements. '
               'Completion policy: ' + completion_policy + '. '
               + ('This is a tool-free conversational task. Give the answer directly in plain text; do not emit tool-call markup.'
                  if completion_policy == 'conversational' else
                  'Call finish only after the host-declared required operations are complete: '
                  + json.dumps(sorted(required_operations)) + '. Put remaining work in unfinished; do not claim completion if any required operation is outstanding.'))
+    if required_clarifications:
+        system += (
+            ' OPERATOR-REQUIRED CLARIFICATION CONTRACT: '
+            'The following identifiers represent requirements that have not '
+            'been supplied for the requested change: '
+            + json.dumps(list(required_clarifications))
+            + '. In finish, include clarification_ids containing exactly these '
+            'identifiers in this order. For every identifier, describe the '
+            'missing NEW requirement in unfinished and explicitly request '
+            'that information from the user in next_actions. '
+            'An existing value or rule found in source code is evidence of '
+            'current behavior, not evidence of the requested new behavior. '
+            'Do not invent replacement values or rules. '
+            'Do not claim the requested change is complete while these '
+            'requirements remain unanswered.'
+        )
+    if require_test_after_each_write:
+        system += (
+            ' HOST-ENFORCED WRITE VERIFICATION: After each authorized source write, '
+            'run the pinned tests before making another write and again before finishing. '
+            'An intermediate failing test receipt is valid evidence that remaining defects '
+            'still need repair; preserve the write and continue only after that receipt.'
+        )
     from conversation_session import bound_turns
 
     # Conversation is untrusted context, never authorization.
@@ -1383,6 +1544,24 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
                 inference_attempts += 1
                 attempt_began = time.monotonic()
                 attempt_status = 'failed'
+                if hasattr(client, 'progress_callback'):
+                    def report_inference_progress(elapsed, current_step=step):
+                        payload = {
+                            'legacy_step': current_step,
+                            'phase': 'awaiting_response_bytes',
+                            'elapsed_seconds': elapsed,
+                        }
+                        try:
+                            with log.open('ab') as stream:
+                                stream.write(encoded({'inference_progress': payload}) + b'\n')
+                        except OSError:
+                            pass
+                        if event_callback is not None:
+                            try:
+                                event_callback('inference.progress', payload)
+                            except Exception:
+                                pass
+                    client.progress_callback = report_inference_progress
                 try:
                     response = client.chat(
                         model, turn_messages, active_tools, context,
@@ -1626,8 +1805,28 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
                             'Do not request additional authorization or bypass a restriction.'
                         )
                     })
+                if ('error' in tool_result and isinstance(tool_result.get('error'), str)
+                        and 'pinned test receipt is required' in tool_result['error'].casefold()):
+                    messages.append({
+                        'role': 'user',
+                        'content': (
+                            'Host verification gate: the prior authorized write is preserved. '
+                            'Run the pinned tests now and wait for its receipt before any next '
+                            'write or finish. An intermediate failing receipt is expected when '
+                            'another authorized repair remains.'
+                        ),
+                    })
                 if name == 'finish' and 'error' not in tool_result:
                     blockers = []
+                    if required_clarifications:
+                        clarification_satisfied = validate_clarification_contract(
+                            tool_result, required_clarifications
+                        )
+                        result['clarification_contract_satisfied'] = clarification_satisfied
+                        if clarification_satisfied:
+                            blockers.append('required clarifications await user input')
+                        else:
+                            blockers.append('required clarification contract was not satisfied')
                     if tool_result.get('unfinished'):
                         blockers.append('finish reported unfinished work')
                     missing = required_operations - successful_operations
@@ -1645,7 +1844,13 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
                     break
             result['steps'] = step + 1
             if result['status'] in {'complete', 'incomplete'}: break
-        if result['status'] == 'running': result['status'] = 'step_limit'
+        if result['status'] == 'running':
+            result['status'] = 'step_limit'
+            if required_clarifications:
+                result['clarification_contract_satisfied'] = False
+                result.setdefault('completion_blockers', []).append(
+                    'required clarification contract was not satisfied before the step limit'
+                )
     except BaseException as exc:
         result.update(status='failed', error=str(exc)[:1000])
         if isinstance(exc, ProviderFailure):

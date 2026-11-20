@@ -51,6 +51,8 @@ class RunAgentValidationTests(FixtureCase):
                         "summary": arguments["summary"],
                         "unfinished": arguments["unfinished"],
                         "next_actions": arguments["next_actions"],
+                        **({"clarification_ids": arguments["clarification_ids"]}
+                           if "clarification_ids" in arguments else {}),
                         "operation_performed": False
                     }
                 return {"operation_performed": False}
@@ -83,6 +85,26 @@ class RunAgentValidationTests(FixtureCase):
         )
         return executed, result
 
+    def test_required_clarifications_preserve_step_limit(self):
+        executed, result = self.execute(
+            [
+                {"role": "assistant", "content": "Still investigating."},
+                {"role": "assistant", "content": "No conclusion yet."},
+            ],
+            max_steps=2,
+            required_clarifications=(
+                "replacement_service_charge_value",
+                "replacement_service_charge_business_rule",
+            ),
+        )
+
+        self.assertEqual(executed, [])
+        self.assertEqual(result["status"], "step_limit")
+        self.assertFalse(result["clarification_contract_satisfied"])
+        self.assertIn(
+            "required clarification contract was not satisfied before the step limit",
+            result["completion_blockers"],
+        )
     def test_unknown_tool_rejected(self):
         executed, result = self.execute([
             {
@@ -161,6 +183,197 @@ class RunAgentValidationTests(FixtureCase):
 
         self.assertEqual(executed, [])
         self.assertEqual(result["status"], "failed")
+
+    def test_system_prompt_explains_missing_requirements(self):
+        captured = []
+        responses = iter([
+            {"role": "assistant", "tool_calls": [
+                tool("finish", {
+                    "summary": "Insufficient information",
+                    "unfinished": ["Replacement value and rule not supplied"],
+                    "next_actions": ["Ask for the replacement value and rule"],
+                })
+            ]},
+            {"role": "assistant", "tool_calls": [
+                tool("finish", {
+                    "summary": "The new requirements remain unspecified.",
+                    "clarification_ids": [
+                        "service_charge_amount", "service_charge_rule"
+                    ],
+                    "unfinished": [
+                        "New service charge amount is missing",
+                        "New service charge business rule is missing",
+                    ],
+                    "next_actions": [
+                        "Ask the user for the new service charge amount",
+                        "Ask the user for the new service charge business rule",
+                    ],
+                })
+            ]}
+        ])
+
+        def fake_request(client, endpoint, payload):
+            captured.append(payload)
+            return {"message": next(responses)}
+
+        with patch("local_agent.Ollama.model",
+                   return_value={"digest": "mock-local-model"}), \
+             patch("local_agent.Ollama.request",
+                   autospec=True, side_effect=fake_request):
+            run_agent(
+                self.project, "mock-local-model",
+                "Update a rule without supplying its replacement value",
+                self.base / "missing-requirements",
+                max_steps=2,
+                required_clarifications=(
+                    "service_charge_amount", "service_charge_rule"
+                ),
+            )
+
+        self.assertTrue(captured)
+        system = captured[0]["messages"][0]["content"]
+        self.assertIn("Distinguish existing implementation values", system)
+        self.assertIn("request clarification in next_actions", system)
+        self.assertIn("OPERATOR-REQUIRED CLARIFICATION CONTRACT", system)
+        self.assertIn(
+            '["service_charge_amount", "service_charge_rule"]', system
+        )
+        self.assertIn("missing NEW requirement", system)
+        self.assertIn("explicitly request", system)
+    def test_required_clarifications_reject_missing_requests(self):
+        executed, result = self.execute([
+            {"role": "assistant", "tool_calls": [
+                tool("finish", {
+                    "summary": "Existing service charge is 2; tests pass.",
+                    "unfinished": ["Existing rule returns 2"],
+                    "next_actions": [],
+                })
+            ]}
+        ], required_clarifications=(
+            "replacement_service_charge_value",
+            "replacement_service_charge_business_rule",
+        ))
+
+        self.assertEqual([name for name, _ in executed], [])
+        self.assertEqual(result["status"], "step_limit")
+        self.assertFalse(result.get("clarification_contract_satisfied", True))
+        self.assertIn(
+            "required clarification",
+            " ".join(result.get("completion_blockers", [])).lower(),
+        )
+    def test_required_clarifications_accept_valid_requests(self):
+        executed, result = self.execute([
+            {"role": "assistant", "tool_calls": [
+                tool("finish", {
+                    "summary": "Existing service charge is 2; replacement unspecified.",
+                    "unfinished": [
+                        "Missing replacement service charge value",
+                        "Missing replacement service charge business rule",
+                    ],
+                    "next_actions": [
+                        "What replacement service charge value should be used?",
+                        "What business rule should determine the new service charge?",
+                    ],
+                    "clarification_ids": [
+                        "replacement_service_charge_value",
+                        "replacement_service_charge_business_rule",
+                    ],
+                })
+            ]}
+        ], required_clarifications=(
+            "replacement_service_charge_value",
+            "replacement_service_charge_business_rule",
+        ))
+
+        self.assertEqual(result["status"], "incomplete")
+        self.assertTrue(result["clarification_contract_satisfied"])
+        self.assertEqual(
+            result["summary"]["clarification_ids"],
+            [
+                "replacement_service_charge_value",
+                "replacement_service_charge_business_rule",
+            ],
+        )
+
+    def test_required_clarifications_accept_one_request_covering_two_ids(self):
+        executed, result = self.execute([
+            {"role": "assistant", "tool_calls": [
+                tool("finish", {
+                    "summary": "The current code uses a fixed service charge of 2.",
+                    "unfinished": [
+                        "The service_charge_amount is currently hardcoded to 2.",
+                        "The service_charge_rule is defined as a function that always returns 2.",
+                    ],
+                    "next_actions": [
+                        "Please provide the new service charge amount and its corresponding business rule to be implemented.",
+                    ],
+                    "clarification_ids": [
+                        "service_charge_amount", "service_charge_rule",
+                    ],
+                })
+            ]}
+        ], required_clarifications=(
+            "service_charge_amount", "service_charge_rule",
+        ))
+
+        self.assertEqual([name for name, _ in executed], ["finish"])
+        self.assertEqual(result["status"], "incomplete")
+        self.assertTrue(result["clarification_contract_satisfied"])
+
+    def test_required_clarifications_reject_ids_without_questions(self):
+        executed, result = self.execute([
+            {"role": "assistant", "tool_calls": [
+                tool("finish", {
+                    "summary": "The existing service charge is 2.",
+                    "unfinished": [
+                        "Replacement service charge value is missing.",
+                        "Replacement business rule is missing.",
+                    ],
+                    "next_actions": [],
+                    "clarification_ids": [
+                        "replacement_service_charge_value",
+                        "replacement_service_charge_business_rule",
+                    ],
+                })
+            ]}
+        ], required_clarifications=(
+            "replacement_service_charge_value",
+            "replacement_service_charge_business_rule",
+        ))
+
+        self.assertEqual([name for name, _ in executed], ["finish"])
+        self.assertEqual(result["status"], "incomplete")
+        self.assertFalse(result["clarification_contract_satisfied"])
+        self.assertIn(
+            "required clarification",
+            " ".join(result.get("completion_blockers", [])).lower(),
+        )
+
+    def test_required_clarifications_reject_existing_values_as_missing_inputs(self):
+        executed, result = self.execute([
+            {"role": "assistant", "tool_calls": [
+                tool("finish", {
+                    "summary": "The current implementation returns 2.",
+                    "unfinished": [
+                        "The service charge amount is 2.",
+                        "The business rule is a fixed value of 2.",
+                    ],
+                    "next_actions": [
+                        "Please provide the requested amount.",
+                        "Please specify the requested business rule.",
+                    ],
+                    "clarification_ids": [
+                        "service_charge_amount", "service_charge_rule",
+                    ],
+                })
+            ]}
+        ], required_clarifications=(
+            "service_charge_amount", "service_charge_rule",
+        ))
+
+        self.assertEqual([name for name, _ in executed], ["finish"])
+        self.assertEqual(result["status"], "incomplete")
+        self.assertFalse(result["clarification_contract_satisfied"])
 
     def test_valid_read_and_finish(self):
         executed, result = self.execute([

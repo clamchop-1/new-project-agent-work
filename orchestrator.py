@@ -1927,12 +1927,52 @@ def _memory_snapshot(project: Project) -> dict[str, str | None]:
 
 
 def _pid_alive(pid: Any) -> bool:
+    """Return False only when the OS confirms that a PID is absent."""
     if type(pid) is not int or pid <= 0:
         return True
+
+    if os.name == 'nt':
+        import ctypes
+        from ctypes import wintypes
+
+        try:
+            kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            open_process = kernel32.OpenProcess
+            open_process.argtypes = (
+                wintypes.DWORD, wintypes.BOOL, wintypes.DWORD
+            )
+            open_process.restype = wintypes.HANDLE
+
+            close_handle = kernel32.CloseHandle
+            close_handle.argtypes = (wintypes.HANDLE,)
+            close_handle.restype = wintypes.BOOL
+
+            ctypes.set_last_error(0)
+            handle = open_process(0x1000 | 0x00100000, False, pid)
+
+            if handle:
+                try:
+                    wait = kernel32.WaitForSingleObject
+                    wait.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+                    wait.restype = wintypes.DWORD
+
+                    result = wait(handle, 0)
+
+                    if result == 0:
+                        return False
+
+                    return True
+                finally:
+                    close_handle(handle)
+
+            error = ctypes.get_last_error()
+            return error != 87
+        except (OSError, AttributeError, ValueError):
+            return True
+
     try:
         os.kill(pid, 0)
     except OSError as exc:
-        if exc.errno == errno.ESRCH or getattr(exc, 'winerror', None) in (87, 1168):
-            return False
-        return True
+        return exc.errno != errno.ESRCH
+
     return True

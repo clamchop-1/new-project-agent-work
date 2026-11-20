@@ -169,9 +169,12 @@ class MemoryTests(FixtureCase):
 
 
 class CapabilityTests(FixtureCase):
-    def broker(self, writes=(), test=False):
+    def broker(self, writes=(), test=False, require_test_after_each_write=False):
         run=self.base/('run'+str(len(list(self.base.glob('run*')))));run.mkdir()
-        return Broker(self.project,run,writes,self.test_config if test else None)
+        return Broker(
+            self.project, run, writes, self.test_config if test else None,
+            require_test_after_each_write=require_test_after_each_write,
+        )
 
     def test_paths_private_files_instructions_and_binary_writes_blocked(self):
         broker=self.broker(['../outside.py','AGENTS.md','.local/PROJECT_CONTEXT.md','sound.pcg'])
@@ -291,6 +294,41 @@ class CapabilityTests(FixtureCase):
         changed=record('qwen');changed['test_receipts']=broker.commands
         self.save(changed)
         self.assertIn('recorded execution',self.project.memory()[0]['text'].lower())
+
+    def test_per_write_test_gate_preserves_edits_and_requires_final_receipt(self):
+        broker = self.broker(
+            ['calculator.py', 'stats.py'], test=True,
+            require_test_after_each_write=True,
+        )
+        self.assertNotEqual(broker.execute('tests')['exit_code'], 0)
+
+        calculator = self.project.root / 'calculator.py'
+        broker.write(
+            'calculator.py',
+            'def average(values):\n'
+            '    if not values:\n'
+            '        raise ValueError("empty")\n'
+            '    return sum(values) / len(values)\n',
+            file_hash(calculator),
+        )
+        with self.assertRaisesRegex(AgentError, 'test receipt is required'):
+            broker.write('stats.py', 'def clamp(value, low, high):\n    return value\n')
+        self.assertTrue(calculator.is_file())
+
+        self.assertNotEqual(broker.execute('tests')['exit_code'], 0)
+        self.assertFalse(broker.write_needs_test)
+        broker.write(
+            'stats.py',
+            'def clamp(value, low, high):\n'
+            '    return min(max(value, low), high)\n',
+        )
+        with self.assertRaisesRegex(AgentError, 'test receipt is required'):
+            broker.call('finish', {'summary': 'Done'})
+
+        self.assertEqual(broker.execute('tests')['exit_code'], 0)
+        self.assertFalse(broker.write_needs_test)
+        self.assertEqual(broker.call('finish', {'summary': 'Verified'}),
+                         {'summary': 'Verified'})
 
     def test_pure_executor_rejects_imports_io_containers_and_builtin_shadowing(self):
         for source in ('import os\n', 'def x():\n    return open("x")\n',

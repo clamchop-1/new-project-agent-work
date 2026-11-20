@@ -103,6 +103,11 @@ def evaluate(batch, name, inference, wall_seconds, progress_guidance=False):
             completion_policy='file_modification' if writes else 'read_only_analysis',
             cancel_event=cancel,
             progress_guidance=progress_guidance,
+            required_clarifications=(
+                ('service_charge_amount', 'service_charge_rule')
+                if name == 'insufficient' else ()
+            ),
+            require_test_after_each_write=name in {'multi-file', 'tool-cycles'},
         )
     except Exception as exc:
         result_file = out / 'result.json'

@@ -686,3 +686,39 @@ class OrchestrationServiceTests(FixtureCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class WindowsPidDetectionTests(unittest.TestCase):
+    """Regression coverage for Windows orchestration lock ownership."""
+
+    @unittest.skipUnless(__import__('os').name == 'nt', 'Windows only')
+    def test_pid_detection_states(self):
+        import os
+        import subprocess
+        import sys
+        from orchestrator import _pid_alive
+
+        self.assertTrue(_pid_alive(os.getpid()))
+        self.assertFalse(_pid_alive(99999999))
+        self.assertTrue(_pid_alive(-1))
+        self.assertTrue(_pid_alive(None))
+
+        child = subprocess.Popen(
+            [sys.executable, '-c', 'pass'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            child.wait(timeout=10)
+            self.assertFalse(_pid_alive(child.pid))
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+
+    @unittest.skipUnless(__import__('os').name == 'nt', 'Windows only')
+    def test_pid_detection_fails_closed_on_api_error(self):
+        from orchestrator import _pid_alive
+
+        with patch('ctypes.WinDLL', side_effect=OSError('Access denied')):
+            self.assertTrue(_pid_alive(12345))

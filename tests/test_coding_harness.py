@@ -42,6 +42,12 @@ class HarnessContractTests(unittest.TestCase):
              'source_hashes': ['b' * 64]}, harness_id='legacy_custom',
         )
         self.assertEqual(HarnessEvent.from_dict(json.loads(event.to_json())), event)
+        progress = HarnessEvent(
+            'run-1', 8, 'inference.progress',
+            {'legacy_step': 2, 'phase': 'awaiting_response_bytes',
+             'elapsed_seconds': 15.0}, harness_id='legacy_custom',
+        )
+        self.assertEqual(HarnessEvent.from_dict(json.loads(progress.to_json())), progress)
 
         result = HarnessResult(
             SCHEMA_VERSION, 'run-1', 'legacy_custom', '1', 'completed', 'complete',

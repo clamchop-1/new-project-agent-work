@@ -136,6 +136,24 @@ class InferenceProviderContractTests(unittest.TestCase):
             finally:
                 timer.cancel()
 
+    def test_waiting_for_response_emits_bounded_progress(self):
+        progress = []
+        left, right = socket.socketpair()
+        with left, right:
+            timer = threading.Timer(0.12, lambda: right.sendall(b'x'))
+            timer.start()
+            try:
+                Ollama._wait_for_response(
+                    left, threading.Event(), 2,
+                    progress_callback=progress.append,
+                    progress_interval=0.02,
+                )
+            finally:
+                timer.cancel()
+        self.assertTrue(progress)
+        self.assertTrue(all(isinstance(value, float) and value > 0
+                            for value in progress))
+
     def test_health_retries_only_one_transient_idempotent_probe(self):
         provider = Ollama(DEFAULT_ENDPOINT)
         transient = self._http_connection(503, b'')

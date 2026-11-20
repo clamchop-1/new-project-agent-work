@@ -8,7 +8,7 @@ from agent_core import digest, encoded
 from local_agent import verify_test_receipts
 
 
-VERSION = '2d1-v2'
+VERSION = '2d1-v3'
 
 
 def _tree(path):
@@ -78,7 +78,9 @@ def _mentions_missing_inputs(summary):
     actions = ' '.join(summary.get('next_actions', ())).casefold()
     value = r'(?:(?:replacement|new)\s+)?(?:service[- ]charge\s+)?(?:amount|value)'
     rule = r'(?:business\s+)?(?:rule|criteria|conditions)'
-    absent = r'(?:missing|not (?:provided|specified|supplied)|unknown|required|need\w*|await\w*)'
+    absent = (r'(?:missing|(?:has|have|had|was|were)\s+not\s+(?:been\s+)?'
+              r'(?:provided|specified|supplied)|not\s+(?:been\s+)?'
+              r'(?:provided|specified|supplied)|unknown|required|need\w*|await\w*)')
     return bool(re.search(absent, missing) and re.search(value, missing) and re.search(rule, missing)
                 and re.search(r'\b(?:ask|request|clarif\w*|provid\w*|specif\w*)\b', actions)
                 and re.search(value, actions) and re.search(rule, actions)

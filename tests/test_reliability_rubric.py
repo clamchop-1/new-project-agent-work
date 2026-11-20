@@ -20,6 +20,16 @@ class ReliabilityRubricTests(unittest.TestCase):
             'unfinished': ['Missing replacement service charge amount and business rule'],
             'next_actions': ['Ask the operator to provide the amount and business rule'],
         }))
+        self.assertTrue(_mentions_missing_inputs({
+            'unfinished': [
+                'The service charge amount has not been specified.',
+                'The business rule has not been specified.',
+            ],
+            'next_actions': [
+                'Please provide the requested service charge amount.',
+                'Please provide the business rule for the service charge.',
+            ],
+        }))
 
     def test_refactor_requires_assignment_and_use_in_total(self):
         with tempfile.TemporaryDirectory() as root:
