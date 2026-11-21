@@ -41,10 +41,11 @@ class NoRedirect(HTTPRedirectHandler):
 
 
 class Ollama:
-    def __init__(self, base=DEFAULT_ENDPOINT, forwarded_profile=None):
+    def __init__(self, base=DEFAULT_ENDPOINT, forwarded_profile=None, diagnostic_capture=None):
         self.tunnel = None
         self.cancel_event = None
         self.progress_callback = None
+        self.diagnostic_capture = diagnostic_capture
         if forwarded_profile is None:
             self.base = validate_endpoint(base)
         else:
@@ -70,7 +71,7 @@ class Ollama:
             self.tunnel = ManagedSshTunnel(forwarded_profile)
         self.opener = build_opener(ProxyHandler({}), NoRedirect())
 
-    def chat(self, model, messages, tools, context, options):
+    def chat(self, model, messages, tools, context, options, timeout=None):
         payload = {
             'model': model,
             'messages': messages,
@@ -80,7 +81,8 @@ class Ollama:
             'keep_alive': '2m',
             'options': {'num_ctx': context, **options},
         }
-        response = self.request('/api/chat', payload)
+        response = (self.request('/api/chat', payload) if timeout is None
+                    else self.request('/api/chat', payload, timeout=timeout))
         message = response.get('message')
         if not isinstance(message, dict) or message.get('role') != 'assistant':
             raise ProviderFailure('malformed_response', 'Inference provider returned an incomplete assistant response.')
@@ -95,50 +97,75 @@ class Ollama:
         if type(timeout) not in (int, float) or not 0 < timeout <= MAX_INFERENCE_TIMEOUT_SECONDS:
             raise AgentError('Inference request timeout is outside the configured bound.')
         body = encoded(payload) if payload is not None else None
+        capture = self.diagnostic_capture if path == '/api/chat' and body is not None else None
+        diagnostic_started = time.monotonic()
+        diagnostic_response = None
+        diagnostic_response_state = 'unavailable'
+        diagnostic_status = None
+        diagnostic_error = None
+        diagnostic_failure = None
+        diagnostic_request_state = 'not_sent'
+        raw = bytearray()
         if body is not None and len(body) > MAX_INFERENCE_REQUEST_BYTES:
             raise AgentError('Inference request exceeds local limit.')
         if self.cancel_event is not None and self.cancel_event.is_set():
             raise ProviderFailure('cancelled', 'Inference request cancelled.')
-        if self.tunnel is not None:
-            self.tunnel.ensure_ready(self.cancel_event)
-        parsed = urlsplit(self.base)
-        connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=timeout)
-        try:
-            connection.connect()
-        except socket.timeout as exc:
-            connection.close()
-            raise ProviderFailure('timeout', 'Inference connection timed out.', retryable=True) from exc
-        except OSError as exc:
-            connection.close()
-            raise ProviderFailure('unavailable', 'Inference endpoint is unavailable.', retryable=True) from exc
+        if capture is not None:
+            try:
+                capture.verify_ready()
+            except Exception as exc:
+                raise ProviderFailure(
+                    'diagnostic_capture_failed',
+                    'Required diagnostic capture is unavailable; inference was not sent.',
+                    security=True,
+                ) from exc
+        connection = None
         finished = threading.Event()
         watcher = None
-        if self.cancel_event is not None:
-            watcher = threading.Thread(target=self._watch_cancellation,
-                                      args=(connection.sock, finished, self.cancel_event), daemon=True)
-            watcher.start()
         try:
+            if self.tunnel is not None:
+                self.tunnel.ensure_ready(self.cancel_event)
+            parsed = urlsplit(self.base)
+            connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=timeout)
+            try:
+                connection.connect()
+            except socket.timeout as exc:
+                raise ProviderFailure('timeout', 'Inference connection timed out.', retryable=True) from exc
+            except OSError as exc:
+                raise ProviderFailure('unavailable', 'Inference endpoint is unavailable.', retryable=True) from exc
+            if self.cancel_event is not None:
+                watcher = threading.Thread(target=self._watch_cancellation,
+                                          args=(connection.sock, finished, self.cancel_event), daemon=True)
+                watcher.start()
             if self.cancel_event is not None and self.cancel_event.is_set():
                 raise ProviderFailure('cancelled', 'Inference request cancelled.')
+            if capture is not None:
+                diagnostic_request_state = 'uncertain'
             connection.request('POST' if body is not None else 'GET', path, body=body,
                                headers={'Content-Type': 'application/json'} if body is not None else {})
+            if capture is not None:
+                diagnostic_request_state = 'submitted'
             if connection.sock is not None:
                 self._wait_for_response(
                     connection.sock, self.cancel_event, timeout,
                     progress_callback=self.progress_callback,
                 )
             response = connection.getresponse()
+            diagnostic_status = response.status
+            rejected_status = None
             if 300 <= response.status < 400:
-                raise ProviderFailure('redirect_rejected', 'Inference endpoint redirects are forbidden.', security=True)
-            if response.status in (401, 403):
-                raise ProviderFailure('authentication', 'Inference provider authentication failed.')
-            if response.status == 404:
-                raise ProviderFailure('model_missing', 'Inference provider did not find the requested model.')
-            if response.status >= 500:
-                raise ProviderFailure('service_unavailable', 'Inference provider returned a service error.', retryable=True)
-            if response.status >= 400:
-                raise ProviderFailure('request_rejected', 'Inference provider rejected the request.')
-            raw = bytearray()
+                rejected_status = ProviderFailure('redirect_rejected', 'Inference endpoint redirects are forbidden.', security=True)
+            elif response.status in (401, 403):
+                rejected_status = ProviderFailure('authentication', 'Inference provider authentication failed.')
+            elif response.status == 404:
+                rejected_status = ProviderFailure('model_missing', 'Inference provider did not find the requested model.')
+            elif response.status >= 500:
+                rejected_status = ProviderFailure('service_unavailable', 'Inference provider returned a service error.', retryable=True)
+            elif response.status >= 400:
+                rejected_status = ProviderFailure('request_rejected', 'Inference provider rejected the request.')
+            if rejected_status is not None and capture is None:
+                raise rejected_status
+            diagnostic_response_state = 'partial'
             deadline = time.monotonic() + timeout
             while True:
                 if self.cancel_event is not None and self.cancel_event.is_set():
@@ -152,10 +179,18 @@ class Ollama:
                 except socket.timeout:
                     continue
                 if not chunk:
+                    if capture is not None:
+                        diagnostic_response = bytes(raw)
+                    diagnostic_response_state = 'complete'
                     break
                 raw.extend(chunk)
+                if capture is not None:
+                    diagnostic_response = bytes(raw)
                 if len(raw) > MAX_INFERENCE_RESPONSE_BYTES:
+                    diagnostic_response_state = 'oversized'
                     raise ProviderFailure('response_too_large', 'Inference response exceeds the configured limit.')
+            if rejected_status is not None:
+                raise rejected_status
             if self.cancel_event is not None and self.cancel_event.is_set():
                 raise ProviderFailure('cancelled', 'Inference request cancelled.')
             if self.tunnel is not None:
@@ -167,7 +202,8 @@ class Ollama:
             if not isinstance(parsed_response, dict):
                 raise ProviderFailure('malformed_response', 'Inference provider response must be a JSON object.')
             return parsed_response
-        except ProviderFailure:
+        except ProviderFailure as exc:
+            diagnostic_error = exc.code
             raise
         except socket.timeout as exc:
             if self.cancel_event is not None and self.cancel_event.is_set():
@@ -182,10 +218,31 @@ class Ollama:
                 raise ProviderFailure('cancelled', 'Inference request cancelled.') from exc
             raise ProviderFailure('partial_response', 'Inference provider returned an incomplete HTTP response.') from exc
         finally:
+            if capture is not None:
+                try:
+                    capture.save(
+                        body or b'', diagnostic_response,
+                        endpoint=path,
+                        model=(payload or {}).get('model'), status=diagnostic_status,
+                        elapsed_seconds=round(time.monotonic() - diagnostic_started, 3),
+                        request_state=diagnostic_request_state,
+                        response_state=diagnostic_response_state,
+                        error=diagnostic_error,
+                    )
+                except Exception as exc:
+                    diagnostic_failure = ProviderFailure(
+                        'diagnostic_capture_failed',
+                        'Required protocol evidence could not be safely captured.',
+                        security=True,
+                    )
+                    diagnostic_failure.__cause__ = exc
             finished.set()
-            connection.close()
+            if connection is not None:
+                connection.close()
             if watcher is not None:
                 watcher.join(timeout=0.5)
+            if diagnostic_failure is not None:
+                raise diagnostic_failure
 
     @staticmethod
     def _wait_for_response(request_socket, cancel_event, timeout,
@@ -245,18 +302,19 @@ class Ollama:
         if self.tunnel is not None:
             self.tunnel.close()
 
-    def model(self, name):
+    def model(self, name, timeout=None):
         if 'cloud' in name.casefold():
             raise ProviderFailure('unauthorized_provider', 'Cloud model tags are forbidden.', security=True)
-        matches = [row for row in self.models() if row['name'] == name]
+        matches = [row for row in self.models(timeout=timeout) if row['name'] == name]
         if len(matches) != 1 or matches[0].get('remote_host') or matches[0].get('remote_model'):
             raise ProviderFailure('model_missing', 'An already installed, non-remote model is required.')
         if matches[0].get('details', {}).get('format') not in ('gguf', 'safetensors'):
             raise ProviderFailure('model_unverified', 'Model format is not verified for local inference.', security=True)
         return matches[0]
 
-    def models(self):
-        value = self.request('/api/tags')
+    def models(self, timeout=None):
+        value = (self.request('/api/tags') if timeout is None
+                 else self.request('/api/tags', timeout=timeout))
         models = value.get('models')
         if (not isinstance(models, list) or any(
                 not isinstance(row, dict) or not isinstance(row.get('name'), str)
@@ -300,16 +358,17 @@ def _fallback_permitted(policy, substitution, approval_callback):
 
 
 def create_inference_provider(provider_name='ollama', endpoint=DEFAULT_ENDPOINT,
-                              provider_profile=None):
+                              provider_profile=None, diagnostic_capture=None):
     """Build only validated local or explicitly configured SSH-forwarded providers."""
     if provider_name == 'ollama':
         if provider_profile is not None:
             raise AgentError('Local Ollama does not accept remote provider profile data.')
-        return Ollama(endpoint)
+        return Ollama(endpoint, diagnostic_capture=diagnostic_capture)
     if provider_name == 'ssh_tunnel_ollama':
         if not isinstance(provider_profile, dict):
             raise AgentError('Remote inference requires an explicitly configured trusted tunnel profile.')
-        return Ollama(endpoint, forwarded_profile=provider_profile)
+        return Ollama(endpoint, forwarded_profile=provider_profile,
+                       diagnostic_capture=diagnostic_capture)
     else:
         raise AgentError('Configured inference provider is not supported locally.')
 
@@ -1223,7 +1282,7 @@ def validate_clarification_contract(finish_result, required_clarifications):
     return True
 
 @recoverable_run
-def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), test_config=None, max_steps=16, context=16384, conversation=(), provider_name='ollama', assistant_root=None, assistant_write_paths=(), max_tool_calls=None, cancel_event=None, event_callback=None, provider_profile=None, remote_profile=None, fallback_policy=None, fallback_approval=None, routing_decision=None, allowed_tools=None, role_instructions='', completion_policy='tool_required', required_operations=(), *, resume_from=None, progress_guidance=False, required_clarifications=(), require_test_after_each_write=False, recovery_store):
+def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), test_config=None, max_steps=16, context=16384, conversation=(), provider_name='ollama', assistant_root=None, assistant_write_paths=(), max_tool_calls=None, cancel_event=None, event_callback=None, provider_profile=None, remote_profile=None, fallback_policy=None, fallback_approval=None, routing_decision=None, allowed_tools=None, role_instructions='', completion_policy='tool_required', required_operations=(), *, resume_from=None, progress_guidance=False, required_clarifications=(), require_test_after_each_write=False, recovery_store, diagnostic_capture=None):
     output = Path(output);output.mkdir(parents=True, exist_ok=False)
     assistant_files = AssistantFiles(assistant_root) if assistant_root else None
     if assistant_write_paths and assistant_files is None:
@@ -1281,7 +1340,9 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
     fallback_policy = fallback_policy or {'mode': 'disabled', 'substitutions': []}
     original_provider, original_model = provider_name, model
     fallback_record = None
-    client: InferenceProvider = create_inference_provider(provider_name, base, provider_profile)
+    client: InferenceProvider = create_inference_provider(
+        provider_name, base, provider_profile, diagnostic_capture=diagnostic_capture
+    )
     if hasattr(client, 'cancel_event'):
         client.cancel_event = cancel_event
     try:
@@ -1350,7 +1411,9 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
             client.close()
             provider_name, model, base = (substitution['to_provider'],
                                           substitution['to_model'], target_endpoint)
-            client = create_inference_provider(provider_name, base, target_profile)
+            client = create_inference_provider(
+                provider_name, base, target_profile, diagnostic_capture=diagnostic_capture
+            )
             if hasattr(client, 'cancel_event'):
                 client.cancel_event = cancel_event
             client.health_check()
