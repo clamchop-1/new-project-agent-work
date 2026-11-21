@@ -8,6 +8,7 @@ from unittest.mock import patch
 from agent_core import AgentError, file_hash
 from local_agent import Broker, run_agent
 from inference_provider import ProviderFailure
+from execution_recovery import RecoveryError, RecoveryStore
 from test_shared_memory import FixtureCase
 
 
@@ -21,6 +22,64 @@ def tool(name, arguments):
 
 
 class RunAgentValidationTests(FixtureCase):
+
+    def test_mutation_budget_is_shared_by_project_write_tools(self):
+        output = self.base / 'mutation'
+        output.mkdir()
+        store = RecoveryStore(self.project)
+        target = self.project.path('calculator.py')
+        with store.locked():
+            broker = Broker(self.project, output, writes=('calculator.py',),
+                            max_source_mutations=1)
+            broker.journal = store.start(output, ('calculator.py',), None, (), None,
+                                         None, ('replace_text', 'create_file'))
+            with self.assertRaisesRegex(AgentError, 'specifically authorized'):
+                broker.write('README.md', 'denied')
+            old = target.read_text(encoding='utf-8')
+            receipt = broker.call('replace_text', {
+                'path': 'calculator.py', 'old': old, 'new': old + '\n# changed\n',
+                'expected_sha256': file_hash(target),
+            })
+            self.assertEqual(receipt['after'], file_hash(target))
+            self.assertEqual(broker.journal.row['operations'][0]['evidence'], receipt)
+            with self.assertRaisesRegex(AgentError, 'budget exhausted'):
+                broker.write('calculator.py', old, receipt['after'])
+            with self.assertRaises(AgentError):
+                broker.call('create_file', {'path': 'calculator.py', 'content': old})
+            with self.assertRaisesRegex(AgentError, 'unavailable'):
+                broker.call('edit_location_file', {})
+            with self.assertRaisesRegex(AgentError, 'unavailable'):
+                broker.execute('tests')
+            self.assertEqual(broker.writes, [receipt])
+            self.assertEqual(file_hash(target), receipt['after'])
+
+    def test_ambiguous_mutation_retains_reserved_budget_and_journal(self):
+        output = self.base / 'mutation-failure'
+        output.mkdir()
+        store = RecoveryStore(self.project)
+        target = self.project.path('calculator.py')
+        before = file_hash(target)
+        with store.locked():
+            broker = Broker(self.project, output, writes=('calculator.py',),
+                            max_source_mutations=1)
+            broker.journal = store.start(output, ('calculator.py',), None, (), None,
+                                         None, ('replace_text',))
+            with patch('local_agent.atomic_write', side_effect=OSError('mock interruption')):
+                with self.assertRaises(OSError):
+                    broker.write('calculator.py', '# changed\n', before)
+            self.assertIsNotNone(broker.journal.pending)
+            self.assertEqual(broker.source_mutations_remaining, 0)
+            self.assertEqual(broker.writes, [])
+            with self.assertRaises(RecoveryError):
+                broker.write('calculator.py', '# retry\n', before)
+        with self.assertRaises(RecoveryError):
+            store.assert_clear()
+
+    def test_mutation_budget_does_not_grant_write_permission(self):
+        broker = Broker(self.project, self.base, max_source_mutations=1)
+        with self.assertRaisesRegex(AgentError, 'specifically authorized'):
+            broker.write('calculator.py', '# denied\n')
+        self.assertEqual(broker.source_mutations_remaining, 1)
 
     def execute(self, responses, failure=False, assistant_root=None, **run_options):
         output = self.base / "execution"
@@ -84,6 +143,40 @@ class RunAgentValidationTests(FixtureCase):
             )
         )
         return executed, result
+
+    def test_six_model_calls_include_tool_result_continuations(self):
+        replies = [
+            {"role": "assistant", "tool_calls": [
+                tool("read_file", {"path": "calculator.py", "start_line": line})
+            ]}
+            for line in range(1, 8)
+        ]
+        with patch("local_agent.Ollama.close") as close:
+            executed, result = self.execute(replies, max_steps=16, max_model_calls=6)
+        self.assertEqual(result["inference_attempts"], 6)
+        self.assertEqual(result["status"], "step_limit")
+        self.assertEqual([args["start_line"] for _, args in executed], list(range(1, 7)))
+        close.assert_called_once()
+
+    def test_timeout_attempts_respect_both_budgets(self):
+        for calls, retries, expected in ((6, 0, 1), (1, 1, 1), (2, 1, 2)):
+            with self.subTest(calls=calls, retries=retries):
+                output = self.base / f"bounds-{calls}-{retries}"
+                with patch("local_agent.Ollama.model", return_value={"digest": "mock"}), patch(
+                    "local_agent.Ollama.request",
+                    side_effect=ProviderFailure("timeout", "mock timeout", retryable=True),
+                ) as request, patch("local_agent.Ollama.close") as close, patch.object(
+                    Broker, "call"
+                ) as dispatch:
+                    with self.assertRaises(ProviderFailure):
+                        run_agent(self.project, "mock", "Read calculator.py", output,
+                                  max_model_calls=calls, transport_retries=retries)
+                result = json.loads((output / "result.json").read_text(encoding="utf-8"))
+                self.assertEqual(request.call_count, expected)
+                self.assertEqual(result["inference_attempts"], expected)
+                self.assertEqual(result["inference_retries"], expected - 1)
+                dispatch.assert_not_called()
+                close.assert_called_once()
 
     def test_required_clarifications_preserve_step_limit(self):
         executed, result = self.execute(

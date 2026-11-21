@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import hashlib
+import ctypes
+from ctypes import wintypes
 import json
 import os
 from pathlib import Path
@@ -356,49 +358,81 @@ def _ensure_private_permissions(path):
 
 
 def _set_and_verify_windows_acl(path):
-    # Use SIDs (not localized account names), protect this directory only, and
-    # verify the resulting DACL through .NET rather than trusting icacls exit code.
-    script = r'''
-$ErrorActionPreference = 'Stop'
-$p = $env:LOCAL_CODING_AGENT_DIAGNOSTIC_ACL_PATH
-$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-$system = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
-$acl = Get-Acl -LiteralPath $p
-$acl.SetAccessRuleProtection($true, $false)
-$acl.Access | ForEach-Object { [void]$acl.RemoveAccessRuleSpecific($_) }
-$rights = [System.Security.AccessControl.FileSystemRights]::FullControl
-$inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
-$prop = [System.Security.AccessControl.PropagationFlags]::None
-$allow = [System.Security.AccessControl.AccessControlType]::Allow
-foreach ($who in @($sid, $system)) {
-  $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($who, $rights, $inherit, $prop, $allow)
-  $acl.AddAccessRule($rule)
-}
-Set-Acl -LiteralPath $p -AclObject $acl
-$check = Get-Acl -LiteralPath $p
-if (-not $check.AreAccessRulesProtected) { throw 'ACL inheritance remains enabled' }
-$rules = $check.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
-$allowed = @($sid.Value, 'S-1-5-18')
-if ($rules.Count -ne 2) { throw 'Unexpected ACL rule count' }
-foreach ($r in $rules) {
-  if ($r.IsInherited -or $r.AccessControlType -ne $allow -or
-      $r.FileSystemRights -ne $rights -or $r.InheritanceFlags -ne $inherit -or
-      $r.PropagationFlags -ne $prop -or $r.IdentityReference.Value -notin $allowed) {
-    throw 'ACL verification failed'
-  }
-}
-if (($rules | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique).Count -ne 2) {
-  throw 'Required ACL principals are missing'
-}
-'''
-    acl_env = os.environ.copy()
-    acl_env[POWERSHELL_ACL_PATH_ENV] = str(path)
-    result = subprocess.run(
-        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
-        capture_output=True, text=True, timeout=15, check=False, env=acl_env,
-    )
-    if result.returncode != 0:
-        raise AgentError("Windows diagnostic ACL could not be established and verified.")
+    # Apply only the protected DACL. In particular, do not rewrite owner,
+    # group, or SACL fields (the latter requires SeSecurityPrivilege).
+    _reject_reparse_chain(path)
+    try:
+        advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        void_p = ctypes.c_void_p
+        advapi.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+        advapi.OpenProcessToken.restype = wintypes.BOOL
+        kernel.GetCurrentProcess.restype = wintypes.HANDLE
+        advapi.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, void_p,
+                                               wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+        advapi.GetTokenInformation.restype = wintypes.BOOL
+        advapi.ConvertSidToStringSidW.argtypes = [void_p, ctypes.POINTER(wintypes.LPWSTR)]
+        advapi.ConvertSidToStringSidW.restype = wintypes.BOOL
+        advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(void_p), ctypes.POINTER(wintypes.DWORD)]
+        advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
+        advapi.GetSecurityDescriptorDacl.argtypes = [void_p, ctypes.POINTER(wintypes.BOOL),
+                                                      ctypes.POINTER(void_p), ctypes.POINTER(wintypes.BOOL)]
+        advapi.GetSecurityDescriptorDacl.restype = wintypes.BOOL
+        advapi.SetNamedSecurityInfoW.argtypes = [wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD,
+                                                 void_p, void_p, void_p, void_p]
+        advapi.SetNamedSecurityInfoW.restype = wintypes.DWORD
+        kernel.LocalFree.argtypes = [void_p]
+        kernel.LocalFree.restype = void_p
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.CloseHandle.restype = wintypes.BOOL
+        token = wintypes.HANDLE()
+        if not advapi.OpenProcessToken(kernel.GetCurrentProcess(), 0x0008, ctypes.byref(token)):
+            raise OSError(ctypes.get_last_error(), "OpenProcessToken failed")
+        try:
+            required = wintypes.DWORD()
+            advapi.GetTokenInformation(token, 1, None, 0, ctypes.byref(required))
+            token_info = ctypes.create_string_buffer(required.value)
+            if not advapi.GetTokenInformation(token, 1, token_info, required.value, ctypes.byref(required)):
+                raise OSError(ctypes.get_last_error(), "GetTokenInformation failed")
+            user_sid = ctypes.cast(token_info, ctypes.POINTER(ctypes.c_void_p))[0]
+            sid_text = wintypes.LPWSTR()
+            if not advapi.ConvertSidToStringSidW(user_sid, ctypes.byref(sid_text)):
+                raise OSError(ctypes.get_last_error(), "ConvertSidToStringSidW failed")
+            try:
+                sddl = _windows_dacl_sddl(sid_text.value, is_directory=Path(path).is_dir())
+            finally:
+                kernel.LocalFree(sid_text)
+        finally:
+            kernel.CloseHandle(token)
+
+        descriptor = ctypes.c_void_p()
+        if not advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl, 1, ctypes.byref(descriptor), None):
+            raise OSError(ctypes.get_last_error(), "SDDL conversion failed")
+        present, defaulted, dacl = wintypes.BOOL(), wintypes.BOOL(), ctypes.c_void_p()
+        if not advapi.GetSecurityDescriptorDacl(
+                descriptor, ctypes.byref(present), ctypes.byref(dacl), ctypes.byref(defaulted)) or not present.value:
+            raise OSError(ctypes.get_last_error(), "DACL extraction failed")
+        result = advapi.SetNamedSecurityInfoW(
+            str(path), 1, 0x00000004 | 0x80000000,
+            None, None, dacl, None)
+        if result:
+            raise OSError(result, "DACL application failed")
+    except (AttributeError, OSError, ValueError) as exc:
+        raise AgentError("Windows diagnostic ACL could not be established and verified.") from exc
+    finally:
+        if 'descriptor' in locals() and descriptor:
+            kernel.LocalFree(descriptor)
+    _verify_windows_acl(path)
+
+
+def _windows_dacl_sddl(user_sid, *, is_directory=True):
+    """Return a protected user/SYSTEM DACL, with inheritance only on directories."""
+    if not isinstance(user_sid, str) or not re.fullmatch(r"S-\d(?:-\d+)+", user_sid):
+        raise AgentError("Current Windows user SID is invalid.")
+    inherit = "OICI" if is_directory else ""
+    return f"D:P(A;{inherit};FA;;;{user_sid})(A;{inherit};FA;;;SY)"
 
 
 def _validate_private_directory(path):
@@ -419,11 +453,12 @@ $ErrorActionPreference = 'Stop'
 $p = $env:LOCAL_CODING_AGENT_DIAGNOSTIC_ACL_PATH
 $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $acl = Get-Acl -LiteralPath $p
+$isDirectory = (Get-Item -LiteralPath $p).PSIsContainer
 if (-not $acl.AreAccessRulesProtected) { throw 'ACL inheritance remains enabled' }
 $rules = $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
 $allowed = @($sid, 'S-1-5-18')
 $rights = [System.Security.AccessControl.FileSystemRights]::FullControl
-$inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+$inherit = if ($isDirectory) { [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit' } else { [System.Security.AccessControl.InheritanceFlags]::None }
 $prop = [System.Security.AccessControl.PropagationFlags]::None
  $allow = [System.Security.AccessControl.AccessControlType]::Allow
 if ($rules.Count -ne 2) { throw 'Unexpected ACL rule count' }
@@ -461,12 +496,18 @@ def _atomic_create(directory, name, data):
         _validate_private_directory(directory)
         with os.fdopen(fd, "wb") as stream:
             descriptor_open = False
+            if IS_WINDOWS:
+                _ensure_private_permissions(temp)
+            else:
+                os.chmod(temp, 0o600)
+            _validate_private_file(temp)
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
         _reject_reparse_chain(temp)
         # Hard-link creation is atomic and fails if target already exists.
         os.link(temp, target)
+        _validate_private_file(target)
         temp.unlink()
         return target
     except FileExistsError as exc:
@@ -484,6 +525,18 @@ def _atomic_create(directory, name, data):
                 temp.unlink()
         except OSError:
             pass
+
+
+def _validate_private_file(path):
+    path = Path(path)
+    _reject_reparse_chain(path)
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode):
+        raise AgentError("Diagnostic manifest path is not a regular file.")
+    if IS_WINDOWS:
+        _verify_windows_acl(path)
+    elif stat.S_IMODE(info.st_mode) & 0o077:
+        raise AgentError("Diagnostic manifest permissions are broader than owner-only.")
 
 
 def load_replay(path):

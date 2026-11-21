@@ -15,6 +15,7 @@ import time
 from inference_provider import ProviderFailure
 
 STARTUP_TIMEOUT_SECONDS = 12.0
+CONNECT_TIMEOUT_SECONDS = 5
 SHUTDOWN_TIMEOUT_SECONDS = 3.0
 IDENTITY_TIMEOUT_SECONDS = 5.0
 
@@ -116,6 +117,7 @@ class ManagedSshTunnel:
             '-o', 'GlobalKnownHostsFile=NUL',
             '-o', 'StrictHostKeyChecking=yes',
             '-o', 'BatchMode=yes',
+            '-o', f'ConnectTimeout={CONNECT_TIMEOUT_SECONDS}',
             '-o', 'PreferredAuthentications=publickey',
             '-o', 'PubkeyAuthentication=yes',
             '-o', 'PasswordAuthentication=no',
@@ -204,17 +206,57 @@ class ManagedSshTunnel:
         except (OSError, ValueError):
             return
 
-    def _startup_failure(self):
+    def _startup_failure(self, elapsed_seconds, *, readiness_deadline=False):
         with self._stderr_lock:
             message = bytes(self._stderr).decode('utf-8', errors='ignore').casefold()
-        if 'host key verification failed' in message or 'remote host identification has changed' in message:
-            return ProviderFailure('identity_mismatch', 'OpenSSH rejected the Mac host identity.', security=True)
-        if 'permission denied' in message or 'no supported authentication methods' in message:
-            return ProviderFailure('authentication', 'OpenSSH public-key authentication failed.')
+        elapsed_ms = min(int(STARTUP_TIMEOUT_SECONDS * 1000),
+                         max(0, int(elapsed_seconds * 1000)))
+
+        def failure(code, category, description, *, retryable=False, security=False):
+            return ProviderFailure(
+                code,
+                f'{description} ({category}; elapsed_ms={elapsed_ms}).',
+                retryable=retryable,
+                security=security,
+            )
+
+        if ('host key verification failed' in message
+                or 'remote host identification has changed' in message):
+            return failure('identity_mismatch', 'host_key_rejected',
+                           'OpenSSH rejected the Mac host identity', security=True)
+        if ('permission denied' in message
+                or 'no supported authentication methods' in message):
+            return failure('authentication', 'public_key_authentication_failed',
+                           'OpenSSH public-key authentication failed')
         if ('cannot listen to port' in message or 'address already in use' in message
-                or 'address cannot be assigned' in message):
-            return ProviderFailure('port_conflict', 'OpenSSH could not bind the configured forwarding port.', security=True)
-        return ProviderFailure('tunnel_unavailable', 'Windows OpenSSH tunnel failed to start.', retryable=True)
+                or 'address cannot be assigned' in message or 'could not bind' in message):
+            return failure('port_conflict', 'local_forward_bind_failure',
+                           'OpenSSH could not bind the configured local forwarding port',
+                           security=True)
+        if ('connection timed out' in message or 'operation timed out' in message
+                or 'connect timed out' in message):
+            return failure('tunnel_timeout', 'ssh_tcp_connection_timeout',
+                           'OpenSSH TCP connection timed out', retryable=True)
+        if ('no route to host' in message or 'host is unreachable' in message
+                or 'network is unreachable' in message):
+            return failure('tunnel_unavailable', 'ssh_host_unreachable',
+                           'The configured SSH host is unreachable', retryable=True)
+        if ('could not request local forwarding' in message
+                or 'forwarding failed' in message
+                or 'administratively prohibited' in message):
+            return failure('tunnel_unavailable', 'ssh_forwarding_failed',
+                           'OpenSSH could not establish the configured forwarding',
+                           retryable=True)
+        if 'connection refused' in message:
+            return failure('tunnel_unavailable', 'ssh_connection_refused',
+                           'The configured SSH host refused the connection', retryable=True)
+        if readiness_deadline:
+            return failure('tunnel_timeout', 'listener_readiness_deadline_exceeded',
+                           'Timed out waiting for the managed SSH forwarding listener',
+                           retryable=True)
+        return failure('tunnel_unavailable', 'ssh_process_exited_early',
+                       'SSH tunnel process exited before establishing its forwarding listener',
+                       retryable=True)
 
     def ensure_ready(self, cancel_event=None):
         with self._lock:
@@ -250,17 +292,16 @@ class ManagedSshTunnel:
                     target=self._drain_stderr, args=(stderr_stream,), daemon=True
                 )
                 self._stderr_thread.start()
-            deadline = self._monotonic() + STARTUP_TIMEOUT_SECONDS
+            startup_started = self._monotonic()
+            deadline = startup_started + STARTUP_TIMEOUT_SECONDS
             while self._monotonic() < deadline:
                 if cancel_event is not None and cancel_event.is_set():
                     self.close()
                     raise ProviderFailure('cancelled', 'SSH tunnel startup cancelled.')
                 if self._process.poll() is not None:
-                    failure = self._startup_failure()
-                    if failure.code == 'tunnel_unavailable':
-                        failure = ProviderFailure('tunnel_unavailable', 'SSH tunnel process exited before establishing its forwarding listener.', retryable=True)
+                    elapsed = self._monotonic() - startup_started
                     self.close()
-                    raise failure
+                    raise self._startup_failure(elapsed)
                 try:
                     owners = self._listener_pids()
                 except BaseException:
@@ -274,8 +315,9 @@ class ManagedSshTunnel:
                         raise ProviderFailure('port_conflict', 'Configured tunnel port was claimed by an unexpected process.', security=True)
                     return True
                 self._sleep(0.1)
+            elapsed = self._monotonic() - startup_started
             self.close()
-            raise ProviderFailure('tunnel_timeout', 'Timed out waiting for the managed SSH forwarding listener.', retryable=True)
+            raise self._startup_failure(elapsed, readiness_deadline=True)
 
     def close(self):
         with self._lock:

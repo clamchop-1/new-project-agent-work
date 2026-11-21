@@ -82,27 +82,20 @@ class ProtocolDiagnosticStorageTests(unittest.TestCase):
             with self.assertRaisesRegex(AgentError, "ACL verification failed"):
                 diagnostics._ensure_private_permissions(self.root)
 
-    def test_windows_acl_helpers_pass_path_through_child_environment(self):
-        path = self.root / "acl-check"
-        result = mock.Mock(returncode=0)
-        with mock.patch.object(diagnostics, "_set_and_verify_windows_acl",
-                               self.real_set_windows_acl), \
-                mock.patch.object(diagnostics, "_verify_windows_acl",
-                                  self.real_verify_windows_acl), \
-                mock.patch.object(diagnostics.subprocess, "run", return_value=result) as run:
-            diagnostics._set_and_verify_windows_acl(path)
-            diagnostics._verify_windows_acl(path)
-
-        self.assertEqual(run.call_count, 2)
-        for call in run.call_args_list:
-            command = call.args[0]
-            self.assertEqual(command[:4], ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"])
-            self.assertEqual(len(command), 5)
-            self.assertIn("$env:" + diagnostics.POWERSHELL_ACL_PATH_ENV, command[4])
-            self.assertNotIn("$args[0]", command[4])
-            self.assertEqual(call.kwargs["env"][diagnostics.POWERSHELL_ACL_PATH_ENV], str(path))
-            self.assertEqual(call.kwargs["timeout"], 15)
-        self.assertNotIn(diagnostics.POWERSHELL_ACL_PATH_ENV, os.environ)
+    def test_windows_dacl_policy_is_explicit_and_sid_scoped(self):
+        sddl = diagnostics._windows_dacl_sddl("S-1-5-21-123-456-789-1001")
+        self.assertEqual(
+            sddl,
+            "D:P(A;OICI;FA;;;S-1-5-21-123-456-789-1001)(A;OICI;FA;;;SY)",
+        )
+        self.assertNotIn("S:", sddl)
+        self.assertNotIn(";OW)", sddl)
+        with self.assertRaises(AgentError):
+            diagnostics._windows_dacl_sddl("not-a-sid")
+        self.assertEqual(
+            diagnostics._windows_dacl_sddl("S-1-5-21-123-456-789-1001", is_directory=False),
+            "D:P(A;;FA;;;S-1-5-21-123-456-789-1001)(A;;FA;;;SY)",
+        )
 
     @unittest.skipUnless(os.name == "nt", "Windows ACL verification requires Windows")
     def test_windows_acl_is_established_and_verified_without_admin(self):

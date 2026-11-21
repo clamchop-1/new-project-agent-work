@@ -9,7 +9,8 @@ import uuid
 
 from agent_core import AgentError, Project, atomic_write, encoded, digest, exclusive, save_handoff
 from assistant_files import AssistantFiles
-from local_agent import HUB, TOOLS, run_agent
+from local_agent import (HUB, TOOLS, run_agent, RESTRICTED_EVALUATOR_SHA256,
+                         RESTRICTED_ACCEPTANCE_SPEC_ID)
 from execution_recovery import RecoveryStore
 from model_router import discover_candidates, route_model, read_recent_performance
 from model_registry import (ModelRegistryError, append_performance_evidence,
@@ -18,6 +19,12 @@ from conversation_session import load_session
 from agent_config import (config_path, default_projects, load_config,
                           legacy_name_map, selector_map, DEFAULT_ENDPOINT,
                           validate_endpoint)
+from temporary_project_registry import (
+    DEFAULT_TTL_SECONDS, canonical_worktree,
+    inspect as inspect_temporary_project,
+    register as register_temporary_project,
+    revoke as revoke_temporary_project,
+)
 
 REPAIR_ROOT = (HUB / '.local/tests/live-repair-001/repo').resolve()
 REPAIR_WRITE_PATHS = frozenset({'calculator.py', 'stats.py'})
@@ -208,9 +215,12 @@ def main():
     configured_projects = legacy_name_map(config)
     selectors = selector_map(config)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['config','inspect','run','approve','history','prepare-bridges','prepare-handoff','save-handoff','recovery-inspect','recovery-reconcile'])
-    parser.add_argument('--project', choices=selectors,
-                        default='KronosStage' if 'KronosStage' in configured_projects else next(iter(configured_projects)))
+    parser.add_argument('action', choices=['config','inspect','run','approve','history','prepare-bridges','prepare-handoff','save-handoff','recovery-inspect','recovery-reconcile',
+                                           'temporary-register','temporary-inspect','temporary-revoke'])
+    parser.add_argument('--project', choices=selectors)
+    parser.add_argument('--temporary-project', help='Select one active temporary registration by its generated ID.')
+    parser.add_argument('--temporary-project-root', type=Path, help='Absolute Git worktree root for explicit temporary registration.')
+    parser.add_argument('--temporary-project-ttl-seconds', type=int, default=DEFAULT_TTL_SECONDS)
     parser.add_argument('--task');parser.add_argument('--task-file',type=Path)
     parser.add_argument('--assistant-root', type=Path,
                         help='Assistant file root, usually the PowerShell current directory; reads are broad and writes require exact paths.')
@@ -220,6 +230,10 @@ def main():
     parser.add_argument('--provider', choices=['ollama', 'ssh_tunnel_ollama'])
     parser.add_argument('--routing-mode', choices=['configured', 'local_only', 'remote_allowed'], default='configured')
     parser.add_argument('--role', help='Task-specific agent role for routing; does not grant tools or permissions.')
+    parser.add_argument('--max-model-calls', type=int, help='Cap all chat attempts for this run.')
+    parser.add_argument('--max-source-mutations', type=int, choices=(1,),
+                        help='Limit this run to one attempted mutation of one approved project path.')
+    parser.add_argument('--transport-retries', type=int, choices=(0, 1), help='Set the session-wide timeout retry budget.')
     parser.add_argument('--context', type=int, default=16384)
     parser.add_argument('--max-context', type=int, default=32768)
     parser.add_argument('--max-memory-gib', type=float)
@@ -230,6 +244,14 @@ def main():
     parser.add_argument(
         '--allow-pinned-tests', action='store_true',
         help='Expose this project’s registered pinned test suite to the agent for this run.',
+    )
+    parser.add_argument(
+        '--authorize-restricted-evaluation', action='store_true',
+        help='Separately authorize one restricted calculator evaluation for this run.',
+    )
+    parser.add_argument(
+        '--restricted-source-path',
+        help='Exact project-relative Python source path covered by the separate evaluation authorization.',
     )
     parser.add_argument('--resume-held-project',action='store_true')
     parser.add_argument('--permit',type=Path);parser.add_argument('--run-directory',type=Path)
@@ -250,6 +272,62 @@ def main():
                                        if tool['function']['name'] != 'finish'),
                         help='Require this registered operation before finish; repeat for multiple requirements.')
     args=parser.parse_args()
+    if args.max_source_mutations is not None and (
+            args.action != 'run' or args.recovery_run or args.assistant_write_path
+            or args.allow_pinned_tests):
+        parser.error('Source mutation bounds require a fresh run without assistant writes or pinned tests')
+    if args.max_model_calls is not None and args.max_model_calls < 1:
+        parser.error('--max-model-calls must be positive')
+    if args.action != 'run' and (args.max_model_calls is not None or args.transport_retries is not None):
+        parser.error('Execution bounds apply only to run')
+
+    execution_bounds = {name: getattr(args, name) for name in
+                        ('max_model_calls', 'transport_retries', 'max_source_mutations')
+                        if getattr(args, name) is not None}
+    default_project = 'KronosStage' if 'KronosStage' in configured_projects else next(iter(configured_projects))
+    if args.action == 'temporary-register':
+        if args.temporary_project or args.project or not args.temporary_project_root:
+            raise AgentError('Temporary registration requires only an absolute temporary project root.')
+        protected_roots = [HUB, *configured_projects.values()]
+        candidate, _ = canonical_worktree(args.temporary_project_root, protected_roots)
+        confirmation = input(
+            'Register this disposable Git worktree for a bounded session? Type its canonical root exactly: '
+        ).strip()
+        if confirmation != str(candidate.root):
+            raise AgentError('Temporary project registration was not explicitly confirmed.')
+        record = register_temporary_project(
+            candidate.root, protected_roots=protected_roots,
+            ttl_seconds=args.temporary_project_ttl_seconds, confirmed=True,
+        )
+        print(json.dumps({key: record[key] for key in (
+            'registration_id', 'project_id', 'project_root', 'worktree',
+            'created_at', 'expires_at', 'allowed_source_path', 'capabilities',
+            'write_authorized', 'test_execution_authorized')}, indent=2))
+        return
+    if args.action in ('temporary-inspect', 'temporary-revoke'):
+        if not args.temporary_project or args.temporary_project_root or args.project:
+            raise AgentError('Select exactly one temporary registration ID.')
+        result = (inspect_temporary_project(args.temporary_project)
+                  if args.action == 'temporary-inspect'
+                  else revoke_temporary_project(args.temporary_project))
+        print(json.dumps(result, indent=2))
+        return
+    if args.temporary_project and args.project:
+        raise AgentError('Select either a configured project or one temporary registration.')
+    if not args.temporary_project:
+        args.project = args.project or default_project
+    elif args.action not in ('inspect', 'approve', 'run'):
+        raise AgentError('Temporary registrations are supported only for inspect, approve, and run.')
+
+    if args.authorize_restricted_evaluation and args.action != 'run':
+        raise AgentError('Restricted evaluation authorization is available only for a run action.')
+    if args.restricted_source_path and not args.authorize_restricted_evaluation:
+        raise AgentError('A restricted source path requires explicit evaluation authorization.')
+    if args.authorize_restricted_evaluation and not args.restricted_source_path:
+        raise AgentError('Explicit restricted evaluation authorization requires one exact source path.')
+    if ('evaluate_restricted_source' in args.require_operation
+            and not args.authorize_restricted_evaluation):
+        raise AgentError('Restricted evaluation is a separate authorization from operation requirements.')
 
     assistant_write_paths = ()
     if args.assistant_write_path:
@@ -281,9 +359,37 @@ def main():
                           'config_path': str(effective_config_path)}, indent=2))
         return
     PRIVATE.mkdir(exist_ok=True)
-    logical_project_id = selectors[args.project]
-    selected_project_name = config['projects'][logical_project_id]['name']
-    project=Project(configured_projects[selected_project_name])
+    temporary_registration = None
+    if args.temporary_project:
+        temporary_registration = inspect_temporary_project(args.temporary_project)
+        logical_project_id = 'temporary-' + temporary_registration['registration_id']
+        selected_project_name = 'temporary-disposable'
+        project = Project(temporary_registration['project_root'])
+        if (project.identity != temporary_registration['project_id']
+                or project.root != Path(temporary_registration['project_root'])):
+            raise AgentError('Temporary project identity changed after registration.')
+    else:
+        logical_project_id = selectors[args.project]
+        selected_project_name = config['projects'][logical_project_id]['name']
+        project=Project(configured_projects[selected_project_name])
+    restricted_evaluation_authorization = None
+    if args.authorize_restricted_evaluation:
+        target = project.path(args.restricted_source_path)
+        canonical = target.relative_to(project.root).as_posix()
+        if canonical != args.restricted_source_path or target.suffix.casefold() != '.py':
+            raise AgentError('Restricted evaluation requires an exact canonical project-relative Python source path.')
+        restricted_evaluation_authorization = {
+            'project_id': project.identity,
+            'project_root': str(project.root),
+            'source_path': canonical,
+            'evaluator_sha256': RESTRICTED_EVALUATOR_SHA256,
+            'acceptance_spec_id': RESTRICTED_ACCEPTANCE_SPEC_ID,
+        }
+        if temporary_registration is not None:
+            if canonical != temporary_registration['allowed_source_path']:
+                raise AgentError('Restricted evaluation path is outside the temporary registration scope.')
+            restricted_evaluation_authorization['registration_id'] = temporary_registration['registration_id']
+            restricted_evaluation_authorization['worktree_identity'] = temporary_registration['worktree']['identity']
     recovery = RecoveryStore(project)
     if args.action == 'recovery-inspect':
         print(json.dumps(recovery.inspect(args.recovery_run), indent=2))
@@ -322,6 +428,9 @@ def main():
             folder=new_directory('approvals')
             permit={'project_id':project.identity,'state':state,'memory':project.memory_snapshot(),
                     'task':args.task_file.read_text(encoding='utf-8'),'write_paths':list(write_paths),'used':False}
+            if temporary_registration is not None:
+                permit['temporary_registration_id'] = temporary_registration['registration_id']
+                permit['temporary_worktree_identity'] = temporary_registration['worktree']['identity']
             if args.recovery_run:
                 permit['recovery_run'] = args.recovery_run
             atomic_write(folder/'permit.json',encoded(permit))
@@ -344,7 +453,20 @@ def main():
                 if task!=permit['task']:raise AgentError('Approved task changed.')
                 if permit.get('recovery_run') != args.recovery_run:
                     raise AgentError('The write permit does not match this recovery checkpoint.')
+                expected_registration = (temporary_registration['registration_id']
+                                         if temporary_registration else None)
+                if permit.get('temporary_registration_id') != expected_registration:
+                    raise AgentError('The write permit does not match this project registration.')
+                if (temporary_registration is not None
+                        and permit.get('temporary_worktree_identity')
+                        != temporary_registration['worktree']['identity']):
+                    raise AgentError('The write permit does not match this Git worktree identity.')
                 writes=validate_write_paths(selected_project_name, permit['write_paths'])
+                if args.max_source_mutations is not None and len(writes) != 1:
+                    raise AgentError('A bounded write permit must name one exact project path.')
+                if (args.max_source_mutations is not None and temporary_registration is not None
+                        and writes != (temporary_registration['allowed_source_path'],)):
+                    raise AgentError('A bounded temporary project permit must name its registered source path.')
                 permit['used']=True;atomic_write(permit_path,encoded(permit))
             parent=new_directory('runs');packet=snapshot(project,parent)
             packet['logical_project_id'] = logical_project_id
@@ -451,6 +573,9 @@ def main():
                         routing_decision=route,
                         completion_policy=completion_policy,
                         required_operations=tuple(args.require_operation),
+                        restricted_evaluation_authorization=restricted_evaluation_authorization,
+                        temporary_project_registration=temporary_registration,
+                        **execution_bounds,
                         **recovery_options,
                     )
             finally:

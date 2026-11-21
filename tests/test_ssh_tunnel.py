@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import io
 import tempfile
 import threading
 import unittest
@@ -8,8 +9,10 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from agent_core import AgentError
+from inference_provider import ProviderFailure
 from local_agent import create_inference_provider
-from ssh_tunnel import ManagedSshTunnel, verify_enrolled_host
+from ssh_tunnel import (CONNECT_TIMEOUT_SECONDS, STARTUP_TIMEOUT_SECONDS,
+                        ManagedSshTunnel, verify_enrolled_host)
 
 
 def fingerprint(blob):
@@ -19,10 +22,11 @@ def fingerprint(blob):
 class FakeProcess:
     pid = 44123
 
-    def __init__(self, alive=True):
+    def __init__(self, alive=True, stderr=None):
         self.alive = alive
         self.terminated = False
         self.killed = False
+        self.stderr = io.BytesIO(stderr) if stderr is not None else None
 
     def poll(self):
         return None if self.alive else 1
@@ -117,11 +121,20 @@ class TunnelTests(unittest.TestCase):
         argv = popen.call_args.args[0]
         self.assertIn('BatchMode=yes', argv)
         self.assertIn('StrictHostKeyChecking=yes', argv)
+        self.assertIn(f'ConnectTimeout={CONNECT_TIMEOUT_SECONDS}', argv)
+        self.assertLess(CONNECT_TIMEOUT_SECONDS, STARTUP_TIMEOUT_SECONDS)
+        self.assertIn('UserKnownHostsFile=' + str(self.known_hosts), argv)
+        self.assertIn('GlobalKnownHostsFile=NUL', argv)
         self.assertIn('ExitOnForwardFailure=yes', argv)
         self.assertIn('ClearAllForwardings=no', argv)
         self.assertIn('ForwardAgent=no', argv)
         self.assertIn('PasswordAuthentication=no', argv)
+        self.assertIn('KbdInteractiveAuthentication=no', argv)
         self.assertIn('PreferredAuthentications=publickey', argv)
+        self.assertIn('ProxyCommand=none', argv)
+        self.assertIn('ProxyJump=none', argv)
+        self.assertEqual(argv[argv.index('-F') + 1], str(self.ssh_config))
+        self.assertNotIn('-i', argv)
         self.assertIn('-N', argv)
         self.assertIn('127.0.0.1:22001:127.0.0.1:11434', argv)
         self.assertTrue(manager.close())
@@ -186,12 +199,73 @@ class TunnelTests(unittest.TestCase):
         def sleep(seconds):
             time_state['now'] += seconds
         process = FakeProcess()
-        manager, _, _, run = self._manager({'pids': set()}, process,
-                                           (monotonic, sleep))
-        with self.assertRaisesRegex(AgentError, 'Timed out'):
+        manager, _, popen, run = self._manager({'pids': set()}, process,
+                                               (monotonic, sleep))
+        with self.assertRaisesRegex(ProviderFailure, 'Timed out.*listener_readiness_deadline') as caught:
             manager.ensure_ready()
+        self.assertEqual(caught.exception.code, 'tunnel_timeout')
         self.assertTrue(process.terminated)
         self.assertFalse(process.killed)
+        popen.assert_called_once()
+
+    def test_startup_stderr_is_classified_without_exposing_raw_text(self):
+        cases = (
+            (b'connect to host 192.0.2.50 port 22: Connection timed out secret=hidden',
+             'tunnel_timeout', 'ssh_tcp_connection_timeout'),
+            (b'No route to host', 'tunnel_unavailable', 'ssh_host_unreachable'),
+            (b'Permission denied (publickey).', 'authentication',
+             'public_key_authentication_failed'),
+            (b'Host key verification failed.', 'identity_mismatch', 'host_key_rejected'),
+            (b'bind [127.0.0.1]:22001: Address already in use',
+             'port_conflict', 'local_forward_bind_failure'),
+            (b'Could not request local forwarding.',
+             'tunnel_unavailable', 'ssh_forwarding_failed'),
+            (b'connection refused', 'tunnel_unavailable', 'ssh_connection_refused'),
+        )
+        for stderr, expected_code, expected_category in cases:
+            with self.subTest(category=expected_category):
+                manager, _, _, _ = self._manager({'pids': set()})
+                manager._stderr.extend(stderr)
+                failure = manager._startup_failure(1.234)
+                self.assertEqual(failure.code, expected_code)
+                self.assertIn(expected_category, str(failure))
+                self.assertIn('elapsed_ms=1234', str(failure))
+                if expected_code in {'identity_mismatch', 'port_conflict'}:
+                    self.assertTrue(failure.security)
+                if expected_code == 'authentication':
+                    self.assertFalse(failure.retryable)
+                self.assertNotIn('192.0.2.50', str(failure))
+                self.assertNotIn('secret=hidden', str(failure))
+
+    def test_unknown_timeout_reports_only_readiness_deadline_and_bounded_time(self):
+        manager, _, _, _ = self._manager({'pids': set()})
+        manager._stderr.extend(b'opaque SSH diagnostic with secret=hidden')
+        failure = manager._startup_failure(90.0, readiness_deadline=True)
+        self.assertEqual(failure.code, 'tunnel_timeout')
+        self.assertIn('listener_readiness_deadline_exceeded', str(failure))
+        self.assertIn('elapsed_ms=12000', str(failure))
+        self.assertNotIn('opaque', str(failure))
+        self.assertNotIn('secret=hidden', str(failure))
+
+    def test_unknown_early_exit_is_distinct_and_does_not_include_stderr(self):
+        manager, _, _, _ = self._manager({'pids': set()})
+        manager._stderr.extend(b'unclassified private diagnostic')
+        failure = manager._startup_failure(0.321)
+        self.assertEqual(failure.code, 'tunnel_unavailable')
+        self.assertIn('ssh_process_exited_early', str(failure))
+        self.assertIn('elapsed_ms=321', str(failure))
+        self.assertNotIn('unclassified private diagnostic', str(failure))
+
+    def test_connection_timeout_exit_cleans_up_once_without_retry(self):
+        process = FakeProcess(alive=False, stderr=(
+            b'connect to host 192.0.2.50 port 22: Connection timed out'))
+        manager, _, popen, _ = self._manager({'pids': set()}, process)
+        with self.assertRaises(ProviderFailure) as caught:
+            manager.ensure_ready()
+        self.assertEqual(caught.exception.code, 'tunnel_timeout')
+        self.assertIn('ssh_tcp_connection_timeout', str(caught.exception))
+        popen.assert_called_once()
+        self.assertIn(b'connection timed out', bytes(manager._stderr).lower())
 
     def test_stale_process_or_changed_listener_owner_fails_closed(self):
         state = {'pids': set()}

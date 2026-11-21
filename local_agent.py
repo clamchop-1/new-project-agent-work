@@ -1,6 +1,7 @@
 """Local-only Qwen tool loop with bounded, typed repository capabilities."""
 import argparse
 import copy
+import importlib.util
 from functools import wraps
 from datetime import datetime, timezone
 import http.client
@@ -25,6 +26,7 @@ from inference_provider import InferenceProvider, ProviderFailure
 from execution_recovery import RecoveryError, RecoveryStore
 from assistant_files import AssistantFiles
 from web_retrieval import SourceLibrary, read_web_page, read_youtube_transcript, search_web
+from temporary_project_registry import inspect as inspect_temporary_project
 
 HUB = Path(__file__).resolve().parent
 MAX_INFERENCE_REQUEST_BYTES = 1024 * 1024
@@ -33,6 +35,17 @@ MAX_INFERENCE_TIMEOUT_SECONDS = 180
 INFERENCE_PROGRESS_INTERVAL_SECONDS = 15.0
 MAX_TRANSIENT_INFERENCE_RETRIES = 1
 MAX_FINISH_SCHEMA_RETRIES = 1
+RESTRICTED_EVALUATOR_SHA256 = '308AF0D9D255AAD00C16AA2C3535B4EB2DE31853466D7249FFC2C37BE5135E64'
+RESTRICTED_ACCEPTANCE_SPEC_ID = 'calculator-average-v1'
+RESTRICTED_ACCEPTANCE_CASES = (
+    ('typical', (2, 4, 6), 4.0, None),
+    ('single', (5,), 5.0, None),
+    ('empty', (), None, 'ValueError'),
+    ('zeros', (0, 0), 0.0, None),
+    ('negative', (-2, 0), -1.0, None),
+    ('fractional', (1.5, 2.5), 2.0, None),
+    ('boundary_magnitude', (1_000_000, 1_000_000), 1_000_000.0, None),
+)
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -424,15 +437,84 @@ TOOLS = [
              {'summary': TEXT, 'unfinished': {'type': 'array', 'items': TEXT},
               'next_actions': {'type': 'array', 'items': TEXT}}, ['summary', 'unfinished', 'next_actions'])]
 
+RESTRICTED_EVALUATION_TOOL = function(
+    'evaluate_restricted_source',
+    'Evaluate only the operator-authorized Python source file with the fixed calculator acceptance specification. This does not execute the source as Python.',
+    {'path': TEXT}, ['path'],
+)
+
+
+def validate_source_mutation_scope(limit, writes, assistant_writes, test_config,
+                                   temporary_registration):
+    if limit is None:
+        return
+    if type(limit) is not int or limit != 1:
+        raise AgentError('The source mutation budget must be one.')
+    if len(writes) > 1 or assistant_writes or test_config is not None:
+        raise AgentError('A source mutation budget permits at most one project path and excludes assistant writes and pinned tests.')
+    if isinstance(temporary_registration, dict) and writes and (
+            tuple(writes) != (temporary_registration.get('allowed_source_path'),)):
+        raise AgentError('A bounded temporary project write must target its registered source path.')
+
 
 class Broker:
     def __init__(self, project, run, writes=(), test_config=None, assistant_root=None,
                  assistant_write_paths=(), allowed_tools=None,
-                 require_test_after_each_write=False):
+                 require_test_after_each_write=False,
+                 restricted_evaluation_authorization=None,
+                 temporary_project_registration=None, max_source_mutations=None):
         self.project, self.run = project, Path(run)
+        validate_source_mutation_scope(max_source_mutations, writes, assistant_write_paths,
+                                       test_config, temporary_project_registration)
+        self.source_mutations_remaining = max_source_mutations
+        self.mutation_project_id = project.identity if max_source_mutations is not None else None
+        self.mutation_paths = frozenset(writes) if max_source_mutations is not None else frozenset()
         self.allowed_writes = set(writes)
         self.allowed_tools = None if allowed_tools is None else frozenset(allowed_tools)
         self.test_config = test_config
+        self.temporary_project_registration = temporary_project_registration
+        if temporary_project_registration is not None:
+            if (not isinstance(temporary_project_registration, dict)
+                    or temporary_project_registration.get('project_id') != self.project.identity
+                    or temporary_project_registration.get('project_root') != str(self.project.root)):
+                raise AgentError('Temporary project registration does not match this Broker project.')
+            current_registration = inspect_temporary_project(
+                temporary_project_registration.get('registration_id')
+            )
+            if current_registration != temporary_project_registration:
+                raise AgentError('Temporary project registration changed or was revoked.')
+        self.restricted_evaluation_authorization = restricted_evaluation_authorization
+        self.restricted_evaluation_path = None
+        self.restricted_evaluation_used = False
+        self.restricted_evaluation_receipts = []
+        if restricted_evaluation_authorization is not None:
+            required_auth = {'project_id', 'project_root', 'source_path',
+                             'evaluator_sha256', 'acceptance_spec_id'}
+            if temporary_project_registration is not None:
+                required_auth |= {'registration_id', 'worktree_identity'}
+            if (not isinstance(restricted_evaluation_authorization, dict)
+                    or set(restricted_evaluation_authorization) != required_auth
+                    or restricted_evaluation_authorization['project_id'] != self.project.identity
+                    or restricted_evaluation_authorization['project_root'] != str(self.project.root)
+                    or restricted_evaluation_authorization['evaluator_sha256'] != RESTRICTED_EVALUATOR_SHA256
+                    or restricted_evaluation_authorization['acceptance_spec_id'] != RESTRICTED_ACCEPTANCE_SPEC_ID
+                    or not isinstance(restricted_evaluation_authorization['source_path'], str)):
+                raise AgentError('Restricted evaluation authorization is invalid or belongs to another project.')
+            if temporary_project_registration is not None and (
+                    restricted_evaluation_authorization['registration_id']
+                    != temporary_project_registration['registration_id']
+                    or restricted_evaluation_authorization['worktree_identity']
+                    != temporary_project_registration['worktree']['identity']
+                    or restricted_evaluation_authorization['source_path']
+                    != temporary_project_registration['allowed_source_path']):
+                raise AgentError('Restricted evaluation authorization differs from the temporary registration scope.')
+            if file_hash(HUB / 'restricted_acceptance.py').casefold() != RESTRICTED_EVALUATOR_SHA256.casefold():
+                raise AgentError('Trusted restricted evaluator identity mismatch.')
+            self.restricted_evaluation_path = restricted_evaluation_authorization['source_path']
+            authorized_target = self.project.path(self.restricted_evaluation_path)
+            authorized_relative = authorized_target.relative_to(self.project.root).as_posix()
+            if authorized_relative != self.restricted_evaluation_path or authorized_target.suffix.casefold() != '.py':
+                raise AgentError('Restricted evaluation authorization path is not canonical Python source.')
         if type(require_test_after_each_write) is not bool:
             raise AgentError('Per-write test verification policy must be boolean.')
         self.require_test_after_each_write = require_test_after_each_write
@@ -526,6 +608,16 @@ class Broker:
                 raise AgentError('File changed since inspection; edit refused.')
             before = expected
         after = digest(raw)
+        if self.source_mutations_remaining is not None:
+            if canonical not in self.mutation_paths or self.project.identity != self.mutation_project_id:
+                raise AgentError('Source mutation is outside the budgeted project scope.')
+            if (self.journal is None or self.journal.pending is not None or self.journal.broken
+                    or self.journal.row.get('project_id') != self.mutation_project_id):
+                raise RecoveryError('Source mutation requires a clear project recovery journal.')
+            if self.source_mutations_remaining == 0:
+                raise AgentError('Source mutation budget exhausted.')
+            # Reserve before persisting intent. An exception never refunds this attempt.
+            self.source_mutations_remaining -= 1
         if self.journal:
             backup = target.read_bytes() if before and target.stat().st_size <= 1048576 else None
             if backup is not None:
@@ -550,6 +642,8 @@ class Broker:
         return receipt
 
     def execute(self, name, path=None):
+        if self.source_mutations_remaining is not None:
+            raise AgentError('Command execution is unavailable with a source mutation budget.')
         extra_env = {}
         adapter = host_tool_adapter()
         if name == 'tests':
@@ -613,7 +707,146 @@ class Broker:
                 self.write_needs_test = False
         return {**receipt, 'output': text}
 
+    def evaluate_restricted_source(self, path):
+        """Interpret one exact authorized source file and store a run-bound receipt."""
+        if self.restricted_evaluation_path is None:
+            raise AgentError('Restricted evaluation requires separate operator authorization.')
+        if self.restricted_evaluation_used:
+            raise AgentError('Restricted evaluation authorization is single-use.')
+        self.restricted_evaluation_used = True
+        if self.temporary_project_registration is not None:
+            current_registration = inspect_temporary_project(
+                self.temporary_project_registration['registration_id']
+            )
+            if (current_registration != self.temporary_project_registration
+                    or current_registration['worktree']['identity']
+                    != self.restricted_evaluation_authorization.get('worktree_identity')):
+                raise AgentError('Temporary project registration expired, changed, or was revoked.')
+        if not isinstance(path, str) or path != self.restricted_evaluation_path:
+            raise AgentError('Restricted evaluation source path differs from the operator-approved path.')
+        if (self.journal is None or self.journal.pending is not None or self.journal.broken
+                or self.journal.row.get('project_id') != self.project.identity
+                or self.journal.row.get('status') not in {'authorized', 'executing'}
+                or self.project.state() != self.journal.row.get('checkpoint')):
+            raise RecoveryError('Restricted evaluation is blocked by unresolved or mismatched recovery state.')
+        if (digest(str(self.project.root).casefold().encode()) != self.project.identity
+                or Path(self.project.git('rev-parse', '--show-toplevel').strip()).resolve() != self.project.root):
+            raise AgentError('Restricted evaluation project identity changed.')
+
+        target = self.project.path(path)
+        canonical = target.relative_to(self.project.root).as_posix()
+        if canonical != self.restricted_evaluation_path or target.suffix.casefold() != '.py':
+            raise AgentError('Restricted evaluation target is not the exact approved project source.')
+        try:
+            metadata = target.lstat()
+        except OSError as exc:
+            raise AgentError('Restricted evaluation source is missing or unreadable.') from exc
+        if (not target.is_file() or target.is_symlink()
+                or getattr(metadata, 'st_file_attributes', 0) & 0x400
+                or metadata.st_nlink != 1 or metadata.st_size > 8192):
+            raise AgentError('Restricted evaluation source is linked, oversized, or not a regular file.')
+
+        read = self.read(path, start_line=1, line_count=120)
+        if read.get('total_lines', 0) > 120:
+            raise AgentError('Restricted evaluation source exceeds the bounded line limit.')
+        source = read.get('text')
+        if not isinstance(source, str) or len(source.encode('utf-8')) > 8192:
+            raise AgentError('Restricted evaluation source exceeds the evaluator size limit.')
+        source_hash = read.get('sha256')
+        if not isinstance(source_hash, str) or file_hash(target) != source_hash:
+            raise AgentError('Restricted evaluation source changed during bounded reading.')
+
+        evaluator_path = HUB / 'restricted_acceptance.py'
+        if file_hash(evaluator_path).casefold() != RESTRICTED_EVALUATOR_SHA256.casefold():
+            raise AgentError('Trusted restricted evaluator identity mismatch.')
+        module_spec = importlib.util.spec_from_file_location(
+            '_local_agent_trusted_restricted_acceptance', evaluator_path
+        )
+        if module_spec is None or module_spec.loader is None:
+            raise AgentError('Trusted restricted evaluator cannot be loaded.')
+        evaluator = importlib.util.module_from_spec(module_spec)
+        # Load only the separately hash-pinned host evaluator. Project source stays
+        # plain text and is never compiled or executed.
+        module_spec.loader.exec_module(evaluator)
+        if tuple(evaluator.ACCEPTANCE_CASES) != RESTRICTED_ACCEPTANCE_CASES:
+            raise AgentError('Trusted acceptance specification identity mismatch.')
+
+        began = time.monotonic()
+        result = evaluator.run_acceptance(source)
+        elapsed_ms = int((time.monotonic() - began) * 1000)
+        if file_hash(target) != source_hash:
+            raise AgentError('Restricted evaluation source changed while it was being evaluated.')
+        if (not isinstance(result, dict)
+                or set(result) != {'passed', 'case_count', 'passed_count', 'cases'}
+                or type(result['passed']) is not bool
+                or result['case_count'] != len(RESTRICTED_ACCEPTANCE_CASES)
+                or type(result['passed_count']) is not int
+                or not isinstance(result['cases'], (tuple, list))
+                or len(result['cases']) != len(RESTRICTED_ACCEPTANCE_CASES)):
+            raise AgentError('Trusted evaluator returned an invalid result structure.')
+        cases = []
+        for expected, observed in zip(RESTRICTED_ACCEPTANCE_CASES, result['cases']):
+            if (not isinstance(observed, (tuple, list)) or len(observed) != 3
+                    or observed[0] != expected[0] or type(observed[1]) is not bool
+                    or observed[2] not in ('float', 'int', 'ValueError', 'rejected')):
+                raise AgentError('Trusted evaluator returned an invalid case result.')
+            cases.append({'name': observed[0], 'passed': observed[1], 'actual_kind': observed[2]})
+        if result['passed'] != all(item['passed'] for item in cases):
+            raise AgentError('Trusted evaluator summary does not match its case outcomes.')
+
+        receipt = {
+            'format': 'local-agent-restricted-evaluation-receipt',
+            'version': 1,
+            'project_id': self.project.identity,
+            'project_root': str(self.project.root),
+            'source_path': canonical,
+            'source_sha256': source_hash,
+            'evaluator_sha256': RESTRICTED_EVALUATOR_SHA256,
+            'acceptance_spec_id': RESTRICTED_ACCEPTANCE_SPEC_ID,
+            'passed': result['passed'],
+            'case_count': result['case_count'],
+            'passed_count': result['passed_count'],
+            'cases': cases,
+            'duration_ms': max(0, elapsed_ms),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+        }
+        receipt_path = self.run.resolve() / 'restricted-evaluation.json'
+        if receipt_path.exists() or receipt_path.is_symlink():
+            raise AgentError('Restricted evaluation receipt path already exists.')
+        atomic_write(receipt_path, encoded(receipt))
+        reference = {'path': str(receipt_path), 'sha256': file_hash(receipt_path)}
+        status, integrity = verify_restricted_evaluation_receipts(
+            [reference], self.project, self.run, self.restricted_evaluation_path
+        )
+        if not integrity.get('valid') or status != ('passed' if result['passed'] else 'failed'):
+            raise AgentError('Restricted evaluation receipt failed integrity verification.')
+        self.restricted_evaluation_receipts.append(reference)
+        return {
+            'operation_performed': True,
+            'status': status,
+            'passed': result['passed'],
+            'case_count': result['case_count'],
+            'passed_count': result['passed_count'],
+            'cases': cases,
+            'source_path': canonical,
+            'source_sha256': source_hash,
+            'evaluator_sha256': RESTRICTED_EVALUATOR_SHA256,
+            'acceptance_spec_id': RESTRICTED_ACCEPTANCE_SPEC_ID,
+            'duration_ms': receipt['duration_ms'],
+            'receipt_path': str(receipt_path),
+            'receipt_sha256': reference['sha256'],
+        }
+
     def call(self, name, args):
+        if self.source_mutations_remaining is not None and name in {
+                'edit_location_file', 'create_location_file', 'save_source', 'forget_saved_source'}:
+            raise AgentError('This write tool is unavailable with a source mutation budget.')
+        if self.temporary_project_registration is not None:
+            current_registration = inspect_temporary_project(
+                self.temporary_project_registration['registration_id']
+            )
+            if current_registration != self.temporary_project_registration:
+                raise AgentError('Temporary project registration expired, changed, or was revoked.')
         if self.allowed_tools is not None and name not in self.allowed_tools:
             raise AgentError('Tool is not permitted for this agent role.')
         if name == 'search_web':
@@ -706,6 +939,10 @@ class Broker:
             return self.write(args['path'], before.replace(args['old'], args['new'], 1), args['expected_sha256'])
         if name == 'create_file': return self.write(args['path'], args['content'])
         if name == 'run_tests': return self.execute('tests')
+        if name == 'evaluate_restricted_source':
+            if not isinstance(args, dict) or set(args) != {'path'}:
+                raise AgentError('Restricted evaluation requires only the approved source path.')
+            return self.evaluate_restricted_source(args['path'])
         if name == 'run_command': return self.execute(args['name'], args['path'])
         if name == 'finish':
             if self.require_test_after_each_write and self.write_needs_test:
@@ -992,14 +1229,14 @@ COMPLETION_POLICIES = frozenset({
 
 
 def validate_completion_policy(policy, required_operations, writes, test_config,
-                               assistant_write_paths):
+                               assistant_write_paths, extra_operations=()):
     """Validate host-declared completion requirements before contacting a model."""
     if policy not in COMPLETION_POLICIES:
         raise AgentError('Unknown completion policy.')
     if (not isinstance(required_operations, (tuple, list, set, frozenset))
-            or any(not isinstance(name, str) or name not in {
+            or any(not isinstance(name, str) or name not in ({
                 tool['function']['name'] for tool in TOOLS
-            } - {'finish'} for name in required_operations)):
+            } | set(extra_operations)) - {'finish'} for name in required_operations)):
         raise AgentError('Required completion operations are malformed.')
     required_operations = frozenset(required_operations)
     if policy == 'conversational' and (required_operations or writes or test_config
@@ -1097,6 +1334,82 @@ def verify_test_receipts(commands, project, run_directory):
     return ('passed' if latest['exit_code'] == 0 else 'failed'), {'valid': True, 'errors': []}
 
 
+def verify_restricted_evaluation_receipts(references, project, run_directory,
+                                          authorized_source_path):
+    """Verify fixed-spec evaluator receipts against the current project and source."""
+    if not references:
+        return 'not_run', {'valid': True, 'errors': []}
+    run_root = Path(run_directory).resolve()
+    errors = []
+    verified = []
+    evaluator_path = HUB / 'restricted_acceptance.py'
+    for reference in references:
+        try:
+            receipt_path = Path(reference['path'])
+            if receipt_path.is_symlink() or (receipt_path.exists() and
+                    getattr(receipt_path.lstat(), 'st_file_attributes', 0) & 0x400):
+                raise ValueError('Receipt path is linked.')
+            receipt_path = receipt_path.resolve(strict=True)
+            if (not receipt_path.is_relative_to(run_root)
+                    or receipt_path != run_root / 'restricted-evaluation.json'):
+                raise ValueError('Receipt path is outside the run or unexpected.')
+            if receipt_path.stat().st_size > 16384:
+                raise ValueError('Restricted evaluation receipt exceeds its size limit.')
+            if file_hash(receipt_path) != reference['sha256']:
+                raise ValueError('Receipt hash changed after evaluation.')
+            receipt = json.loads(receipt_path.read_bytes())
+            expected_keys = {
+                'format', 'version', 'project_id', 'project_root', 'source_path',
+                'source_sha256', 'evaluator_sha256', 'acceptance_spec_id', 'passed',
+                'case_count', 'passed_count', 'cases', 'duration_ms', 'timestamp',
+            }
+            if (not isinstance(receipt, dict) or set(receipt) != expected_keys
+                    or receipt['format'] != 'local-agent-restricted-evaluation-receipt'
+                    or type(receipt['version']) is not int or receipt['version'] != 1
+                    or receipt['project_id'] != project.identity
+                    or receipt['project_root'] != str(project.root)
+                    or receipt['source_path'] != authorized_source_path
+                    or receipt['evaluator_sha256'] != RESTRICTED_EVALUATOR_SHA256
+                    or receipt['acceptance_spec_id'] != RESTRICTED_ACCEPTANCE_SPEC_ID
+                    or type(receipt['passed']) is not bool
+                    or type(receipt['case_count']) is not int
+                    or receipt['case_count'] != len(RESTRICTED_ACCEPTANCE_CASES)
+                    or type(receipt['passed_count']) is not int
+                    or type(receipt['duration_ms']) is not int
+                    or receipt['duration_ms'] < 0
+                    or not isinstance(receipt['timestamp'], str)):
+                raise ValueError('Receipt project, evaluator, or result identity is invalid.')
+            if file_hash(evaluator_path).casefold() != RESTRICTED_EVALUATOR_SHA256.casefold():
+                raise ValueError('Trusted evaluator identity changed after evaluation.')
+            source = project.path(authorized_source_path)
+            if source.suffix.casefold() != '.py' or not source.is_file():
+                raise ValueError('Authorized source is missing or invalid.')
+            if file_hash(source) != receipt['source_sha256']:
+                verified.append((receipt, 'stale_after_edit'))
+                continue
+            cases = receipt['cases']
+            if (not isinstance(cases, list) or len(cases) != len(RESTRICTED_ACCEPTANCE_CASES)
+                    or any(not isinstance(case, dict)
+                           or set(case) != {'name', 'passed', 'actual_kind'}
+                           for case in cases)
+                    or [case['name'] for case in cases]
+                    != [case[0] for case in RESTRICTED_ACCEPTANCE_CASES]
+                    or any(type(case['passed']) is not bool
+                           or case['actual_kind'] not in ('float', 'int', 'ValueError', 'rejected')
+                           for case in cases)
+                    or sum(case['passed'] for case in cases) != receipt['passed_count']
+                    or all(case['passed'] for case in cases) != receipt['passed']):
+                raise ValueError('Receipt case results are malformed or inconsistent.')
+            verified.append((receipt, 'passed' if receipt['passed'] else 'failed'))
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            errors.append(str(exc)[:240])
+    if errors:
+        return 'receipt_invalid', {'valid': False, 'errors': errors}
+    latest, status = verified[-1]
+    return status, {'valid': True, 'errors': [], 'receipt_sha256': references[-1]['sha256'],
+                    'project_id': latest['project_id'], 'source_sha256': latest['source_sha256']}
+
+
 def model_relative_path(project, value):
     """Present contained receipt paths without changing broker authorization."""
     if not isinstance(value, str) or not value or value.startswith(('\\\\', '//')):
@@ -1147,6 +1460,8 @@ def model_tool_result(project, name, result):
         presented['files'] = [model_relative_path(project, path) for path in presented['files']]
     if name in ('run_tests', 'run_command') and 'output_path' in presented:
         presented['output_path'] = model_relative_path(project, presented['output_path'])
+    if name == 'evaluate_restricted_source' and 'receipt_path' in presented:
+        presented['receipt_path'] = model_relative_path(project, presented['receipt_path'])
     if name == 'git_status' and 'root' in presented:
         presented['root'] = model_relative_path(project, presented['root'])
     return presented
@@ -1162,11 +1477,28 @@ def recoverable_run(runner):
     return run
 
 
-def execution_tools(test_config, completion_policy, allowed_tools):
+def execution_tools(test_config, completion_policy, allowed_tools,
+                    restricted_evaluation_authorization=None,
+                    temporary_project_registration=None):
     tools = available_tools(TOOLS, test_config=test_config)
+    if (restricted_evaluation_authorization is not None
+            and (allowed_tools is None
+                 or 'evaluate_restricted_source' in allowed_tools)):
+        tools.append(copy.deepcopy(RESTRICTED_EVALUATION_TOOL))
     if completion_policy == 'conversational':
         return []
     excluded = set()
+    if temporary_project_registration is not None:
+        temporary_allowed = {
+            'list_files', 'read_file', 'search', 'git_status', 'git_diff',
+            'replace_text', 'create_file', 'finish',
+        }
+        if restricted_evaluation_authorization is not None:
+            temporary_allowed.add('evaluate_restricted_source')
+        excluded.update(
+            item['function']['name'] for item in tools
+            if item['function']['name'] not in temporary_allowed
+        )
     if completion_policy == 'read_only_analysis':
         excluded.update({'replace_text', 'create_file', 'edit_location_file',
                          'create_location_file', 'save_source', 'forget_saved_source'})
@@ -1196,6 +1528,13 @@ def host_progress(active_tools, required, successful, reads, broker, tests, bloc
     outstanding = required - successful
     if 'run_tests' in required and tests != 'passed':
         outstanding = outstanding | {'run_tests'}
+    restricted_status, _ = verify_restricted_evaluation_receipts(
+        broker.restricted_evaluation_receipts, broker.project, broker.run,
+        broker.restricted_evaluation_path,
+    )
+    if ('evaluate_restricted_source' in required
+            and restricted_status != 'passed'):
+        outstanding = outstanding | {'evaluate_restricted_source'}
     data = {
         'available_tools': sorted(item['function']['name'] for item in active_tools),
         'authorized_project_paths': sorted(broker.allowed_writes)[:20],
@@ -1203,6 +1542,7 @@ def host_progress(active_tools, required, successful, reads, broker, tests, bloc
         'write_receipt_paths': sorted({row['path'] for row in broker.writes})[:20],
         'required_operations_outstanding': sorted(outstanding),
         'test_evidence': tests,
+        'restricted_evaluation': restricted_status,
         'policy_block_categories': sorted({item['category'] for item in blocked}),
     }
     return {'role': 'user', 'content': (
@@ -1282,7 +1622,15 @@ def validate_clarification_contract(finish_result, required_clarifications):
     return True
 
 @recoverable_run
-def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), test_config=None, max_steps=16, context=16384, conversation=(), provider_name='ollama', assistant_root=None, assistant_write_paths=(), max_tool_calls=None, cancel_event=None, event_callback=None, provider_profile=None, remote_profile=None, fallback_policy=None, fallback_approval=None, routing_decision=None, allowed_tools=None, role_instructions='', completion_policy='tool_required', required_operations=(), *, resume_from=None, progress_guidance=False, required_clarifications=(), require_test_after_each_write=False, recovery_store, diagnostic_capture=None):
+def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), test_config=None, max_steps=16, context=16384, conversation=(), provider_name='ollama', assistant_root=None, assistant_write_paths=(), max_tool_calls=None, cancel_event=None, event_callback=None, provider_profile=None, remote_profile=None, fallback_policy=None, fallback_approval=None, routing_decision=None, allowed_tools=None, role_instructions='', completion_policy='tool_required', required_operations=(), *, resume_from=None, progress_guidance=False, required_clarifications=(), require_test_after_each_write=False, restricted_evaluation_authorization=None, temporary_project_registration=None, recovery_store, diagnostic_capture=None, max_model_calls=None, transport_retries=MAX_TRANSIENT_INFERENCE_RETRIES, max_source_mutations=None):
+    validate_source_mutation_scope(max_source_mutations, writes, assistant_write_paths,
+                                   test_config, temporary_project_registration)
+    if max_source_mutations is not None and resume_from is not None:
+        raise AgentError('A source mutation budget requires a fresh run.')
+    if max_model_calls is not None and (type(max_model_calls) is not int or max_model_calls < 1):
+        raise AgentError('Model call budget must be a positive integer.')
+    if type(transport_retries) is not int or not 0 <= transport_retries <= MAX_TRANSIENT_INFERENCE_RETRIES:
+        raise AgentError('Transport retry budget is outside the supported range.')
     output = Path(output);output.mkdir(parents=True, exist_ok=False)
     assistant_files = AssistantFiles(assistant_root) if assistant_root else None
     if assistant_write_paths and assistant_files is None:
@@ -1292,6 +1640,8 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
         raise AgentError('Assistant file write paths must be unique.')
     if allowed_tools is not None:
         known_tools = {tool['function']['name'] for tool in TOOLS}
+        if restricted_evaluation_authorization is not None:
+            known_tools.add('evaluate_restricted_source')
         if (not isinstance(allowed_tools, (tuple, list, set, frozenset))
                 or (completion_policy != 'conversational' and 'finish' not in allowed_tools)
                 or set(allowed_tools) - known_tools):
@@ -1300,9 +1650,53 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
     if not isinstance(role_instructions, str) or len(role_instructions) > 2000:
         raise AgentError('Agent role instructions exceed the bounded text limit.')
     no_secrets(role_instructions)
+    if temporary_project_registration is not None:
+        current_registration = inspect_temporary_project(
+            temporary_project_registration.get('registration_id')
+            if isinstance(temporary_project_registration, dict) else None
+        )
+        if (current_registration != temporary_project_registration
+                or current_registration.get('project_id') != project.identity
+                or current_registration.get('project_root') != str(project.root)):
+            raise AgentError('Temporary project registration is invalid, stale, or cross-project.')
+        temporary_tools = {
+            'list_files', 'read_file', 'search', 'git_status', 'git_diff',
+            'replace_text', 'create_file', 'finish',
+        }
+        if restricted_evaluation_authorization is not None:
+            temporary_tools.add('evaluate_restricted_source')
+        allowed_tools = temporary_tools if allowed_tools is None else set(allowed_tools) & temporary_tools
+    if restricted_evaluation_authorization is not None:
+        required_auth = {'project_id', 'project_root', 'source_path',
+                         'evaluator_sha256', 'acceptance_spec_id'}
+        if temporary_project_registration is not None:
+            required_auth |= {'registration_id', 'worktree_identity'}
+        if (not isinstance(restricted_evaluation_authorization, dict)
+                or set(restricted_evaluation_authorization) != required_auth
+                or restricted_evaluation_authorization.get('project_id') != project.identity
+                or restricted_evaluation_authorization.get('project_root') != str(project.root)
+                or restricted_evaluation_authorization.get('evaluator_sha256') != RESTRICTED_EVALUATOR_SHA256
+                or restricted_evaluation_authorization.get('acceptance_spec_id') != RESTRICTED_ACCEPTANCE_SPEC_ID):
+            raise AgentError('Restricted evaluation authorization is invalid or belongs to another project.')
+        if allowed_tools is not None and 'evaluate_restricted_source' not in allowed_tools:
+            raise AgentError('The selected role does not permit restricted evaluation.')
+        if file_hash(HUB / 'restricted_acceptance.py').casefold() != RESTRICTED_EVALUATOR_SHA256.casefold():
+            raise AgentError('Trusted restricted evaluator identity mismatch.')
+        source_path = restricted_evaluation_authorization.get('source_path')
+        if not isinstance(source_path, str):
+            raise AgentError('Restricted evaluation authorization requires an exact source path.')
+        source_target = project.path(source_path)
+        if (source_target.relative_to(project.root).as_posix() != source_path
+                or source_target.suffix.casefold() != '.py'):
+            raise AgentError('Restricted evaluation authorization path is not canonical Python source.')
+        required_operations = tuple(dict.fromkeys(
+            (*required_operations, 'evaluate_restricted_source')
+        ))
     required_operations = validate_completion_policy(
         completion_policy, required_operations, writes, test_config,
         assistant_write_paths,
+        ('evaluate_restricted_source',)
+        if restricted_evaluation_authorization is not None else (),
     )
     if (not isinstance(required_clarifications, (tuple, list))
             or len(required_clarifications) > 12
@@ -1320,7 +1714,11 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
     if required_clarifications and completion_policy == 'conversational':
         raise AgentError('Clarification contracts require a tool-based completion policy.')
 
-    tools = copy.deepcopy(execution_tools(test_config, completion_policy, allowed_tools))
+    tools = copy.deepcopy(execution_tools(
+        test_config, completion_policy, allowed_tools,
+        restricted_evaluation_authorization,
+        temporary_project_registration,
+    ))
     if required_clarifications:
         finish_schema = next(
             item['function']['parameters'] for item in tools
@@ -1430,7 +1828,10 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
         broker = Broker(project, output, writes, test_config, assistant_root=assistant_files,
                         assistant_write_paths=assistant_write_paths,
                         allowed_tools=allowed_tools,
-                        require_test_after_each_write=require_test_after_each_write)
+                        require_test_after_each_write=require_test_after_each_write,
+        restricted_evaluation_authorization=restricted_evaluation_authorization,
+        temporary_project_registration=temporary_project_registration,
+        max_source_mutations=max_source_mutations)
         broker.cancel_event = cancel_event
         if resume_from:
             recovery_store.resume_scope(resume_from, writes, assistant_write_paths,
@@ -1585,6 +1986,9 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
     usage = {'prompt_tokens': 0, 'completion_tokens': 0, 'responses': 0, 'max_prompt_tokens': 0}
     try:
         for step in range(max_steps):
+            if max_model_calls is not None and inference_attempts >= max_model_calls:
+                result.setdefault('completion_blockers', []).append('model call budget exhausted')
+                break
             if cancel_event is not None and cancel_event.is_set():
                 raise AgentError('Harness cancellation requested.')
             if (output/'STOP').exists(): raise AgentError('Operator emergency STOP requested.')
@@ -1636,7 +2040,8 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
                     attempt_status = exc.code
                     should_retry = (
                         exc.code == 'timeout'
-                        and inference_retries < MAX_TRANSIENT_INFERENCE_RETRIES
+                        and inference_retries < transport_retries
+                        and (max_model_calls is None or inference_attempts < max_model_calls)
                         and not (cancel_event is not None and cancel_event.is_set())
                         and not (output/'STOP').exists()
                     )
@@ -1923,6 +2328,10 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
     finally:
         try:
             actual_tests, receipt_integrity = verify_test_receipts(broker.commands, project, output)
+            restricted_status, restricted_integrity = verify_restricted_evaluation_receipts(
+                broker.restricted_evaluation_receipts, project, output,
+                broker.restricted_evaluation_path,
+            )
             if result['status'] == 'complete' and broker.journal.row['operations']:
                 inspection = recovery_store.inspect(broker.journal.row['run_id'])
                 if not inspection['safe_to_reconcile']:
@@ -1934,6 +2343,12 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
                 result['status'] = 'incomplete'
                 result.setdefault('completion_blockers', []).append(
                     'required test receipt is missing, invalid, stale, or failed')
+            if (result['status'] == 'complete'
+                    and 'evaluate_restricted_source' in required_operations
+                    and restricted_status != 'passed'):
+                result['status'] = 'incomplete'
+                result.setdefault('completion_blockers', []).append(
+                    'required restricted evaluation receipt is missing, invalid, stale, or failed')
             result.update(seconds=time.monotonic()-started, writes=broker.writes,
                           assistant_file_writes=broker.assistant_writes, commands=broker.commands,
                           inference_attempts=inference_attempts,
@@ -1941,18 +2356,27 @@ def run_agent(project, model, task, output, base=DEFAULT_ENDPOINT, writes=(), te
                           broker_dispatch_seconds=broker_dispatch_seconds,
                           host_completion_evidence={
                                   'completed_operations': sorted(successful_operations - {'finish'}
-                                      - ({'run_tests'} if actual_tests != 'passed' else set())),
+                                      - ({'run_tests'} if actual_tests != 'passed' else set())
+                                      - ({'evaluate_restricted_source'}
+                                         if restricted_status != 'passed' else set())),
                               'outstanding_required_operations': sorted(
                                   (required_operations - successful_operations)
                                   | ({'run_tests'} if 'run_tests' in required_operations
-                                     and actual_tests != 'passed' else set())),
+                                     and actual_tests != 'passed' else set())
+                                  | ({'evaluate_restricted_source'}
+                                     if 'evaluate_restricted_source' in required_operations
+                                     and restricted_status != 'passed' else set())),
                               'test_status': actual_tests,
+                              'restricted_evaluation_status': restricted_status,
                               'block_categories': sorted({item['category'] for item in blocked_operations}),
                           },
                           inference_retries=inference_retries,
                           finish_schema_retries=finish_schema_retries,
                           verified_test_status=actual_tests,
                           receipt_integrity=receipt_integrity,
+                          restricted_evaluation_status=restricted_status,
+                          restricted_evaluation_receipts=broker.restricted_evaluation_receipts,
+                          restricted_evaluation_integrity=restricted_integrity,
                           model_metrics={**usage,
                               'total_tokens': usage['prompt_tokens'] + usage['completion_tokens'],
                               'context_limit': context,
