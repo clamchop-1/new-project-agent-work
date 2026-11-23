@@ -1,6 +1,23 @@
 # Mac Studio inference architecture
 
-This document records the supported Windows-side remote inference boundary and future Mac deployment direction. The Mac Studio is not available for validation yet; no live Mac connectivity or inference has been verified.
+This document records the supported Windows-side remote inference boundary and future Mac deployment direction. On 2026-11-22, the configured Mac Ollama endpoint was reached through the existing managed SSH tunnel and used for one bounded, tool-free coding proposal. This verifies the configured path and one inference response; it does not establish long-term availability or production readiness.
+
+## Live verification record (2026-11-22)
+
+- Provider: existing `ssh_tunnel_ollama` using the configured managed SSH
+  profile, host-key pin, and loopback-only forward.
+- Health: Ollama `0.40.17`.
+- Model: `qwen3-coder:30b`, digest
+  `06c1097efce0431c2045fe7b2e5108366e43bee1b4603a7aded8f21689e90bca`.
+- Initial health/model availability checks sent no task prompt. The tunnel was
+  closed after the probe.
+- One subsequent coding proposal used the existing Windows orchestration in
+  conversational mode with no tools. The proposal stayed in a disposable Git
+  fixture, passed allowlist and non-mutating patch applicability checks, and
+  was left unapplied. Review found a bool-as-int bug, so the demo is not a
+  successful implementation result.
+- This milestone made no changes to the Mac service, LAN exposure, Windows
+  Broker, or model configuration.
 
 ## Responsibilities
 
@@ -24,7 +41,7 @@ The Mac service must not offer arbitrary command execution, file browsing, repos
 
 Do not resume a task from chat text alone. Resume from a saved, integrity-checked run record and revalidate the Git and authorization snapshots.
 
-## Provider lifecycle and fallback (implemented on Windows; Mac untested)
+## Provider lifecycle and fallback (implemented on Windows; live route verified)
 
 The provider contract exposes model verification/discovery, a no-context health probe, bounded inference, structured sanitized failures, cancellation checks, and cleanup. Remote provider construction requires the validated managed SSH profile. Discovery and health checks close their run-scoped provider afterward; inference runs close the provider on completion or failure. Retries are limited to one retry of the idempotent version health GET. Inference requests are never automatically replayed.
 
@@ -127,4 +144,4 @@ Before deployment, remove assumptions that all registered roots use Windows driv
 
 ## Not yet implemented or verified
 
-There is no Mac service, LAN listener, resource monitor, multi-agent scheduler, remote approval UI, or live Mac benchmark. The managed SSH route and fallback use mocks in automated tests only; actual macOS runtime compatibility, SSH handshake, host-key enrollment, Mac service behavior and performance remain hardware-dependent validation tasks.
+There is no additional Mac-side agent service, LAN listener, resource monitor, multi-agent scheduler, remote approval UI, or live Mac benchmark. The managed SSH route was exercised on the configured host as recorded above; automated tests still use mocks. Broader macOS runtime compatibility, SSH key lifecycle, service restart behavior, sustained availability, and performance remain unverified.
