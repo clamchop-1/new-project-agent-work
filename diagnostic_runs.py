@@ -69,7 +69,7 @@ _TRANSITIONS = {
     "collected": {"validated", "rejected"},
 }
 _ALLOWED_RUN_ENTRIES = frozenset({
-    ".lock", "journal.json", "input", "collected", "validation-receipt.json",
+    ".lock", "journal.json", "input", "collected", "evidence", "validation-receipt.json",
 })
 
 
@@ -346,11 +346,14 @@ class DiagnosticRunLedger:
             elif path.name not in _ALLOWED_RUN_ENTRIES:
                 anomalies.append("unexpected:" + path.name)
                 continue
-            elif path.name in {"input", "collected"} and (path.exists() or path.is_symlink()):
+            elif path.name in {"input", "collected", "evidence"} and (path.exists() or path.is_symlink()):
                 try:
                     _require_directory(path)
                 except (OSError, DiagnosticRunError):
                     anomalies.append("unsafe-entry:" + path.name)
+                else:
+                    if path.name == "evidence":
+                        anomalies.extend(_evidence_tree_anomalies(path))
             elif path.name in {"journal.json", "validation-receipt.json"} and path.exists():
                 try:
                     _require_regular_unlinked_file(path)
@@ -495,6 +498,46 @@ def _validate_evidence(evidence: dict) -> dict:
     if len(encoded) > 16 * 1024:
         raise DiagnosticRunError("Journal evidence exceeds its 16 KiB limit.")
     return json.loads(encoded.decode("utf-8"))
+
+
+def _evidence_tree_anomalies(root: Path) -> list[str]:
+    """Validate the allowlisted shape of additive evidence without interpreting it."""
+    legacy_directories = {"approvals", "consumptions", "intents", "results"}
+    current_directories = legacy_directories | {"collections"}
+    anomalies: list[str] = []
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return ["unreadable:evidence"]
+    if {entry.name for entry in entries} not in (legacy_directories, current_directories):
+        anomalies.append("unexpected:evidence-directory-inventory")
+    for directory in entries:
+        try:
+            _require_directory(directory)
+        except (OSError, DiagnosticRunError):
+            anomalies.append("unsafe:evidence/" + directory.name)
+            continue
+        try:
+            records = list(directory.iterdir())
+        except OSError:
+            anomalies.append("unreadable:evidence/" + directory.name)
+            continue
+        for record in records:
+            if ".pending-" in record.name:
+                anomalies.append("pending:evidence/" + directory.name + "/" + record.name)
+                continue
+            if directory.name == "approvals":
+                valid_name = bool(re.fullmatch(r"[0-9a-f]{32}\.signed\.json", record.name))
+            else:
+                valid_name = bool(re.fullmatch(r"[0-9a-f]{32}\.json", record.name))
+            if not valid_name:
+                anomalies.append("unexpected:evidence/" + directory.name + "/" + record.name)
+                continue
+            try:
+                _require_regular_unlinked_file(record)
+            except (OSError, DiagnosticRunError):
+                anomalies.append("unsafe:evidence/" + directory.name + "/" + record.name)
+    return anomalies
 
 
 def _read_canonical_json(path: Path, *, max_bytes: int) -> dict:
