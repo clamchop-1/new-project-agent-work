@@ -570,3 +570,26 @@ evidence-backed integration proposals. See
 permissions, resource defaults, review gates, and CLI examples. Resource
 measurements are mocked until host capacity is measured; task changes remain in
 worktrees until explicitly reviewed and integrated by the operator.
+
+## LocalCodingAgent chat
+
+For general questions and programming help, run from the repository root:
+
+```powershell
+cmd.exe /c local-chat.cmd
+```
+
+The launcher opens `http://127.0.0.1:52718/` in your default browser and prints
+a one-run token in the PowerShell window. Paste that token into the local login
+form, and keep the window open. The chat uses the
+configured Mac Studio provider through the pinned SSH tunnel, streams model
+responses, and stores bounded conversations under `.local/chat/conversations`.
+The default model is `qwen3-coder:30b`; `qwen3:8b` is available under Settings
+when authorized. Chat has no project, filesystem, shell, Broker, or VM tools.
+Authentication remains enabled; never put the token in a URL or persistent log.
+
+If port 52718 is occupied, the launcher leaves the existing process untouched.
+Use `cmd.exe /c local-chat.cmd --dashboard-port 52719` to start another local
+instance. The older workflow dashboard remains available for registered
+disposable fixtures at `/developer` when launched with `coding-dashboard.cmd`.
+It is not required for ordinary conversation.

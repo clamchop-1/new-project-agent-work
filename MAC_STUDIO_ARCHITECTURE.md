@@ -19,6 +19,38 @@ This document records the supported Windows-side remote inference boundary and f
 - This milestone made no changes to the Mac service, LAN exposure, Windows
   Broker, or model configuration.
 
+## Live verification record (2026-11-23; replacement coding task)
+
+- The original Milestone 1 task was not recovered. A new operator-authored
+  replacement specification defined `clamp_percent` and its required tests.
+- The existing managed SSH provider again reached Ollama `0.40.17` and
+  `qwen3-coder:30b` with digest
+  `06c1097efce0431c2045fe7b2e5108366e43bee1b4603a7aded8f21689e90bca`.
+  The request exposed no tools, used a 120-second inference timeout, forwarded
+  only through loopback, and closed its tunnel afterward.
+- The first separately approved patch had malformed hunk counts in both files:
+  source declared 5 additions but contained 8; tests declared 20 but contained
+  24. `git apply --check` passed but application consumed only the declared
+  lines. A separate baseline clone reproduced the partial application.
+- A corrected patch with SHA-256
+  `957edaa7ea9aa17a4b32e98766fc5b2e376a0bda13483e246c597883d2d38934` passed
+  exact hunk-count validation and isolated `git apply --check`; the simulated
+  files matched the intended Windows CRLF bytes. After separate approval, only
+  `src/progress.py` and `tests/test_progress.py` were replaced in the disposable
+  repository, with new immutable copies of their prior contents preserved.
+- The disposable suite passed 3 test methods, 0 failures and 0 errors, covering
+  all 10 specified input cases. Fourteen focused LocalCodingAgent regression
+  suites passed 193 tests with 0 failures and 0 errors. Full discovery was not
+  rerun; the earlier optional `pycdlib` and
+  `diagnostic_witness_service.py` errors were not rechecked.
+- Candidate lessons for exact bool/int checking and hunk-count validation are
+  locally recorded as verified candidates, not promoted to authoritative or
+  executable skills. Evidence is under
+  `.local/tests/unified-coding-demo/milestone2-recovery-20261123T162731Z-6defa190d5/`
+  and `.local/tests/unified-coding-demo/milestone2-apply-20261123T163425Z-a77bf72ccc/`.
+- No Mac service, LAN exposure, production repository, Broker authority, or
+  model configuration was changed.
+
 ## Responsibilities
 
 - **Windows development workstation:** keep the repository, Git worktrees, edit permits, source writes, test receipts, review UI, and stop control. The Windows broker remains the authority for which files an agent may change.
@@ -31,7 +63,66 @@ Windows Ollama at `http://127.0.0.1:11434` remains the default. Remote inference
 
 The Mac service must not offer arbitrary command execution, file browsing, repository checkout, or remote write tools. If remote orchestration is ever needed, design a separate authenticated task protocol and keep capability execution on the Windows broker. Review that security model separately before implementation.
 
+## Unified coding workflow hardening (2026-11-23; partial)
+
+`patch_validation.py` now provides a dependency-free unified-diff parser for
+strict hunk-count and context validation, exact path allowlists, complete body
+consumption, and reconstructed expected bytes. It rejects traversal, symlink
+targets, ambiguous boundaries, renames, deletions, and binary/mode changes.
+The Milestone 2 under-count failure is covered by a focused regression test.
+Eight validator tests passed; the existing 14 focused integration/security
+suites passed 193/193. Output is preserved under
+`.local/tests/milestone3-validator-final-20261123T090737-9f5f19c8/`.
+
+This is not yet an integrated coding workflow. The existing permit binds a
+task, project state, and write paths, but does not bind the exact unified-diff
+hash and reconstructed post-images. Until a one-use adapter binds those fields
+and routes exact approved bytes through Broker plus the fixed test capability,
+do not use an existing permit to apply a model-generated patch. No live Mac
+proposal was made in this partial Milestone 3 work; the last verified Mac
+connectivity and model evidence remains the Milestone 2 record above.
+
 ## Task and review flow
+
+### Milestone 3 continuation — verified approval checkpoint (2026-11-23)
+
+The existing Windows Broker remains the only write and test authority. The
+new `coding_workflow.py` connects it to the coding harness, strict
+`patch_validation.py`, existing provider factory/SSH tunnel, recovery journal,
+and candidate skill library. Qwen receives a bounded prompt with no tools and
+cannot write files, invoke shell commands, access the Broker, or operate VMs.
+
+Before approval, the workflow validates the entire unified diff, reconstructs
+expected file bytes, checks the allowlist and baseline, and applies the patch
+only in a separate disposable simulation. The fixed pinned acceptance tests
+must pass there. Approval binds repository identity and baseline, patch bytes,
+expected post-image hashes, authorized paths, pinned test configuration and
+command, plus a unique one-use identifier. The Broker consumes approval
+durably before a live write, uses CAS and its recovery journal, verifies
+resulting bytes, then runs only its predefined tests. Ambiguous writes are
+terminal and are never retried automatically.
+
+Live Mac proposal run `8a9ba8feea9d465ea4b0edcea26988bb` reached
+`awaiting_approval` through the configured pinned-host, loopback-forwarded
+`ssh_tunnel_ollama` provider and `qwen3-coder:30b`. Destination:
+`.local/tests/milestone3-live-bacc8b0366df/repo`, baseline
+`054e52f05a0a3cf4b69f457090f6ba9a0a91e798`, allowlist only
+`src/progress.py`. Patch SHA-256:
+`2b045865730b8b0ce6e277b206025fd17e1e5d8022080f51337d484998974cb8`;
+expected post-image SHA-256:
+`07d3ccebb1aed05af8a2c0faa9986897a8ca7aa80a9a78c1840b6c8b6f0e8825`.
+Strict validation, isolated `git apply --check`, exact simulated byte
+comparison, and three pinned acceptance tests passed. Explicit one-use
+approval `4d6cd441cf7949349f4b740665f92b89` was then consumed before the write.
+The Broker created only the authorized file and verified its actual bytes
+against the post-image hash. The fixed post-write Broker tests passed 3/3
+(zero failures/errors), and workflow state is `completed`.
+
+Focused regressions passed 258/258. The exact-integer lesson is recorded as
+unpromoted SkillLibrary candidate
+`skill-3d78e16793a7034177a718f1`, supported by the Broker test receipt and
+workflow provenance. The known full-discovery `pycdlib` dependency and
+unrelated diagnostic syntax errors remain outside this milestone.
 
 1. Windows captures the selected project identity, Git baseline, task, and exact proposed edit scope.
 2. The model receives only the prompt/context needed for reasoning. Sensitive files and unrelated project memory are excluded.
@@ -144,4 +235,131 @@ Before deployment, remove assumptions that all registered roots use Windows driv
 
 ## Not yet implemented or verified
 
-There is no additional Mac-side agent service, LAN listener, resource monitor, multi-agent scheduler, remote approval UI, or live Mac benchmark. The managed SSH route was exercised on the configured host as recorded above; automated tests still use mocks. Broader macOS runtime compatibility, SSH key lifecycle, service restart behavior, sustained availability, and performance remain unverified.
+There is no additional Mac-side agent service, LAN listener, resource monitor, remote approval UI, or live Mac benchmark. Milestone 4 adds sequential planner, coder, and reviewer calls within the existing Windows workflow, all using the managed provider and receiving no tools. The loopback dashboard presents workflow state but does not authorize or apply patches. Live inference through `ssh_tunnel_ollama` reached the human approval checkpoint; see `.local/tests/milestone4-final-20261123-dbde4b6f/report.md` for the exact run, patch and post-image hashes, validation, and clean unapplied destination. Broader macOS runtime compatibility, SSH key lifecycle, service restart behavior, sustained availability, and performance remain unverified.
+
+The pinned Windows pure-test runner now has an exact canonical registration for the authorized Milestone 4 disposable fixture and BOM-safe decoding for its unchanged pinned test configuration. Path traversal and symlink/junction/reparse-point checks remain enabled; this compatibility fix did not change the Mac inference adapter, Broker authority, or model permissions. After separate exact-patch approval, Broker consumed approval once, applied the disposable `src/progress.py`, verified its expected post-image, and ran the pinned test capability successfully (3/3). Final focused regressions passed 307/307. The verified candidate remains unpromoted. See `.local/tests/milestone4-completion-20261123-dbde4b6f/report.md` for receipts and hashes; earlier checkpoint reports remain preserved.
+
+## Multi-file proposal reliability (2026-11-23)
+
+The two rejected operational-review proposals had distinct causes: one
+underdeclared hunk additions (+3 declared versus +6 consumed in both retries);
+the other combined an ambiguous task and incorrect behavior with malformed
+context, while strict parsing also stopped on a CRLF target. The live repair
+uses full-file JSON intents with source hashes and trusted deterministic diff
+construction; strict path/hunk/post-image checks and the Windows Broker
+approval boundary remain unchanged.
+
+On a fresh disposable two-module Python fixture, `ssh_tunnel_ollama` ran two
+planner/coder/reviewer configurations: all `qwen3-coder:30b`, and `qwen3:8b`
+planner with `qwen3-coder:30b` coder/reviewer. Each produced a valid two-file
+proposal, passed byte-exact simulation and the fixed test capability (3/3),
+and reached `awaiting_approval` after an independent advisory review. No live
+patch was approved or applied. Focused regressions passed 196/196. The dashboard
+model allowlist accepts both installed models, remains loopback-only, and has
+no approval/apply route. Browser automation host was unavailable; dashboard
+interactive usability remains unverified. See
+`.local/tests/milestone4-reliability-20261123-5b3f8aa8925141aabb861b5b7d3e9c48/report.md`
+for diffs, patch/post-image hashes, timings, candidate status, and manual
+browser checklist. No production readiness is claimed.
+
+### Configuration A application completion (2026-11-23)
+
+The operator separately approved Configuration A workflow
+`3abcc66ad4744709820e5a966d1ac018`. Existing Windows approval/application
+consumed one patch-bound approval (`dbf35b623bcc4ec19d2aba8ca8efa185`) and
+Broker changed only disposable `calculator.py` and `stats.py`. Both resulting
+file hashes match their approved post-images. Pinned `stats_multi_module_v1`
+tests passed 3/3 (exit 0), and focused inference/tunnel/authorization/recovery/
+orchestration/SkillLibrary/coding regressions passed 196/196. The recovery
+journal is complete and the workflow is `completed`. Candidate
+`skill-90bfc6a2af0b8102e714ede2` version 5 remains unpromoted and now references
+this run’s patch, approval receipt, final workflow state, and successful Broker
+receipt. Configuration B remains untouched. The legacy `coding-status`
+formatter raised a `file_hash` NameError; direct persisted-state and receipt
+checks succeeded. See
+`.local/tests/milestone4-reliability-20261123-5b3f8aa8925141aabb861b5b7d3e9c48/configuration-a-completion-report.md`.
+
+## Dashboard operational usability update (2026-11-23)
+
+The existing authenticated dashboard now presents overview, bounded disposable
+task submission, active workflow/proposal review, persistent history, and
+read-only SkillLibrary information. It still binds only to IPv4 loopback and
+has no approval, apply, arbitrary evidence-path, or arbitrary command route.
+Exact approval details are displayed for the established CLI/Broker checkpoint.
+
+The `coding-status` formatter's missing `file_hash` import is fixed. Status
+inspection does not invoke ambiguous-write recovery. A completed state is
+reported verified only when the approved post-images, Broker output receipt,
+and the matching complete recovery journal all verify. Workflow and dashboard
+views share the same status projection. Historical Configuration A remains
+unchanged and now reports its exact completed evidence.
+
+The startup probe through the existing `ssh_tunnel_ollama` provider connected
+successfully and listed `qwen3-coder:30b` and `qwen3:8b`. Provider health is
+presented as cached startup data; the model allowlist is limited to those two
+names. Dashboard task timeouts and coder attempts remain bounded.
+
+Chrome rendered the loopback login page and navigation. Automated credential
+entry was not performed; operator sign-in is still required for visual review
+of authenticated pages. API authentication, task submission, history, model
+allowlists, cancellation, approval presentation, and the absent approval/apply
+routes were tested. Do not interpret this as full authenticated browser QA.
+
+### Read-only real-project readiness
+
+The host configuration includes project selectors for KronosStage and
+PhotoLibraryTools, but neither repository was opened or changed in this review.
+The current coding workflow and dashboard deliberately accept only clean
+Milestone 3/4 disposable fixtures. General project identity and bounded path
+reads exist, and project instruction collection and project-scoped SkillLibrary
+retrieval are available components; no end-to-end read-only analysis run was
+demonstrated for either target. Coding context remains allowlist-driven and
+bounded. Dependency graph awareness and source retrieval across an entire
+registered real project are not established by this workflow.
+
+The next smallest step is a read-only registration pilot on an explicitly
+approved project copy: verify canonical Git identity, capture project
+instructions, select a bounded source set, inspect dependency metadata, enforce
+a context budget, isolate retrieved skills/evidence by project identity, and
+prove that no write or test capability is exposed. Production write access is
+not part of that step. Readiness remains disposable projects only.
+
+## Phase A — chat-first local assistant (2026-11-23)
+
+The existing authenticated loopback server now serves a conversational chat
+home page at `/`; configured disposable coding dashboards retain the previous
+workflow console at `/developer`. A chat-only launcher can run with no project
+root or coding file allowlist. It uses `CodingDashboard`'s loopback binding,
+one-run bearer authentication, same-origin POST checks, the existing provider
+factory, configured managed SSH tunnel, and installed-model allowlist.
+
+`Ollama.chat_stream` consumes bounded `/api/chat` NDJSON responses and sends
+text-only increments to the local UI. The request contains no tools. A bounded
+`ConversationStore` writes atomic JSON records beneath `.local/chat`, limits
+message count and size, and supplies only recent bounded context. Cancellation
+reaches the HTTP provider socket. Model output is rendered with DOM text nodes;
+HTML from the model is never interpreted. Chat cannot read project files or
+authorize code changes. The existing coding workflow and Broker approval
+authority are unchanged.
+
+The `local-chat.cmd` launcher checks the SSH-tunneled provider and installed
+models, binds only to `127.0.0.1`, opens the local page in the default browser,
+and prints a one-run token in its console.
+The token login remains enabled; an automatic browser session bootstrap was
+not implemented. The old developer console remains available for explicitly
+registered disposable fixtures only.
+
+Live API demonstration on 2026-11-24 UTC verified `qwen3-coder:30b`, the three
+acceptance turns, incremental output, follow-up context, cancellation, and
+conversation restoration after restart. Exact outputs and latency are in
+`.local/tests/phasea-chat-live-613f2e76b46a/result.json`. Browser inspection in
+Edge showed the local chat login page and layout at port 52719. The browser
+token form was not automated under the computer-use authentication rule, so
+this is pre-auth visual review rather than authenticated browser QA.
+
+Focused suites passed 114 tests across chat persistence and streaming,
+dashboard, status, workflow, inference, SSH tunnel, authorization, recovery,
+patch validation, and conversation security. Full test discovery was not run.
+Project selection, source retrieval, automatic intent routing, coding proposals
+from chat, SkillLibrary integration, and authenticated browser review remain
+later phases. This status records Phase A only; it does not start Milestone 5.

@@ -102,6 +102,114 @@ class Ollama:
         if 'tool_calls' in message and not isinstance(message['tool_calls'], list):
             raise ProviderFailure('malformed_response', 'Inference provider returned malformed tool-call data.')
         return response
+
+    def chat_stream(self, model, messages, context, options, on_token, *,
+                    cancel_event=None, timeout=180):
+        """Stream bounded Ollama chat tokens without granting model tools."""
+        if not callable(on_token):
+            raise AgentError('Streaming chat requires a local token callback.')
+        if type(timeout) not in (int, float) or not 0 < timeout <= MAX_INFERENCE_TIMEOUT_SECONDS:
+            raise AgentError('Inference request timeout is outside the configured bound.')
+        if self.tunnel is not None:
+            self.tunnel.ensure_ready(cancel_event)
+        payload = {'model': model, 'messages': list(messages), 'tools': [],
+                   'stream': True, 'think': False, 'keep_alive': '2m',
+                   'options': {'num_ctx': context, **options}}
+        body = encoded(payload)
+        if len(body) > MAX_INFERENCE_REQUEST_BYTES:
+            raise AgentError('Inference request exceeds local limit.')
+        if cancel_event is not None and cancel_event.is_set():
+            raise ProviderFailure('cancelled', 'Inference request cancelled.')
+
+        parsed = urlsplit(self.base)
+        connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=timeout)
+        finished = threading.Event()
+        watcher = None
+        self.cancel_event = cancel_event
+        accumulated = 0
+        saw_done = False
+        try:
+            if self.tunnel is not None:
+                self.tunnel.ensure_ready(cancel_event)
+            connection.connect()
+            if cancel_event is not None:
+                watcher = threading.Thread(target=self._watch_cancellation,
+                    args=(connection.sock, finished, cancel_event), daemon=True)
+                watcher.start()
+            connection.request('POST', '/api/chat', body=body,
+                               headers={'Content-Type': 'application/json'})
+            response = connection.getresponse()
+            if 300 <= response.status < 400:
+                raise ProviderFailure('redirect_rejected', 'Inference endpoint redirects are forbidden.', security=True)
+            if response.status in (401, 403):
+                raise ProviderFailure('authentication', 'Inference provider authentication failed.')
+            if response.status == 404:
+                raise ProviderFailure('model_missing', 'Inference provider did not find the requested model.')
+            if response.status >= 400:
+                raise ProviderFailure('request_rejected', 'Inference provider rejected the request.')
+            deadline = time.monotonic() + timeout
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise ProviderFailure('cancelled', 'Inference request cancelled.')
+                if time.monotonic() >= deadline:
+                    raise ProviderFailure('timeout', 'Inference request timed out.', retryable=True)
+                if connection.sock is not None:
+                    connection.sock.settimeout(min(30.0, max(.05, deadline-time.monotonic())))
+                try:
+                    line = response.readline(65_537)
+                except socket.timeout as exc:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise ProviderFailure('cancelled', 'Inference request cancelled.') from exc
+                    raise ProviderFailure('timeout', 'Inference stream stopped responding.', retryable=True) from exc
+                if not line:
+                    break
+                accumulated += len(line)
+                if len(line) > 65_536 or accumulated > MAX_INFERENCE_RESPONSE_BYTES:
+                    raise ProviderFailure('response_too_large', 'Inference response exceeds the configured limit.')
+                try:
+                    event = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ProviderFailure('malformed_response', 'Inference provider returned malformed stream data.') from exc
+                if not isinstance(event, dict):
+                    raise ProviderFailure('malformed_response', 'Inference provider returned malformed stream data.')
+                if event.get('error'):
+                    raise ProviderFailure('provider_error', 'Inference provider ended the response with an error.')
+                message = event.get('message', {})
+                if not isinstance(message, dict):
+                    raise ProviderFailure('malformed_response', 'Inference provider returned malformed assistant content.')
+                text = message.get('content', '')
+                if text:
+                    if not isinstance(text, str):
+                        raise ProviderFailure('malformed_response', 'Inference provider returned malformed assistant content.')
+                    on_token(text)
+                if event.get('done') is True:
+                    saw_done = True
+                    break
+            if cancel_event is not None and cancel_event.is_set():
+                raise ProviderFailure('cancelled', 'Inference request cancelled.')
+            if not saw_done:
+                raise ProviderFailure('partial_response', 'Inference stream ended before completion.')
+            if self.tunnel is not None:
+                self.tunnel.ensure_ready(cancel_event)
+            return {'done': True, 'response_bytes': accumulated}
+        except ProviderFailure:
+            raise
+        except socket.timeout as exc:
+            if cancel_event is not None and cancel_event.is_set():
+                raise ProviderFailure('cancelled', 'Inference request cancelled.') from exc
+            raise ProviderFailure('timeout', 'Inference request timed out.', retryable=True) from exc
+        except OSError as exc:
+            if cancel_event is not None and cancel_event.is_set():
+                raise ProviderFailure('cancelled', 'Inference request cancelled.') from exc
+            raise ProviderFailure('connection_lost', 'Inference connection closed unexpectedly.', retryable=True) from exc
+        except http.client.HTTPException as exc:
+            raise ProviderFailure('partial_response', 'Inference provider returned an incomplete stream.') from exc
+        finally:
+            finished.set()
+            connection.close()
+            if watcher is not None:
+                watcher.join(timeout=.5)
+            self.cancel_event = None
     def request(self, path, payload=None, timeout=180):
         if path not in ('/api/version', '/api/tags', '/api/ps', '/api/chat', '/api/embed'):
             raise AgentError('Endpoint is not on the local inference allowlist.')

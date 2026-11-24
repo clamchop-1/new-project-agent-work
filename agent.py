@@ -1,21 +1,25 @@
 """Human-facing launcher and shared-memory bridge; no global configuration writes."""
 import argparse
 from datetime import datetime, timezone
+import getpass
 import json
 from pathlib import Path
 import subprocess
 import sys
+import socket
 import uuid
+import webbrowser
 
-from agent_core import AgentError, Project, atomic_write, encoded, digest, exclusive, save_handoff
+from agent_core import AgentError, Project, atomic_write, encoded, digest, exclusive, save_handoff, file_hash
 from assistant_files import AssistantFiles
 from local_agent import (HUB, TOOLS, run_agent, RESTRICTED_EVALUATOR_SHA256,
-                         RESTRICTED_ACCEPTANCE_SPEC_ID)
+                         RESTRICTED_ACCEPTANCE_SPEC_ID, create_inference_provider)
 from execution_recovery import RecoveryStore
 from model_router import discover_candidates, route_model, read_recent_performance
 from model_registry import (ModelRegistryError, append_performance_evidence,
                             load_registry)
 from conversation_session import load_session
+from chat_conversations import ConversationStore
 from agent_config import (config_path, default_projects, load_config,
                           legacy_name_map, selector_map, DEFAULT_ENDPOINT,
                           validate_endpoint)
@@ -179,6 +183,210 @@ def new_directory(kind):
     return folder
 
 
+def _run_collaborative_proposal(workflow, role_models, config, provider_name,
+                               routing_mode='configured', endpoint=None,
+                               timeout=120.0, attempts=2, cancel_event=None):
+    if type(timeout) not in (int, float) or not 1 <= timeout <= 600:
+        raise AgentError('Per-role coding timeout must be between one and 600 seconds.')
+    if type(attempts) is not int or not 1 <= attempts <= 3:
+        raise AgentError('Coder proposal attempts must be between one and three.')
+    specs = provider_specs(config, endpoint or config['inference']['endpoint'],
+                           routing_mode, provider_name)
+    selected = specs[provider_name]
+    PRIVATE.mkdir(parents=True, exist_ok=True)
+    with exclusive(PRIVATE / 'inference.lock', 'coding-collaboration'):
+        provider = create_inference_provider(provider_name, selected['endpoint'], selected.get('profile'))
+        try:
+            provider.health_check()
+            for model in dict.fromkeys(role_models.values()):
+                provider.model(model)
+            return workflow.generate_collaborative(provider, role_models=role_models,
+                provider_id=provider_name, timeout=timeout, max_attempts=attempts,
+                cancel_event=cancel_event)
+        finally:
+            provider.close()
+
+
+def _coding_workflow_cli(args, config):
+    from coding_workflow import CodingWorkflow
+    if args.action in ('coding-dashboard', 'local-chat'):
+        chat_only = args.action == 'local-chat'
+        if args.project or args.temporary_project:
+            raise AgentError('Local chat and coding dashboard do not accept production project selectors.')
+        if chat_only and (args.dashboard_root or args.coding_path):
+            raise AgentError('Local chat starts without project access or coding file permissions.')
+        if not chat_only and (not args.dashboard_root or not args.coding_path):
+            raise AgentError('Coding dashboard requires explicit disposable fixtures and exact file paths.')
+        if type(args.chat_timeout) is not int or not 30 <= args.chat_timeout <= 180:
+            raise AgentError('Local chat timeout must be between 30 and 180 seconds.')
+        if type(args.dashboard_port) is not int or not 1024 <= args.dashboard_port <= 65535:
+            raise AgentError('Dashboard port must be between 1024 and 65535.')
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.settimeout(0.2)
+            if probe.connect_ex(('127.0.0.1', args.dashboard_port)) == 0:
+                raise AgentError(f'Loopback dashboard port {args.dashboard_port} is already in use; existing processes were left untouched.')
+        finally:
+            probe.close()
+        from coding_dashboard import CodingDashboard
+        models = tuple(args.dashboard_model or ['qwen3-coder:30b', 'qwen3:8b'])
+        provider_name = args.provider or config['inference']['provider']
+        runner = (lambda workflow, role_models, cancel, limits: _run_collaborative_proposal(
+            workflow, role_models, config, provider_name, args.routing_mode,
+            args.endpoint, limits['timeout'], limits['attempts'], cancel)) if not chat_only else None
+        provider_status = {'status': 'unavailable', 'checked_at': None, 'installed_models': [],
+                           'provider': provider_name}
+        try:
+            specs = provider_specs(config, args.endpoint, args.routing_mode, provider_name)
+            selected = specs[provider_name]
+            provider = create_inference_provider(provider_name, selected['endpoint'], selected.get('profile'))
+            try:
+                health = provider.health_check()
+                installed = provider.models()
+                provider_status = {'status': 'connected', 'checked_at': datetime.now(timezone.utc).isoformat(),
+                    'provider': provider_name,
+                    'installed_models': [item.get('name') for item in installed
+                        if isinstance(item, dict) and isinstance(item.get('name'), str)]}
+            finally:
+                provider.close()
+        except (AgentError, OSError, ValueError) as exc:
+            provider_status.update({'status': 'unavailable', 'checked_at': datetime.now(timezone.utc).isoformat(),
+                                    'error': type(exc).__name__})
+        specs = provider_specs(config, args.endpoint, args.routing_mode, provider_name)
+        selected = specs[provider_name]
+        def chat_runner(messages, model, cancel_event, on_token):
+            PRIVATE.mkdir(parents=True, exist_ok=True)
+            with exclusive(PRIVATE / 'inference.lock', 'local-chat'):
+                provider = create_inference_provider(provider_name, selected['endpoint'], selected.get('profile'))
+                try:
+                    provider.model(model)
+                    provider.chat_stream(model, messages, 16384, {'temperature': 0.2}, on_token,
+                                         cancel_event=cancel_event, timeout=args.chat_timeout)
+                finally:
+                    provider.close()
+        chat_store = ConversationStore(HUB)
+        dashboard = CodingDashboard(args.dashboard_root, allowed_paths=tuple(args.coding_path),
+                                    allowed_models=models, runner=runner,
+                                    test_profile=args.coding_test_profile,
+                                    provider_status=provider_status,
+                                    chat_store=chat_store, chat_runner=chat_runner,
+                                    chat_models=models)
+        server = dashboard.start(port=args.dashboard_port)
+        print('Inference provider check: ' + provider_status['status']
+              + (' (cached at ' + provider_status['checked_at'] + ')' if provider_status.get('checked_at') else ''))
+        installed = provider_status.get('installed_models', [])
+        print('Authorized models: ' + ', '.join(models))
+        print('Installed models confirmed: ' + (', '.join(installed) if installed else 'not confirmed'))
+        print('Local dashboard: http://127.0.0.1:' + str(server.server_port))
+        print('One-run dashboard bearer token: ' + dashboard.token)
+        if chat_only and not args.no_browser_open:
+            try:
+                webbrowser.open('http://127.0.0.1:' + str(server.server_port) + '/', new=2)
+            except Exception:
+                print('Could not open a browser automatically; use the local URL above.')
+        if not chat_only:
+            print('Developer workflow view: http://127.0.0.1:' + str(server.server_port) + '/developer')
+            print('Approval/application remain available only through coding-approve and coding-apply.')
+        try:
+            server.serve_forever(poll_interval=0.25)
+        except KeyboardInterrupt:
+            print('Dashboard stopped by operator.')
+        finally:
+            server.shutdown(); server.server_close()
+        return
+    if not args.coding_root or args.project or args.temporary_project:
+        raise AgentError('Coding actions require only an exact --coding-root disposable repository.')
+    project = Project(args.coding_root)
+    if args.action == 'coding-collaborate':
+        if not args.coding_path or (not args.task and not args.task_file):
+            raise AgentError('Collaborative proposal requires a task and one or more exact --coding-path values.')
+        task = args.task if args.task is not None else args.task_file.read_text(encoding='utf-8')
+        coder_model = args.coder_model or args.model
+        role_models = {'planner': args.planner_model or coder_model,
+                       'coder': coder_model, 'reviewer': args.reviewer_model or coder_model}
+        workflow = CodingWorkflow(project, task, tuple(args.coding_path))
+        provider_name = args.provider or config['inference']['provider']
+        proposal = _run_collaborative_proposal(workflow, role_models, config, provider_name,
+            args.routing_mode, args.endpoint, args.coding_timeout, args.coding_attempts)
+        print(json.dumps(proposal, ensure_ascii=True, indent=2))
+        return
+    if args.action == 'coding-propose':
+        if not args.coding_path or (not args.task and not args.task_file):
+            raise AgentError('Coding proposal requires a task and one or more exact --coding-path values.')
+        task = args.task if args.task is not None else args.task_file.read_text(encoding='utf-8')
+        workflow = CodingWorkflow(project, task, tuple(args.coding_path))
+        provider_name = args.provider or config['inference']['provider']
+        specs = provider_specs(config, args.endpoint, args.routing_mode, provider_name)
+        selected = specs[provider_name]
+        PRIVATE.mkdir(parents=True, exist_ok=True)
+        with exclusive(PRIVATE / 'inference.lock', 'coding-workflow'):
+            provider = create_inference_provider(provider_name, selected['endpoint'], selected.get('profile'))
+            try:
+                provider.health_check()
+                provider.model(args.model)
+                proposal = workflow.generate(provider, args.model, provider_id=provider_name,
+                                             max_attempts=args.coding_attempts)
+            finally:
+                provider.close()
+        print(json.dumps(proposal, ensure_ascii=True, indent=2))
+        return
+    if not args.workflow_id:
+        raise AgentError('Coding workflow action requires --workflow-id.')
+    workflow = CodingWorkflow.load(project, args.workflow_id,
+        recover_ambiguous=args.action != 'coding-status')
+    if args.action == 'coding-status':
+        result = dict(workflow.row)
+        patch_path = workflow.run_dir / 'approved.patch'
+        if patch_path.is_file():
+            result['patch_sha256'] = file_hash(patch_path)
+        from coding_status import status_projection
+        from coding_dashboard import CodingDashboard
+        completion_verified = CodingDashboard._verified_test_receipt(
+            project, workflow.run_id, result.get('test_result'))
+        application_verified = CodingDashboard._verified_post_images(project, result)
+        recovery_status = CodingDashboard._recovery_status(project, workflow.run_id)
+        candidate_status = CodingDashboard._candidate_status(project, workflow.run_id)
+        result['status_summary'] = status_projection(
+            result, patch_sha256=result.get('patch_sha256'),
+            completion_verified=(result.get('state') == 'completed' and completion_verified
+                                 and application_verified and recovery_status.get('status') == 'complete'),
+            candidate_status=candidate_status, recovery_status=recovery_status.get('status'))
+        print(json.dumps(result, ensure_ascii=True, indent=2))
+        return
+    if args.action in ('coding-approve', 'coding-reject'):
+        patch_path = workflow.run_dir / 'approved.patch'
+        if not patch_path.is_file():
+            raise AgentError('Reviewed patch evidence is missing.')
+        print(json.dumps({'workflow_id': workflow.run_id,
+            'repository': str(project.root), 'baseline_commit': workflow.baseline['commit'],
+            'patch_sha256': workflow.row['patch_sha256'],
+            'expected_post_images': workflow.row['expected_post_images'],
+            'allowed_paths': workflow.row['allowed_paths'],
+            'validation_report': workflow.row.get('validation_report'),
+            'planner': workflow.row.get('planner_output'),
+            'review': workflow.row.get('review_output'),
+            'review_advisory_only': workflow.row.get('review_advisory_only', False),
+            'role_models': workflow.row.get('role_models')}, indent=2))
+        print(patch_path.read_text(encoding='utf-8'))
+        sha = input('Type the exact patch SHA-256 to approve/reject this proposal: ').strip()
+        if args.action == 'coding-reject':
+            workflow.reject(patch_sha256=sha)
+            print(json.dumps({'state': workflow.row['state'], 'workflow_id': workflow.run_id}))
+            return
+        destination = input('Type the exact repository path to approve: ').strip()
+        fixed_command = workflow.row['test_command'].replace('→', '->')
+        print('Fixed test command: ' + fixed_command)
+        test_command = input('Type the fixed test command exactly as shown: ').strip()
+        operator = args.coding_operator or getpass.getuser()
+        approval = workflow.approve(patch_sha256=sha, repository=destination,
+                                    operator=operator, test_command=test_command)
+        print(json.dumps({'state': workflow.row['state'], 'approval': approval}, ensure_ascii=True, indent=2))
+        return
+    if args.action == 'coding-apply':
+        operator = args.coding_operator or getpass.getuser()
+        print(json.dumps(workflow.apply_and_test(operator=operator), ensure_ascii=True, indent=2))
+
+
 def snapshot(project, folder):
     packet = project.takeover()
     packet['memory_snapshot'] = project.memory_snapshot()
@@ -216,12 +424,37 @@ def main():
     selectors = selector_map(config)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=['config','inspect','run','approve','history','prepare-bridges','prepare-handoff','save-handoff','recovery-inspect','recovery-reconcile',
-                                           'temporary-register','temporary-inspect','temporary-revoke'])
+                                           'temporary-register','temporary-inspect','temporary-revoke',
+                                           'coding-propose','coding-collaborate','coding-dashboard',
+                                           'local-chat',
+                                           'coding-approve','coding-reject','coding-apply','coding-status'])
     parser.add_argument('--project', choices=selectors)
     parser.add_argument('--temporary-project', help='Select one active temporary registration by its generated ID.')
     parser.add_argument('--temporary-project-root', type=Path, help='Absolute Git worktree root for explicit temporary registration.')
     parser.add_argument('--temporary-project-ttl-seconds', type=int, default=DEFAULT_TTL_SECONDS)
     parser.add_argument('--task');parser.add_argument('--task-file',type=Path)
+    parser.add_argument('--coding-root', type=Path, help='Exact fresh disposable Milestone 3 repository root.')
+    parser.add_argument('--dashboard-root', type=Path, action='append', default=[],
+                        help='One explicitly authorized fresh Milestone 4 disposable repository; repeat to add fixtures.')
+    parser.add_argument('--coding-path', action='append', default=[], help='Exact relative path authorized for a coding patch.')
+    parser.add_argument('--coding-attempts', type=int, default=3, help='Bound proposal generation/correction attempts (1..3).')
+    parser.add_argument('--coding-test-profile', choices=['clamp_percent_v1', 'stats_multi_module_v1'],
+                        default='clamp_percent_v1', help='Select one exact existing trusted disposable test fixture.')
+    parser.add_argument('--coding-timeout', type=float, default=120.0,
+                        help='Per-role inference timeout in seconds (1..600).')
+    parser.add_argument('--planner-model', help='Installed local model for the read-only Planner role.')
+    parser.add_argument('--coder-model', help='Installed local model for the patch-generating Coder role.')
+    parser.add_argument('--reviewer-model', help='Installed local model for the independent read-only Reviewer role.')
+    parser.add_argument('--dashboard-model', action='append', default=[], choices=['qwen3-coder:30b', 'qwen3:8b'],
+                        help='Model identifier permitted in the dashboard role selectors; repeat to allow more models.')
+    parser.add_argument('--dashboard-port', type=int, default=52718,
+                        help='Loopback dashboard port; an occupied port is left untouched and reported.')
+    parser.add_argument('--chat-timeout', type=int, default=180,
+                        help='Maximum local chat response time in seconds (30..180).')
+    parser.add_argument('--no-browser-open', action='store_true',
+                        help='Keep chat in API-only mode for a verified local test run.')
+    parser.add_argument('--workflow-id', help='Persisted coding workflow identifier.')
+    parser.add_argument('--coding-operator', help='Operator identity for patch approval/application; defaults to current Windows account.')
     parser.add_argument('--assistant-root', type=Path,
                         help='Assistant file root, usually the PowerShell current directory; reads are broad and writes require exact paths.')
     parser.add_argument('--assistant-write-path', action='append', default=[],
@@ -272,6 +505,9 @@ def main():
                                        if tool['function']['name'] != 'finish'),
                         help='Require this registered operation before finish; repeat for multiple requirements.')
     args=parser.parse_args()
+    if args.action.startswith('coding-') or args.action == 'local-chat':
+        _coding_workflow_cli(args, config)
+        return
     if args.max_source_mutations is not None and (
             args.action != 'run' or args.recovery_run or args.assistant_write_path
             or args.allow_pinned_tests):
