@@ -60,6 +60,8 @@ class ConversationalCapabilityTests(unittest.TestCase):
                          'projects.list')
         self.assertEqual(router.propose('Open project audio-demo', selected_project=False).arguments['name'],
                          'audio-demo')
+        self.assertEqual(router.propose('Select the registered project audio-demo.',
+                                        selected_project=False).arguments['name'], 'audio-demo')
         self.assertIsNone(router.propose('Tell me about audio pipelines', selected_project=False))
         self.assertIsNone(router.propose('Run git reset --hard', selected_project=True))
 

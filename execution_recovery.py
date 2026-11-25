@@ -174,6 +174,7 @@ class RecoveryStore:
         saved = row['checkpoint']
         operations = row['operations']
         pending = next((op for op in operations if op['state'] == 'executing'), None)
+        multi_set = bool(row['scope'].get('approved_post_images'))
         write_hashes = {}
         for op in operations:
             if op['kind'] not in {'project_write', 'assistant_write'}:
@@ -195,6 +196,74 @@ class RecoveryStore:
                       if op['kind'] == 'command' and op['state'] == 'recorded']
         tests, integrity = verify_test_receipts(references, self.project, row['output'])
         unchanged = current == saved
+        if multi_set:
+            post_images = row['scope'].get('approved_post_images', {})
+            expected_paths = set(row['scope']['writes'])
+            initial = row.get('initial_checkpoint', saved)
+            all_before = (current['files'] == initial['files']
+                          and all(current[k] == initial[k] for k in
+                                  ('branch', 'commit', 'index_sha256')))
+            expected_final = dict(initial['files'])
+            expected_final.update(post_images)
+            all_after = (set(post_images) == expected_paths
+                         and current['files'] == expected_final
+                         and all(current[k] == initial[k] for k in
+                                 ('branch', 'commit', 'index_sha256')))
+            recorded_paths = {op.get('path') for op in operations
+                              if op['kind'] == 'project_write'
+                              and (op['state'] == 'recorded'
+                                   or op['state'] == 'reconciled'
+                                   and op.get('outcome') == 'matches_after')}
+            complete_scope = recorded_paths == expected_paths
+            per_file = []
+            for name in sorted(expected_paths):
+                before = initial['files'].get(name)
+                after = post_images.get(name)
+                actual = current['files'].get(name)
+                state = ('unchanged' if actual == before else
+                         'applied' if after is not None and actual == after else
+                         'externally_modified' if actual is not None else 'uncertain')
+                per_file.append({'path': name, 'before_sha256': before,
+                    'approved_after_sha256': after, 'actual_sha256': actual,
+                    'classification': state})
+            # A complete accepted state requires every authorized target to
+            # match its exact post-image and every journal operation recorded.
+            pending_after = bool(
+                pending and pending['kind'] == 'project_write'
+                and pending.get('path') in expected_paths
+                and current['files'].get(pending['path']) == pending.get('after'))
+            all_after = all_after and (complete_scope or pending_after)
+            pending_outcome = ('matches_after' if all_after else
+                               'matches_before' if all_before else
+                               'partial_or_uncertain' if pending or operations else
+                               'no_write_started')
+            write_hashes = { ('project_write', item['path']): {
+                'kind': 'project_write', 'path': item['path'],
+                'before': item['before_sha256'], 'after': item['approved_after_sha256'],
+                'actual': item['actual_sha256'],
+                'checkpoint_sha256': item['approved_after_sha256'],
+                'classification': item['classification'],
+                'is_regular_or_absent': item['classification'] != 'uncertain'}
+                for item in per_file }
+            verified = integrity['valid'] and (all_before or all_after)
+            unresolved = row['status'] in {'authorized', 'executing', 'interrupted'}
+            stale_locks = self._stale_launcher_locks(row.get('owner_pid')) if unresolved else {}
+            options = ((['accept'] if all_after else []) + (['abort'] if all_before else [])) if unresolved else []
+            report = {
+                'run_id': run_id, 'project_id': self.project.identity, 'status': row['status'],
+                'recovery_state': 'reconciliation_required' if unresolved else row['status'],
+                'scope': row['scope'], 'journal_sha256': journal_hash, 'pending': pending,
+                'last_recorded': next((op for op in reversed(operations) if op['state'] == 'recorded'), None),
+                'writes': list(write_hashes.values()), 'file_classifications': per_file,
+                'tests': tests, 'receipt_integrity': integrity,
+                'checkpoint_matches': unchanged, 'pending_outcome': pending_outcome,
+                'stale_launcher_locks': {path.name: digest(raw) for path, raw in stale_locks.items()},
+                'safe_to_reconcile': verified, 'current': current, 'options': options,
+            }
+            if unresolved and not options:
+                report['options'] = ['operator must inspect and manually reconcile every target; writes are not retried']
+            report['review_sha256'] = digest(encoded(report))
+            return report
         writes_match = all(item['is_regular_or_absent'] and item['actual'] == item['checkpoint_sha256']
                            for item in write_hashes.values()
                            if not pending or (item['kind'], item['path']) !=
@@ -297,7 +366,10 @@ class RecoveryStore:
                 path.unlink()
             for op in row['operations']:
                 if op['state'] == 'executing':
-                    op.update(state='reconciled', outcome=report['pending_outcome'])
+                    observed = report['current']['files'].get(op.get('path')) if op['kind'] == 'project_write' else None
+                    op.update(state='reconciled', outcome=report['pending_outcome'],
+                              evidence={'recovery_review_sha256': expected_review,
+                                        'observed_sha256': observed})
             row.update(status='resumable' if action == 'accept' else 'aborted',
                        checkpoint=report['current'],
                        reconciliation={'action': action, 'review_sha256': expected_review})
@@ -305,13 +377,20 @@ class RecoveryStore:
             return {'run_id': run_id, 'status': row['status']}
 
     def start(self, output, writes, assistant_files, assistant_writes, allowed_tools,
-              test_config, required_operations, resume_from=None):
+              test_config, required_operations, resume_from=None, run_id=None,
+              approved_post_images=None):
+        run_id = run_id or uuid.uuid4().hex
+        if not isinstance(run_id, str) or not re.fullmatch(r'[a-f0-9]{32}', run_id):
+            raise RecoveryError('Invalid recovery run ID.')
+        starting_checkpoint = checkpoint(self.project)
         row = {
-            'version': 1, 'run_id': uuid.uuid4().hex, 'project_id': self.project.identity,
+            'version': 1, 'run_id': run_id, 'project_id': self.project.identity,
             'output': str(output.resolve()), 'status': 'authorized', 'operations': [],
             'owner_pid': os.getpid(),
-            'checkpoint': checkpoint(self.project), 'resume_from': resume_from,
+            'checkpoint': starting_checkpoint, 'initial_checkpoint': starting_checkpoint,
+            'resume_from': resume_from,
             'scope': {'writes': sorted(writes), 'assistant_writes': sorted(assistant_writes),
+                      'approved_post_images': dict(approved_post_images or {}),
                       'assistant_root': str(assistant_files.root) if assistant_writes else None,
                       'tools': sorted(allowed_tools) if allowed_tools is not None else None,
                       'test_config': str(Path(test_config).resolve()) if test_config else None,
@@ -374,7 +453,8 @@ class ExecutionJournal:
     def close(self, status):
         if self.broken:
             return
-        if self.pending is not None or self.row['status'] == 'interrupted':
+        if (self.pending is not None or self.row['status'] == 'interrupted'
+                or status == 'interrupted'):
             status = 'interrupted'
         elif status != 'complete':
             status = 'interrupted' if self.row['operations'] else 'failed'

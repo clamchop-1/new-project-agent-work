@@ -1,9 +1,17 @@
 """Restricted pure-Python fixture executor, not a general OS sandbox.
 
-Only pinned tests and AST-validated, import-free pure functions are supported.
+Only pinned tests and AST-validated pure functions are supported. Coding-profile
+modules may import one another only through the fixed profile module allowlist.
 General repository test/shell execution is deliberately refused without a qualified
 external sandbox. This narrow executor proves the edit/test loop safely here.
 """
+import faulthandler
+import os
+_TRACE_PATH = os.environ.pop('LOCAL_AGENT_PURE_TEST_TRACEBACK', None)
+_TRACE_FILE = open(_TRACE_PATH, 'x', encoding='utf-8') if _TRACE_PATH else None
+if _TRACE_FILE is not None:
+    faulthandler.dump_traceback_later(5, repeat=True, file=_TRACE_FILE)
+
 import ast
 import hashlib
 import json
@@ -15,7 +23,7 @@ import unittest
 
 SAFE_BUILTINS = {'sum': sum, 'len': len, 'min': min, 'max': max, 'abs': abs,
                  'ValueError': ValueError, 'TypeError': TypeError, 'type': type,
-                 'int': int}
+                 'int': int, 'float': float, 'bool': bool, 'isinstance': isinstance}
 SAFE_CALLS = set(SAFE_BUILTINS) - {'int'}
 HUB = Path(__file__).resolve().parent
 FIXTURE_TESTS_ROOT = HUB / '.local' / 'tests'
@@ -27,15 +35,28 @@ CODING_TEST_CONFIG = {
     'test_sha256': '989f840b6db6d9f65823a7fa0725867b0abd8bc28554746d8b020bdc6c8a2af7',
     'modules': ['src.progress'],
 }
+CONVERSATIONAL_TEST_PROFILES = {
+    'stats_multi_module_v1': {
+        'test_file': 'tests/test_stats.py',
+        'test_sha256': '6a9f34017eb9574fc9f415368eb9c845bb4643f9633ccc9e98de7b7bc98d3181',
+        'modules': ['calculator', 'stats'],
+    },
+    'clamp_percent_v1': {
+        'test_file': 'tests/test_progress.py',
+        'test_sha256': '989f840b6db6d9f65823a7fa0725867b0abd8bc28554746d8b020bdc6c8a2af7',
+        'modules': ['src.progress'],
+    },
+}
 ALLOWED = (ast.Module, ast.FunctionDef, ast.arguments, ast.arg, ast.Return, ast.If,
            ast.Raise, ast.Expr, ast.Constant, ast.Name, ast.Load,
            ast.BinOp, ast.UnaryOp, ast.BoolOp, ast.Compare, ast.Call,
            ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv,
            ast.Mod, ast.USub, ast.UAdd, ast.Not, ast.And, ast.Or, ast.Eq, ast.NotEq,
-           ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Is, ast.IsNot)
+           ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Is, ast.IsNot, ast.Tuple)
 
 
-def validate_source(text, *, allow_local_assignment=False):
+def validate_source(text, *, allow_local_assignment=False, allow_bounded_iteration=False,
+                    approved_modules=()):
     tree = ast.parse(text)
     if len(list(ast.walk(tree))) > 1000:
         raise ValueError('Pure fixture source exceeds AST limit')
@@ -43,10 +64,19 @@ def validate_source(text, *, allow_local_assignment=False):
     if functions & set(SAFE_BUILTINS):
         raise ValueError('Pure fixtures cannot shadow approved builtins')
     parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    approved = frozenset(approved_modules)
+    imported_call_names = set()
     for node in tree.body:
-        if not isinstance(node, ast.FunctionDef) and not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)):
+        if (not isinstance(node, ast.FunctionDef)
+                and not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
+                         and isinstance(node.value.value, str))
+                and not (approved and isinstance(node, (ast.Import, ast.ImportFrom)))):
             raise ValueError('Only pure function definitions and a module docstring are allowed')
-    allowed = ALLOWED + (ast.Assign, ast.Store) if allow_local_assignment else ALLOWED
+    allowed = ALLOWED + (ast.Import, ast.ImportFrom, ast.alias)
+    if allow_local_assignment:
+        allowed += (ast.Assign, ast.Store)
+    if allow_bounded_iteration:
+        allowed += (ast.For, ast.Store)
     for node in ast.walk(tree):
         if not isinstance(node, allowed):
             raise ValueError('Unsupported pure-fixture syntax: ' + type(node).__name__)
@@ -54,8 +84,30 @@ def validate_source(text, *, allow_local_assignment=False):
                 len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name)
                 or node.targets[0].id in SAFE_BUILTINS):
             raise ValueError('Fixture assignment requires a single local non-builtin name')
+        if isinstance(node, ast.For):
+            function = parents.get(node)
+            if (not allow_bounded_iteration or not isinstance(node.target, ast.Name)
+                    or not isinstance(node.iter, ast.Name) or node.orelse
+                    or not isinstance(function, ast.FunctionDef)
+                    or node.iter.id not in {arg.arg for arg in function.args.args}
+                    or any(isinstance(child, ast.For) for statement in node.body
+                           for child in ast.walk(statement))):
+                raise ValueError('Loops must iterate directly over a function argument without nesting')
         if isinstance(node, ast.Name) and node.id.startswith('__'):
             raise ValueError('Dunder access rejected')
+        if isinstance(node, ast.Import):
+            if not approved or any(alias.name not in approved or alias.asname
+                                   and alias.asname.startswith('__') for alias in node.names):
+                raise ValueError('Only direct imports from the fixed pinned-profile modules are allowed')
+            imported_call_names.update(alias.asname or alias.name.split('.')[-1]
+                                        for alias in node.names)
+        if isinstance(node, ast.ImportFrom):
+            if (not approved or node.level != 0 or node.module not in approved
+                    or any(alias.name == '*' or alias.name.startswith('__')
+                           or alias.asname and alias.asname.startswith('__')
+                           for alias in node.names)):
+                raise ValueError('Relative, wildcard, and non-profile imports are rejected')
+            imported_call_names.update(alias.asname or alias.name for alias in node.names)
         if isinstance(node, ast.FunctionDef):
             if node.decorator_list or node.returns or any(a.annotation for a in node.args.args):
                 raise ValueError('Decorators/annotations are outside the pure-fixture contract')
@@ -71,7 +123,8 @@ def validate_source(text, *, allow_local_assignment=False):
                 if not is_doc and not is_error:
                     raise ValueError('String/container construction is outside the numeric fixture contract')
         if isinstance(node, ast.Call):
-            if not isinstance(node.func, ast.Name) or node.func.id not in SAFE_CALLS:
+            if (not isinstance(node.func, ast.Name)
+                    or node.func.id not in SAFE_CALLS | imported_call_names):
                 raise ValueError('Only explicitly safe builtins may be called; no recursion/import/IO')
     return tree
 
@@ -120,7 +173,7 @@ def _validate_coding_fixture_file(root, relative):
     return candidate
 
 
-def _expected_profile(root, config):
+def _expected_profile(root, config, *, conversational=False):
     """Return the pinned profile and mode allowed for a canonical fixture."""
     tests_root = FIXTURE_TESTS_ROOT.resolve()
     if root.name.casefold() == 'localagentsandbox':
@@ -143,6 +196,8 @@ def _expected_profile(root, config):
             and root.parent.name.startswith('milestone3-')
             and config.get('test_file') == 'tests/test_progress.py'):
         return False, True, CODING_TEST_CONFIG
+    if conversational and config in CONVERSATIONAL_TEST_PROFILES.values():
+        return False, config['test_file'] == 'tests/test_progress.py', config
     if root.parent.parent == tests_root:
         return False, False, {
             'test_file': 'tests/test_stats.py',
@@ -152,8 +207,8 @@ def _expected_profile(root, config):
     raise ValueError('Unapproved pinned test project')
 
 
-def _validated_profile(root, config):
-    reliability, coding, expected = _expected_profile(root, config)
+def _validated_profile(root, config, *, conversational=False):
+    reliability, coding, expected = _expected_profile(root, config, conversational=conversational)
     if config != expected:
         raise ValueError('Pinned test configuration differs from approved values')
     return reliability, coding
@@ -164,7 +219,7 @@ def _load_pinned_config(path):
     return json.loads(Path(path).read_text(encoding='utf-8-sig'))
 
 
-def main():
+def _run_pinned_tests():
     root = _canonical_root(sys.argv[1])
     config_argument = Path(sys.argv[2])
     if not config_argument.is_absolute() or '..' in config_argument.parts:
@@ -173,13 +228,23 @@ def main():
         raise ValueError('Pinned test configuration path contains a symlink or reparse point.')
     config_path = config_argument.resolve(strict=True)
     expected_config = root / '.local' / 'pinned-tests.json'
-
-    if config_path != expected_config:
+    app_profiles = HUB / '.local' / 'chat' / 'test-profiles'
+    try:
+        profile_root = app_profiles.resolve(strict=True)
+        expected_project_id = hashlib.sha256(str(root).casefold().encode()).hexdigest()
+        is_app_profile = (
+            config_path.parent.parent == profile_root
+            and config_path.parent.name == expected_project_id
+            and config_path.name in {name + '.json' for name in CONVERSATIONAL_TEST_PROFILES}
+        )
+    except (OSError, ValueError):
+        is_app_profile = False
+    if config_path != expected_config and not is_app_profile:
         raise ValueError('Unexpected pinned test configuration path')
 
     config = _load_pinned_config(config_path)
 
-    reliability, coding = _validated_profile(root, config)
+    reliability, coding = _validated_profile(root, config, conversational=is_app_profile)
 
     if reliability or coding:
         for relative in (config['test_file'], 'pricing.py', 'rules.py', 'test_cases.py'):
@@ -201,7 +266,13 @@ def main():
         test = _validate_coding_fixture_file(root, config['test_file'])
     if hashlib.sha256(test.read_bytes()).hexdigest() != config['test_sha256']:
         raise ValueError('Pinned test changed; refusing execution')
-    for name in config['modules']:
+    module_names = tuple(config['modules'])
+    if not module_names or len(set(module_names)) != len(module_names):
+        raise ValueError('Pinned test profile module inventory is invalid')
+    modules = {}
+    trees = {}
+    dependencies = {}
+    for name in module_names:
         source = root.joinpath(*name.split('.')).with_suffix('.py')
         if coding and source.exists():
             source = _validate_coding_fixture_file(root, source.relative_to(root))
@@ -209,21 +280,61 @@ def main():
             # Keep an approved-but-missing module importable so the pinned
             # unittest can report the missing implementation as an assertion
             # failure instead of aborting test discovery with ImportError.
-            sys.modules[name] = types.ModuleType(name)
+            modules[name] = types.ModuleType(name)
+            trees[name] = None
+            dependencies[name] = set()
             continue
-        tree = validate_source(source.read_text(encoding='utf-8-sig'),
-                               allow_local_assignment=reliability)
-        module = types.ModuleType(name)
-        namespace = {'__builtins__': dict(SAFE_BUILTINS), '__name__': name}
-        exec(compile(tree, str(source), 'exec'), namespace)
-        module.__dict__.update(namespace)
+        text = source.read_text(encoding='utf-8-sig')
+        multi_module_coding = config == CONVERSATIONAL_TEST_PROFILES['stats_multi_module_v1']
+        tree = validate_source(text,
+                               allow_local_assignment=reliability or multi_module_coding,
+                               allow_bounded_iteration=multi_module_coding,
+                               approved_modules=module_names if config.get('modules') else ())
+        trees[name] = (tree, str(source))
+        imports = set()
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                imports.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imports.add(node.module)
+        dependencies[name] = imports
+        modules[name] = types.ModuleType(name)
+    ordered = []
+    remaining = {name: set(dependencies[name]) for name in module_names}
+    while remaining:
+        ready = [name for name in module_names
+                 if name in remaining and not remaining[name] & set(remaining)]
+        if not ready:
+            raise ValueError('Pinned module import dependency cycle is unsupported')
+        for name in ready:
+            ordered.append(name)
+            remaining.pop(name)
+    for name in module_names:
+        sys.modules[name] = modules[name]
+    def approved_import(module_name, globals=None, locals=None, fromlist=(), level=0):
+        if level != 0 or module_name not in modules:
+            raise ImportError('Import is outside the approved pinned-profile module set')
+        if any(not isinstance(item, str) or item == '*' or item.startswith('__')
+               for item in fromlist):
+            raise ImportError('Import member is outside the approved pinned-profile contract')
+        return modules[module_name]
+    for name in ordered:
+        item = trees[name]
+        if item is None:
+            continue
+        tree, filename = item
+        builtins = dict(SAFE_BUILTINS)
+        builtins['__import__'] = approved_import
+        namespace = {'__builtins__': builtins, '__name__': name}
+        exec(compile(tree, filename, 'exec'), namespace)
+        modules[name].__dict__.update(namespace)
+        module = modules[name]
         if coding:
             package = types.ModuleType('src')
             package.__path__ = []
             sys.modules['src'] = package
             module.__package__ = 'src'
             package.progress = module
-        sys.modules[name] = module
     # Tests are authored/reviewed by the operator and pinned before model execution.
     # Models cannot edit this file or choose another test module through this tool.
     spec = types.ModuleType('approved_fixture_tests')
@@ -232,5 +343,18 @@ def main():
     return 0 if result.wasSuccessful() else 1
 
 
+def main():
+    return _run_pinned_tests()
+
+
 if __name__ == '__main__':
-    raise SystemExit(main())
+    try:
+        code = main()
+    finally:
+        if _TRACE_FILE is not None:
+            faulthandler.cancel_dump_traceback_later()
+            _TRACE_FILE.flush()
+            _TRACE_FILE.close()
+            if Path(_TRACE_PATH).stat().st_size == 0:
+                Path(_TRACE_PATH).unlink()
+    raise SystemExit(code)

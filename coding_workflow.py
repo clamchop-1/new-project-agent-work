@@ -42,7 +42,7 @@ TEST_COMMANDS = {'clamp_percent_v1': 'Broker.execute("tests") → python -B -I p
 TEST_COMMANDS['clamp_percent_v1'] = 'Broker.execute("tests") -> python -B -I pure_tests.py'
 TEST_COMMANDS['stats_multi_module_v1'] = TEST_COMMANDS['clamp_percent_v1']
 STATES = {'created', 'planning', 'generating', 'validating', 'reviewing', 'awaiting_approval', 'approved',
-          'applying', 'testing', 'completed', 'failed', 'rejected', 'cancelled',
+          'applying', 'testing', 'modified', 'completed', 'failed', 'rejected', 'cancelled',
           'timed_out', 'interrupted'}
 _TRANSITIONS = {
     'created': {'planning', 'generating', 'cancelled'},
@@ -51,7 +51,7 @@ _TRANSITIONS = {
     'validating': {'awaiting_approval', 'reviewing', 'generating', 'failed', 'cancelled'},
     'reviewing': {'awaiting_approval', 'failed', 'cancelled', 'timed_out'},
     'awaiting_approval': {'approved', 'rejected', 'cancelled'},
-    'approved': {'applying', 'rejected'}, 'applying': {'testing', 'interrupted'},
+    'approved': {'applying', 'rejected'}, 'applying': {'testing', 'modified', 'interrupted'},
     'testing': {'completed', 'failed', 'interrupted'},
 }
 
@@ -68,22 +68,35 @@ class CodingWorkflow:
     """A persisted state machine; callers supply only existing trusted host services."""
 
     def __init__(self, project: Project, task: str, allowed_paths: tuple[str, ...],
-                 *, test_profile: str = 'clamp_percent_v1', run_id: str | None = None):
+                 *, test_profile: str = 'clamp_percent_v1', run_id: str | None = None,
+                 conversational: bool = False, profile_path: Path | None = None,
+                 minimum_files: int = 1, allow_test_files: bool = False,
+                 reference_context: list[dict] | None = None):
         if not isinstance(project, Project) or not isinstance(task, str) or not task.strip() or len(task.encode()) > 12000:
             raise CodingWorkflowError('Workflow needs a validated project and bounded task text.')
         if test_profile not in TEST_PROFILES:
             raise CodingWorkflowError('Test profile is not predefined and trusted.')
-        expected_parent = (HUB / '.local' / 'tests').resolve()
-        if (project.root.name != 'repo' or project.root.parent.parent.resolve() != expected_parent
-                or not project.root.parent.name.startswith(('milestone3-', 'milestone4-'))):
-            raise CodingWorkflowError('Coding patch application is limited to a fresh Milestone 3/4 disposable repository.')
+        if conversational is not True:
+            expected_parent = (HUB / '.local' / 'tests').resolve()
+            if (project.root.name != 'repo' or project.root.parent.parent.resolve() != expected_parent
+                    or not project.root.parent.name.startswith(('milestone3-', 'milestone4-'))):
+                raise CodingWorkflowError('Coding patch application is limited to a fresh Milestone 3/4 disposable repository.')
         paths = tuple(allowed_paths)
-        if (not paths or len(paths) != len(set(paths)) or len(paths) > 8
+        if (not paths or len(paths) != len(set(paths)) or len(paths) > (3 if conversational else 8)
+                or len({path.casefold() for path in paths}) != len(paths)
                 or any(not isinstance(p, str) or not p or PurePosixPath(p).is_absolute()
                        or '\\' in p or any(x in ('', '.', '..') for x in p.split('/'))
                        for p in paths)):
             raise CodingWorkflowError('Authorized file allowlist is malformed.')
-        if project.state()['status'].strip():
+        if conversational:
+            for relative in paths:
+                target = project.path(relative)
+                if not target.is_file() or target.is_symlink() or target.stat().st_size > 8192:
+                    raise CodingWorkflowError('Conversational changes are limited to existing bounded regular files.')
+        if (type(minimum_files) is not int or not 1 <= minimum_files <= len(paths)
+                or type(allow_test_files) is not bool):
+            raise CodingWorkflowError('Change-set validation policy is malformed.')
+        if not conversational and project.state()['status'].strip():
             raise CodingWorkflowError('Disposable repository must start clean.')
         self.project, self.task, self.allowed_paths = project, task.strip(), paths
         self.test_profile = test_profile
@@ -96,7 +109,16 @@ class CodingWorkflow:
         self.run_dir.mkdir(parents=True)
         self.state_path = self.run_dir / 'state.json'
         self.baseline = project.state()
-        self.profile_path = project.root / '.local' / 'pinned-tests.json'
+        self.conversational = conversational
+        self.minimum_files = minimum_files
+        self.allow_test_files = allow_test_files
+        if reference_context is not None and (not isinstance(reference_context, list)
+                or len(reference_context) > 6
+                or any(not isinstance(item, dict)
+                       or set(item) != {'path', 'sha256', 'content'} for item in reference_context)):
+            raise CodingWorkflowError('Read-only dependency context is malformed.')
+        self.reference_context = reference_context or []
+        self.profile_path = Path(profile_path).resolve() if profile_path is not None else project.root / '.local' / 'pinned-tests.json'
         if not self.profile_path.is_file():
             raise CodingWorkflowError('Disposable repository lacks the predefined pinned test configuration.')
         try:
@@ -111,6 +133,9 @@ class CodingWorkflow:
                     'baseline': self.baseline, 'task_sha256': _hash(self.task.encode()),
                     'allowed_paths': list(paths), 'test_profile': test_profile,
                     'test_command': TEST_COMMANDS[test_profile], 'test_config_sha256': self.test_config_hash,
+                    'conversational': conversational, 'profile_path': str(self.profile_path),
+                    'minimum_files': minimum_files, 'allow_test_files': allow_test_files,
+                    'reference_context': self.reference_context,
                     'attempts': 0, 'approval': None, 'patch_sha256': None,
                     'expected_post_images': {}, 'created_at': time.time(),
                     'updated_at': time.time(), 'task': self.task, 'failure': None}
@@ -149,7 +174,11 @@ class CodingWorkflow:
         instance.run_id = run_id
         instance.run_dir = root
         instance.state_path = state_path
-        instance.profile_path = project.root / '.local' / 'pinned-tests.json'
+        instance.conversational = row.get('conversational') is True
+        instance.minimum_files = row.get('minimum_files', 1)
+        instance.allow_test_files = row.get('allow_test_files') is True
+        instance.reference_context = row.get('reference_context', [])
+        instance.profile_path = Path(row.get('profile_path', project.root / '.local' / 'pinned-tests.json')).resolve()
         instance.test_config_hash = row['test_config_sha256']
         instance.baseline = row['baseline']
         instance.row = row
@@ -455,7 +484,8 @@ class CodingWorkflow:
 
     def generate(self, provider, model: str, *, timeout: float = 120.0,
                  cancel_event=None, max_attempts: int = 3,
-                 provider_id: str = 'ollama', defer_approval: bool = False) -> dict:
+                 provider_id: str = 'ollama', defer_approval: bool = False,
+                 run_simulation_tests: bool = True) -> dict:
         if type(max_attempts) is not int or not 1 <= max_attempts <= 3:
             raise CodingWorkflowError('Proposal attempts must be between one and three.')
         if self.row['state'] not in {'created', 'planning'}:
@@ -487,6 +517,7 @@ class CodingWorkflow:
                 'authorized_files': list(self.allowed_paths),
                 'planned_files': sorted(planned_paths),
                 'source_context': self._proposal_file_context(),
+                'read_only_dependency_context': self.reference_context,
                 'required_response_schema': {
                     'files': [{'path': 'one planned authorized relative path',
                                'base_sha256': 'exact source_context sha256, or null for a missing file',
@@ -495,7 +526,8 @@ class CodingWorkflow:
                     'Return one JSON object only; no Markdown, unified diff, prose, commands, or tools.',
                     'For every changed file return its complete intended text and exactly echo its base_sha256, not a partial edit.',
                     'Return only files that need changes and only paths in planned_files.',
-                    'Do not modify tests, .local data, or test configuration.',
+                    'Do not modify paths shown in read_only_dependency_context.',
+                    'Do not modify .local data or the application-pinned test file/test configuration.',
                     'Use one consistent LF or CRLF convention in each content string; local code preserves the target newline convention and BOM.',
                     'Preserve whether the file ends with a final newline.',
                     'Do not invent or paraphrase omitted source; if necessary context is missing, explain via a schema failure.'
@@ -594,12 +626,25 @@ class CodingWorkflow:
                     raw, root=self.project.root, allowed_paths=set(self.allowed_paths),
                     planned_paths=planned_paths,
                     protected_paths={TEST_PROFILE_CONFIGS[self.test_profile]['test_file'],
-                                     '.local/pinned-tests.json'})
+                                     '.local/pinned-tests.json'},
+                    max_files=3 if self.conversational else 8,
+                    allow_test_files=self.allow_test_files)
+                if len(validated.files) < self.minimum_files:
+                    raise PatchValidationError(
+                        f'Change set is incomplete: expected at least {self.minimum_files} coordinated files.')
+                for item in validated.files:
+                    if item.path.casefold().endswith('.py'):
+                        import ast
+                        try:
+                            ast.parse(item.new_bytes.decode('utf-8-sig'), filename=item.path)
+                        except (SyntaxError, UnicodeError) as exc:
+                            raise PatchValidationError(
+                                f'Python syntax validation failed for {item.path}: {exc}') from exc
                 self.row['patch_sha256'] = validated.sha256
                 self.row['expected_post_images'] = {f.path: _hash(f.new_bytes) for f in validated.files}
                 atomic_write(self.run_dir / f'proposal-attempt-{attempt}.patch', validated.raw)
                 self._save()
-                self._simulate(validated.raw)
+                self._simulate(validated.raw, run_tests=run_simulation_tests)
             except Exception as exc:
                 error_code = ('proposal_truncated' if 'truncated' in str(exc).casefold()
                               else 'strict_proposal_validation_failed')
@@ -627,14 +672,20 @@ class CodingWorkflow:
             self.row['files'] = [f.path for f in validated.files]
             validation_report = {'response_structure': 'passed',
                 'strict_unified_diff': 'passed', 'hunk_counts_and_consumption': 'passed',
-                'authorized_paths': 'passed', 'git_apply_check_simulation': 'passed',
+                'authorized_paths': 'passed', 'complete_change_set': 'passed',
+                'case_insensitive_collisions': 'rejected',
+                'python_syntax': ('passed' if any(item.path.casefold().endswith('.py')
+                                                  for item in validated.files) else 'not_applicable'),
+                'semantic_correctness': 'not_established_by_syntax_validation',
+                'git_apply_check_simulation': 'passed',
                 'simulated_post_images': 'byte_for_byte_match',
                 'patch_sha256': validated.sha256}
             self.row['validation_report'] = validation_report
             simulation_tests = self.row.get('simulation_test_result', {})
-            if simulation_tests.get('exit_code') != 0:
+            if run_simulation_tests and simulation_tests.get('exit_code') != 0:
                 raise CodingWorkflowError('Isolated pinned acceptance tests did not pass.')
-            validation_report['fixed_acceptance_tests'] = 'passed'
+            validation_report['fixed_acceptance_tests'] = ('passed' if run_simulation_tests
+                else 'pending separate Windows Broker approval')
             validation_report['test_count'] = simulation_tests.get('test_count')
             self.row['generation_seconds'] = time.monotonic() - began
             self._transition('reviewing' if defer_approval else 'awaiting_approval')
@@ -651,8 +702,18 @@ class CodingWorkflow:
         self._save()
         raise CodingWorkflowError('Proposal attempts exhausted.')
 
-    def _simulate(self, raw: bytes):
+    def _simulate(self, raw: bytes, *, run_tests: bool = True):
         self._verify_baseline()
+        if not run_tests:
+            checked = subprocess.run(['git', '-c', 'core.autocrlf=false', '-C', str(self.project.root),
+                                      'apply', '--check'], input=raw, capture_output=True,
+                                     timeout=20, check=False)
+            if checked.returncode:
+                raise CodingWorkflowError('Git apply --check rejected the validated proposal against current project bytes.')
+            self.row['simulation_test_result'] = {'exit_code': None, 'test_count': None,
+                'failures': None, 'errors': None, 'status': 'deferred_until_separate_approval'}
+            self._save()
+            return
         tests_root = HUB / '.local' / 'tests'
         tests_root.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='milestone3-sim-', dir=tests_root) as temp:
@@ -714,7 +775,9 @@ class CodingWorkflow:
                 test_command: str) -> dict:
         if self.row['state'] != 'awaiting_approval':
             raise CodingWorkflowError('Workflow is not awaiting approval.')
-        if self.row.get('simulation_test_result', {}).get('exit_code') != 0:
+        if (self.row.get('simulation_test_result', {}).get('exit_code') != 0
+                and not (self.conversational and self.row.get('simulation_test_result', {}).get('status')
+                         == 'deferred_until_separate_approval')):
             raise CodingWorkflowError('Proposal has not passed the predefined pre-approval simulation tests.')
         if self.row.get('multi_agent') and (
                 not isinstance(self.row.get('planner_output'), dict)
@@ -787,19 +850,68 @@ class CodingWorkflow:
             self.row['state'] = 'applying'; self._save()  # Consume durably before the first write.
             return self._apply_locked(recovery, approval, parsed)
 
-    def _apply_locked(self, recovery, approval, parsed):
+    def apply_only(self, *, operator: str):
+        """Apply one conversationally approved patch; tests require another approval."""
+        if len(self.allowed_paths) != 1:
+            raise CodingWorkflowError('Single-file conversational approval is required.')
+        return self._apply_change_set(operator=operator, maximum_files=1)
+
+    def apply_change_set(self, *, operator: str, cancel_event=None):
+        """Apply a fully approved change set of at most three existing files."""
+        return self._apply_change_set(operator=operator, maximum_files=3,
+                                     cancel_event=cancel_event)
+
+    def _apply_change_set(self, *, operator: str, maximum_files: int, cancel_event=None):
+        if (not self.conversational or len(self.allowed_paths) > 3
+                or self.row['state'] != 'approved' or not isinstance(self.row.get('approval'), dict)):
+            raise CodingWorkflowError('A bounded conversational change-set approval is required.')
+        approval = self.row['approval']
+        if approval['used'] or approval['operator'] != operator:
+            raise CodingWorkflowError('Approval is reused or operator identity mismatches.')
+        binding = {key: value for key, value in approval.items() if key != 'binding_sha256'}
+        if approval.get('binding_sha256') != digest(encoded(binding)):
+            raise CodingWorkflowError('Approval binding was modified after operator approval.')
+        self._verify_baseline()
+        raw = (self.run_dir / 'approved.patch').read_bytes()
+        if _hash(raw) != approval['patch_sha256'] or _hash(raw) != self.row['patch_sha256']:
+            raise CodingWorkflowError('Approved patch bytes changed.')
+        parsed = validate_unified_diff(raw, root=self.project.root, allowed_paths=set(approval['allowed_paths']))
+        if (not 1 <= len(parsed.files) <= maximum_files
+                or len({item.path.casefold() for item in parsed.files}) != len(parsed.files)
+                or {f.path: _hash(f.new_bytes) for f in parsed.files} != approval['expected_post_images']):
+            raise CodingWorkflowError('Approved patch no longer matches the complete bounded post-image set.')
+        if file_hash(self.profile_path) != approval['test_config_sha256']:
+            raise CodingWorkflowError('Pinned test configuration changed after approval.')
+        recovery = RecoveryStore(self.project)
+        with recovery.locked():
+            recovery.assert_clear()
+            self._verify_baseline()
+            approval['used'] = True
+            approval['consumed_at'] = time.time()
+            self.row['state'] = 'applying'; self._save()
+            return self._apply_locked(recovery, approval, parsed, run_tests=False,
+                                      cancel_event=cancel_event)
+
+    def _apply_locked(self, recovery, approval, parsed, *, run_tests=True, cancel_event=None):
         output = (self.project.root / '.local' / 'orchestration' / 'runs'
                   / self.run_id / 'outputs' / 'coding' / 'broker')
         output.mkdir(parents=True)
         if not output.resolve().is_relative_to(self.project.root) or output.is_symlink():
             raise CodingWorkflowError('Broker evidence path is linked or outside the disposable repository.')
-        journal = recovery.start(output, tuple(approval['allowed_paths']), None, (), (),
-                                 self.profile_path, (), None)
-        broker = Broker(self.project, output, writes=tuple(approval['allowed_paths']),
-                         test_config=self.profile_path)
+        write_paths = tuple(approval['expected_post_images'])
+        journal = recovery.start(output, write_paths, None, (), (),
+                                 self.profile_path, (), None, run_id=self.run_id,
+                                 approved_post_images=approval['expected_post_images'])
+        broker = Broker(self.project, output, writes=write_paths,
+                         test_config=self.profile_path if run_tests else None,
+                         max_source_mutations=(len(write_paths)
+                                               if self.conversational and not run_tests else None),
+                         authorized_dirty_baseline=self.baseline if self.baseline.get('status') else None)
         broker.journal = journal
         try:
             for item in parsed.files:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise CodingWorkflowError('Change-set application cancelled; inspect recovery evidence before continuing.')
                 current = self.project.path(item.path)
                 before = file_hash(current) if current.is_file() else None
                 broker.write(item.path, item.new_bytes.decode('utf-8'), expected=before)
@@ -808,6 +920,14 @@ class CodingWorkflow:
                 if not target.is_file() or file_hash(target) != expected:
                     self.row['state'] = 'interrupted'; self.row['failure'] = 'post-image mismatch'; self._save()
                     raise CodingWorkflowError('Applied bytes differ from approved post-image; no retry attempted.')
+            if not run_tests:
+                journal.close('complete')
+                self._transition('modified')
+                write_receipt = journal.row.get('operations', [])
+                return {'status': 'modified', 'project_id': self.project.identity,
+                        'patch_sha256': self.row['patch_sha256'],
+                        'expected_post_images': approval['expected_post_images'],
+                        'write_receipts': write_receipt, 'recovery_status': journal.row.get('status')}
             self._transition('testing')
             result = broker.execute('tests')
             self.row['test_result'] = result

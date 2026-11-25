@@ -189,6 +189,49 @@ async function queryVisible(send, prompt, timeout = 180000) {
     stream_snapshot_count: samples.length, distinct_progressive_lengths: [...new Set(increases)].length,
     completion_observed: true};
 }
+async function currentOperation(send, conversationId) {
+  const row = await evaluate(send, `await api('/api/chat/conversations/'+${JSON.stringify(conversationId)})`);
+  const message = row.messages.at(-1);
+  if (message?.role !== 'assistant' || message.operation?.state !== 'awaiting_approval')
+    throw new Error('Chat did not persist a trusted approval control for the proposal.');
+  return message.operation;
+}
+async function decideLatestOperation(send, decision) {
+  const index = decision === 'approve' ? 0 : 1;
+  await waitFor(send, `(()=>{const p=[...document.querySelectorAll('.operation-approval')].at(-1);const b=p?.querySelectorAll('button');return !!b&&!!b[${index}]&&!b[${index}].disabled})()`, 15000, 'trusted operation control');
+  const clicked = await evaluate(send, `(()=>{const panels=[...document.querySelectorAll('.operation-approval')];const buttons=panels.at(-1)?.querySelectorAll('button');if(!buttons||!buttons[${index}]||buttons[${index}].disabled)return false;buttons[${index}].click();return true})()`);
+  if (!clicked) throw new Error('Trusted application approval control was unavailable.');
+}
+async function waitOperationState(send, conversationId, operationId, accepted, timeout=180000) {
+  const expression = `await api('/api/chat/conversations/'+${JSON.stringify(conversationId)}+'/operations/'+${JSON.stringify(operationId)})`;
+  const end=Date.now()+timeout;
+  const snapshots=[];
+  let lastSnapshotAt=0, childPid=null;
+  while(Date.now()<end){
+    const row=await evaluate(send,expression);
+    if(accepted.includes(row.state)){
+      result.checks.broker_child_process_snapshots={operation_id:operationId,child_pid:childPid,snapshots};
+      return row;
+    }
+    try {
+      const journal=JSON.parse(await readFile(path.join(state,'execution-recovery',operationId+'.json'),'utf8'));
+      const pending=journal.operations?.find(item=>item.kind==='command'&&item.state==='executing');
+      if(Number.isSafeInteger(pending?.child_pid))childPid=pending.child_pid;
+      if(childPid&&snapshots.length<3&&Date.now()-lastSnapshotAt>=3000){
+        lastSnapshotAt=Date.now();
+        const query=`$p=Get-CimInstance Win32_Process -Filter 'ProcessId = ${childPid}'; if($p){$g=Get-Process -Id ${childPid} -ErrorAction SilentlyContinue; $threads=@($g.Threads|ForEach-Object{$state=$_.ThreadState.ToString();$wait=$null;if($state -eq 'Wait'){try{$wait=$_.WaitReason.ToString()}catch{}};[PSCustomObject]@{Id=$_.Id;State=$state;WaitReason=$wait;CpuSeconds=$_.TotalProcessorTime.TotalSeconds}});[PSCustomObject]@{ProcessId=$p.ProcessId;ParentProcessId=$p.ParentProcessId;ExecutablePath=$p.ExecutablePath;CommandLine=$p.CommandLine;CpuSeconds=$g.CPU;WorkingSetBytes=$g.WorkingSet64;Threads=$threads;ObservedAt=(Get-Date).ToUniversalTime().ToString('o')} | ConvertTo-Json -Compress -Depth 5}else{'null'}`;
+        const raw=execFileSync('C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
+          ['-NoLogo','-NoProfile','-NonInteractive','-Command',query],{encoding:'utf8',timeout:8000}).trim();
+        snapshots.push(raw==='null'?null:JSON.parse(raw));
+      }
+    } catch(error) {
+      if(childPid&&snapshots.length<3)snapshots.push({snapshot_error:String(error).slice(0,160)});
+    }
+    await nap(250);
+  }
+  result.checks.broker_child_process_snapshots={operation_id:operationId,child_pid:childPid,snapshots};
+  throw new Error('Timed out waiting for Broker operation state '+accepted.join('/'));
+}
 async function directReadAcceptance(send, server, projectName, conversationId, relativePath, expectedText) {
   const response=await queryVisible(send,`Read file ${relativePath}`,180000);
   const pattern=new RegExp(projectName.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+':'
@@ -246,9 +289,77 @@ try {
   result.checks.conversational_project_list_and_selection={
     listed:registeredList.content.includes('fixture-alpha'), selected:openedConversation.project_id===alpha.project_id,
     open_action_completed:openReply.completion_observed};
-  const alphaConversation = await openNewProjectConversation(send, alpha.project_id);
   const mac = result.server.models.find(x=>x.host_id==='mac_studio'&&x.model_id==='qwen3-coder:30b');
+  const windowsEarly=result.server.models.find(x=>x.host_id==='windows'&&x.model_id==='qwen3:8b');
+  const windowsEarlyOption=await chooseModel(send,windowsEarly.model_key);
+  const windowsSmoke=await queryVisible(send,'Reply with exactly: WINDOWS_CODE_ACCEPTANCE_OK.',120000);
+  if(!windowsSmoke.content.includes('WINDOWS_CODE_ACCEPTANCE_OK'))
+    throw new Error('Live Windows model did not return the authenticated browser smoke response.');
+  result.live_models.push({host:windowsEarly.host_id,model:windowsEarly.model_id,
+    selection:windowsEarlyOption,operation:'authenticated_windows_inference',...windowsSmoke});
+  const alphaConversation = await openNewProjectConversation(send, alpha.project_id);
   const macOption = await chooseModel(send, mac.model_key);
+  await chooseModel(send,mac.model_key);
+  const calculatorPath=path.join(result.server.alpha,'calculator.py');
+  const statsPath=path.join(result.server.alpha,'stats.py');
+  const calculatorBefore=await readFile(calculatorPath,'utf8');
+  const statsBefore=await readFile(statsPath,'utf8');
+  const unrelatedBefore=await readFile(path.join(result.server.alpha,'pipeline.py'),'utf8');
+  const multiRequest='Update calculator.py and stats.py together. Add a reusable validate_values(values) helper in stats.py that rejects empty input and non-numeric values with ValueError, while preserving clamp. Update calculator.average in calculator.py to import and use that helper before computing the correct average. Change exactly those two files and keep the existing pinned tests passing.';
+  const deniedProposal=await queryVisible(send,
+    multiRequest,180000);
+  const deniedOp=await currentOperation(send,alphaConversation);
+  if(!deniedProposal.content.includes('diff --git a/calculator.py')||!deniedProposal.content.includes('diff --git a/stats.py'))
+    throw new Error('The displayed coding proposal did not include both actual source diffs.');
+  await decideLatestOperation(send,'deny');
+  const deniedResult=await waitOperationState(send,alphaConversation,deniedOp.operation_id,['denied']);
+  const deniedNoWrite=await readFile(calculatorPath,'utf8')===calculatorBefore
+    &&await readFile(statsPath,'utf8')===statsBefore;
+  if(!deniedNoWrite)
+    throw new Error('Deny changed the disposable project source.');
+  const approvedProposal=await queryVisible(send,
+    multiRequest,180000);
+  const approvedOp=await currentOperation(send,alphaConversation);
+  if(!approvedProposal.content.includes('diff --git a/calculator.py')||!approvedProposal.content.includes('diff --git a/stats.py'))
+    throw new Error('The approved proposal did not display both validated source diffs.');
+  await decideLatestOperation(send,'approve');
+  const modified=await waitOperationState(send,alphaConversation,approvedOp.operation_id,['modified','failed','interrupted']);
+  if(modified.state!=='modified'||modified.result?.receipt_verified!==true)
+    throw new Error('Windows Broker did not verify the approved multi-file modification: '+JSON.stringify(modified.result));
+  const calculatorAfter=await readFile(calculatorPath,'utf8');
+  const statsAfter=await readFile(statsPath,'utf8');
+  const expectedHashes=modified.result.post_image_sha256_by_path||{};
+  for(const [relative, absolute, actual] of [['calculator.py',calculatorPath,calculatorAfter],['stats.py',statsPath,statsAfter]]){
+    const expected=expectedHashes[relative];
+    if(!expected||expected!==crypto.createHash('sha256').update(actual).digest('hex'))
+      throw new Error('Applied '+relative+' does not match its independently verified Broker post-image.');
+  }
+  if(calculatorAfter===calculatorBefore||statsAfter===statsBefore||await readFile(path.join(result.server.alpha,'pipeline.py'),'utf8')!==unrelatedBefore)
+    throw new Error('The approved multi-file change did not modify exactly the authorized sources.');
+  const testProposal=await queryVisible(send,'Run the approved tests for this project.',180000);
+  const testOp=await currentOperation(send,alphaConversation);
+  if(!testProposal.content.includes('Windows Broker'))
+    throw new Error('Pinned tests were not presented as a separate Windows Broker approval.');
+  await decideLatestOperation(send,'approve');
+  const tested=await waitOperationState(send,alphaConversation,testOp.operation_id,['passed','failed','interrupted','timed_out']);
+  if(tested.state!=='passed'||tested.result?.receipt_verified!==true||tested.result?.test_count!==3
+      ||tested.result?.passed_count!==3||tested.result?.learning_candidate?.status!=='candidate')
+    throw new Error('Separately approved pinned tests or candidate learning did not verify: '+JSON.stringify(tested.result));
+  result.checks.conversational_code_modification={
+    rejected_without_source_change:deniedResult.state==='denied'&&deniedNoWrite,
+    approved_patch_operation:approvedOp.operation_id,
+    modified_state:modified.state,paths:['calculator.py','stats.py'],
+    post_image_sha256_by_path:expectedHashes,
+    write_receipt:modified.result.write_receipt,
+    separate_test_operation:testOp.operation_id,
+    test_status:tested.state,exit_code:tested.result.exit_code,
+    test_count:tested.result.test_count,passed_count:tested.result.passed_count,
+    test_receipt:tested.result.receipt_reference,
+    learning_candidate:tested.result.learning_candidate};
+  result.live_models.push({host:mac.host_id,model:mac.model_id,operation:'conversational_coding_proposal',
+    denied_proposal_latency_ms:deniedProposal.first_visible_latency_ms,
+    approved_proposal_latency_ms:approvedProposal.first_visible_latency_ms,
+    proposal_completed:approvedProposal.completion_observed});
   const first = await queryVisible(send,
     'Using only this registered project, explain Aurora Audio Toolkit and its processing order. What does normalize_capture return, and how does run_pipeline use that value? Keep the answer concise and do not guess.', 180000);
   result.live_models.push({host:mac.host_id,model:mac.model_id,selection:macOption,...first});
@@ -393,6 +504,13 @@ try {
     beta_conversation_exists:persistedConv.conversations.some(c=>c.id===betaConversation)};
   if(!result.checks.restart_persistence.alpha_conversation_exists||!result.checks.restart_persistence.beta_conversation_exists)
     throw new Error('Project conversations did not persist across isolated app restart.');
+  const codingEvidence=result.checks.conversational_code_modification;
+  const restoredPatch=await evaluate(send,`await api('/api/chat/conversations/'+${JSON.stringify(alphaConversation)}+'/operations/'+${JSON.stringify(codingEvidence.approved_patch_operation)})`);
+  const restoredTests=await evaluate(send,`await api('/api/chat/conversations/'+${JSON.stringify(alphaConversation)}+'/operations/'+${JSON.stringify(codingEvidence.separate_test_operation)})`);
+  if(restoredPatch.state!=='modified'||restoredTests.state!=='passed'
+      ||restoredTests.result?.learning_candidate?.status!=='candidate')
+    throw new Error('Conversational patch/test receipts or candidate evidence did not persist across restart.');
+  result.checks.code_patch_test_and_learning_persist_after_restart=true;
 
   await click(send,'#projectsButton');await waitFor(send,`document.querySelector('#projectsDialog').open`,10000,'Projects dialog after restart');
   await waitFor(send,`document.querySelector('#projectRows').innerText.includes('fixture-alpha')&&document.querySelector('#projectRows').innerText.includes('fixture-beta')`,15000,'registered projects reloaded after restart');

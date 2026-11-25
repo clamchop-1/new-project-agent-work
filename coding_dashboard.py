@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, urlsplit
 from agent_core import AgentError, Project, file_hash
 from coding_workflow import CodingWorkflow
 from coding_status import status_projection
+from inference_provider import ProviderFailure
 
 
 MAX_BODY = 24_576
@@ -26,6 +27,28 @@ AUTHORIZED_DASHBOARD_MODELS = {'qwen3-coder:30b', 'qwen3:8b'}
 
 class DashboardError(AgentError):
     pass
+
+
+_CHAT_FAILURE_MESSAGES = {
+    'timeout': 'The selected model timed out before completing a response. Check the model host load and try again.',
+    'tunnel_timeout': 'The Mac inference tunnel timed out before the model responded.',
+    'tunnel_unavailable': 'The Mac inference tunnel is unavailable. Check its configured connection.',
+    'service_unavailable': 'The selected inference service is unavailable.',
+    'unavailable': 'The selected inference service is unavailable.',
+    'model_missing': 'The selected model is no longer available on its authorized host.',
+    'connection_lost': 'The inference connection closed before the response completed. Any received text was saved.',
+    'partial_response': 'The inference provider returned an incomplete response. Any received text was saved.',
+    'malformed_response': 'The inference provider returned a response the application could not validate.',
+    'response_too_large': 'The response exceeded the application output limit. Any received text was saved.',
+}
+
+
+def _chat_failure_message(error):
+    if isinstance(error, ProviderFailure):
+        return _CHAT_FAILURE_MESSAGES.get(error.code,
+            'The selected model could not complete this response. Check the provider connection and try again.')
+    return ('The local model could not complete this response. '
+            'Check the dashboard connection and try again.')
 
 
 class CodingDashboard:
@@ -79,10 +102,17 @@ class CodingDashboard:
         self.chat_default_model = chat_default_model
         self.knowledge_store = knowledge_store
         self.project_intelligence = project_intelligence
+        self.conversational_execution = None
+        if chat_store is not None and project_intelligence is not None:
+            from conversational_execution import ConversationalExecution
+            self.conversational_execution = ConversationalExecution(
+                project_intelligence.application, project_intelligence, chat_store)
         from conversational_capabilities import CapabilityDispatcher
         self.capability_dispatcher = (CapabilityDispatcher(project_intelligence, chat_store)
                                       if project_intelligence is not None and chat_store is not None
                                       else None)
+        if self.conversational_execution is not None:
+            self.conversational_execution.audit_dispatcher = self.capability_dispatcher
         if research_service is None and chat_store is not None:
             from research_service import ResearchAuthorizationService
             audit_root = (knowledge_store.index.directory if knowledge_store is not None
@@ -98,6 +128,7 @@ class CodingDashboard:
         self._active: str | None = None
         self._cancel: dict[str, threading.Event] = {}
         self._chat_cancel: dict[str, threading.Event] = {}
+        self._operation_cancel: dict[str, threading.Event] = {}
         self._known: dict[str, object] = {}
         self._load_existing()
         self.httpd = None
@@ -325,6 +356,15 @@ class CodingDashboard:
                         self._send(503, {'error': 'Knowledge status is unavailable: ' + str(exc)[:160]})
                     return
                 chat_match = re.fullmatch(r'/api/chat/conversations/([a-f0-9]{32})', route)
+                operation_status = re.fullmatch(
+                    r'/api/chat/conversations/([a-f0-9]{32})/operations/([a-f0-9]{32})', route)
+                if operation_status and app.conversational_execution is not None:
+                    try:
+                        self._send(200, app.conversational_execution.inspect(
+                            operation_status.group(1), operation_status.group(2)))
+                    except (AgentError, OSError, ValueError, TypeError) as exc:
+                        self._send(404, {'error': str(exc)[:180]})
+                    return
                 stream_status_match = re.fullmatch(
                     r'/api/chat/conversations/([a-f0-9]{32})/status', route)
                 if stream_status_match and app.chat_store is not None:
@@ -337,6 +377,15 @@ class CodingDashboard:
                         active=conversation_id in app._chat_cancel
                     stream=next((message for message in reversed(row['messages'])
                         if message.get('stream_status')=='generating'),None)
+                    if stream is not None and not active:
+                        # A persisted generating marker without an owned live
+                        # request can only be a response interrupted by restart.
+                        # Close it durably while preserving any saved partial text.
+                        try:
+                            app.chat_store.update_assistant_stream(
+                                conversation_id, stream['stream_id'], stream['content'], status='failed')
+                        except (OSError, ValueError, TypeError):
+                            self._send(503, {'error':'Interrupted response could not be recovered.'});return
                     state=('generating' if active else 'interrupted') if stream else 'idle'
                     self._send(200,{'conversation_id':conversation_id,'active':active,
                         'state':state,'stream_id':stream.get('stream_id') if stream else None})
@@ -428,6 +477,58 @@ class CodingDashboard:
                     return
                 research_decision_match = re.fullmatch(
                     r'/api/chat/conversations/([a-f0-9]{32})/research-decision', route)
+                operation_reconcile = re.fullmatch(
+                    r'/api/chat/conversations/([a-f0-9]{32})/operations/([a-f0-9]{32})/reconcile', route)
+                if operation_reconcile and app.conversational_execution is not None:
+                    try:
+                        length = int(self.headers.get('Content-Length', '0'))
+                        if length < 1 or length > 1024:
+                            raise ValueError('Recovery decision is invalid.')
+                        data = json.loads(self.rfile.read(length))
+                        if (not isinstance(data, dict) or set(data) != {'action', 'review_sha256'}
+                                or not all(isinstance(value, str) for value in data.values())):
+                            raise ValueError('Choose a verified recovery action.')
+                        self._send(200, app.conversational_execution.reconcile_patch(
+                            operation_reconcile.group(1), operation_reconcile.group(2),
+                            data['action'], data['review_sha256']))
+                    except (AgentError, OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                        self._send(409, {'error': str(exc)[:240]})
+                    return
+                operation_decision = re.fullmatch(
+                    r'/api/chat/conversations/([a-f0-9]{32})/operations/([a-f0-9]{32})/decision', route)
+                if operation_decision and app.conversational_execution is not None:
+                    try:
+                        length = int(self.headers.get('Content-Length', '0'))
+                        if length < 1 or length > 256:
+                            raise ValueError('Operation decision is invalid.')
+                        data = json.loads(self.rfile.read(length))
+                        if not isinstance(data, dict) or set(data) != {'decision'}:
+                            raise ValueError('Choose approve or deny.')
+                        cancel_event = threading.Event()
+                        with app._lock:
+                            app._operation_cancel[operation_decision.group(2)] = (
+                                operation_decision.group(1), cancel_event)
+                        result = app.conversational_execution.decide(
+                            operation_decision.group(1), operation_decision.group(2),
+                            data['decision'], cancel_event=cancel_event)
+                        self._send(200, result)
+                    except (AgentError, OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                        self._send(400, {'error': str(exc)[:240]})
+                    finally:
+                        with app._lock:
+                            app._operation_cancel.pop(operation_decision.group(2), None)
+                    return
+                operation_cancel = re.fullmatch(
+                    r'/api/chat/conversations/([a-f0-9]{32})/operations/([a-f0-9]{32})/cancel', route)
+                if operation_cancel:
+                    with app._lock:
+                        active_operation = app._operation_cancel.get(operation_cancel.group(2))
+                        if active_operation is None or active_operation[0] != operation_cancel.group(1):
+                            self._send(409, {'error': 'No approved operation is currently running.'})
+                            return
+                        active_operation[1].set()
+                    self._send(202, {'cancellation_requested': True})
+                    return
                 if research_decision_match and app.chat_store is not None and app.research_service is not None:
                     try:
                         length = int(self.headers.get('Content-Length', '0'))
@@ -650,7 +751,29 @@ class CodingDashboard:
                     capability_proposal = (app.capability_dispatcher.propose(
                         user_text, project_id=row.get('project_id'))
                         if app.capability_dispatcher is not None else None)
+                    operation_proposal = None
+                    coding_intent = None
+                    operation_result = None
+                    if app.conversational_execution is not None:
+                        intent = app.conversational_execution.intent(
+                            user_text, row.get('project_id') is not None)
+                        if intent and intent['kind'] == 'register':
+                            operation_proposal = app.conversational_execution.propose_registration(
+                                conversation_id, intent['root'])
+                        elif intent and intent['kind'] == 'tests':
+                            if row.get('project_id') is None:
+                                raise ValueError('Select a registered project before proposing its pinned tests.')
+                            operation_proposal = app.conversational_execution.propose_tests(
+                                conversation_id, row['project_id'], intent['profile'])
+                        elif intent and intent['kind'] in {'patch', 'multi_patch'}:
+                            coding_intent = intent
+                        elif intent and intent['kind'] == 'previous':
+                            operation_result = {'capability_id': 'tests.previous',
+                                'result': app.conversational_execution.previous_run(
+                                    conversation_id, row['project_id'])}
                     capability_result = None
+                    if operation_result is not None:
+                        capability_result = operation_result
                     if (capability_proposal is not None
                             and capability_proposal.capability_id == 'project.select'):
                         capability_result = app.capability_dispatcher.execute(
@@ -719,6 +842,49 @@ class CodingDashboard:
 
                 try:
                     write_event({'type': 'status', 'text': 'Thinking…'})
+                    if coding_intent is not None:
+                        write_event({'type': 'status', 'text': 'Inspecting the authorized source files and dependencies…'})
+                        write_event({'type': 'status', 'text': 'Validating the complete change set…'})
+                        operation_proposal = app.conversational_execution.propose_patch(
+                            conversation_id, row['project_id'],
+                            coding_intent.get('paths', coding_intent.get('path')),
+                            coding_intent['task'], selected_model, app.chat_runner, cancel_event)
+                    if operation_proposal is not None:
+                        target = operation_proposal
+                        if target.get('kind') in {'patch', 'multi_patch'}:
+                            files = target.get('files') or [target['path']]
+                            file_list = ', '.join(files)
+                            noun = 'coordinated change set' if target['kind'] == 'multi_patch' else 'change'
+                            message = (f"Proposed {noun} for {target['display_name']} across {file_list}. "
+                                f"Request: {target['task']}\n\nValidation: strict patch validation passed; "
+                                "the project fingerprint, source hashes, complete authorized file set, and every post-image "
+                                "are bound to this approval. Python syntax checks passed where applicable; syntax checks "
+                                "do not establish semantic correctness. Review every file diff below. "
+                                f"Proposed test profile: {target['profile']} on the Windows Broker in "
+                                f"{target['working_directory']}. Approval writes only these existing files and records "
+                                "per-file Broker recovery evidence; "
+                                "tests require separate approval.\n\n```diff\n" + target['diff'] + "\n```\n\n"
+                                f"Patch SHA-256: {target['patch_sha256']}\nChange-set SHA-256: {target['change_set_sha256']}\n"
+                                "Approve to apply this exact complete change set, or deny to leave source unchanged.")
+                        elif 'profile' in target:
+                            message = (f"Approve running {target['profile']} for {target['display_name']} "
+                                f"on the {target['host']} in {target['working_directory']}? "
+                                f"The fixed test file is {target['test_file']}. {target['side_effects']}. "
+                                f"Limits: {target['limits']}. This approval expires in 5 minutes and can be used once.")
+                        else:
+                            message = (f"Approve registering and indexing {target['display_name']} at "
+                                f"{target['root']} with {target['scope']} access? This approval expires "
+                                "in 5 minutes and can be used once.")
+                        app.chat_store.update_assistant_stream(
+                            conversation_id, stream_id, message, status='complete',
+                            operation={'operation_id': target['operation_id'],
+                                       'kind': target['kind'], 'state': 'awaiting_approval'})
+                        write_event({'type': 'operation_proposal', 'proposal': target,
+                                     'message': message, 'conversation_id': conversation_id})
+                        write_event({'type': 'token', 'text': message})
+                        write_event({'type': 'done', 'cancelled': False,
+                                     'conversation_id': conversation_id})
+                        return
                     if capability_proposal is not None:
                         action_label = {
                             'projects.list': 'Listing registered projects…',
@@ -929,7 +1095,7 @@ class CodingDashboard:
                                 status='cancelled')
                         except (AgentError,OSError,ValueError):
                             pass
-                except Exception:
+                except Exception as exc:
                     try:
                         if cancel_event.is_set():
                             partial = ''.join(assistant_text)
@@ -938,8 +1104,7 @@ class CodingDashboard:
                         else:
                             app.chat_store.update_assistant_stream(conversation_id,stream_id,
                                 ''.join(assistant_text),status='failed')
-                            write_event({'type': 'error', 'message':
-                                'The local model could not complete this response. Check the dashboard connection and try again.'})
+                            write_event({'type': 'error', 'message': _chat_failure_message(exc)})
                         write_event({'type': 'done', 'cancelled': cancel_event.is_set(),
                                      'conversation_id': conversation_id})
                     except (BrokenPipeError, ConnectionResetError, OSError):

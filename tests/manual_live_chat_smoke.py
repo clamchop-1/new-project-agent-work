@@ -28,10 +28,11 @@ def read_startup(process, output_queue):
     output_queue.put(None)
 
 
-def launch(port):
+def launch(port, chat_timeout=45):
     process = subprocess.Popen([
         sys.executable, '-u', '-B', str(ROOT / 'agent.py'), 'local-chat',
         '--provider', 'ssh_tunnel_ollama', '--dashboard-port', str(port),
+        '--chat-timeout', str(chat_timeout),
         '--no-browser-open',
     ], cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
        text=True, encoding='utf-8', errors='replace', bufsize=1,
@@ -161,26 +162,35 @@ def main():
     args.output.mkdir(parents=True, exist_ok=False)
     process = None
     result = {'format': 'localcodingagent-live-chat-smoke-v1', 'port': args.port,
-              'model': 'qwen3-coder:30b', 'verified': False,
+              'model_id': 'qwen3-coder:30b', 'verified': False,
               'evidence_dir': str(args.output)}
     try:
         process, base, token, startup = launch(args.port)
         result['startup'] = [line for line in startup if 'token' not in line.casefold()]
+        request(base, token, '/api/chat/models/refresh', method='POST', body={})
         models = request(base, token, '/api/chat/models')
         result['provider_connection'] = models.get('connection')
         result['installed_models'] = models.get('installed', [])
+        model = next((row for row in models.get('models', [])
+            if row.get('provider_id') == 'ssh_tunnel_ollama'
+            and row.get('model_id') == result['model_id']
+            and row.get('authorized') is True and row.get('available') is True
+            and row.get('compatible') is True), None)
+        if model is None:
+            raise RuntimeError('Authorized Mac model is unavailable in the refreshed catalog.')
+        result['model_key'] = model['model_key']
         conversation = request(base, token, '/api/chat/conversations', method='POST', body={})
         conversation_id = conversation['id']
         result['conversation_id'] = conversation_id
         result['turns'] = [
-            send_message(base, token, conversation_id, result['model'],
+            send_message(base, token, conversation_id, result['model_key'],
                          'Hello, what can you help me with?'),
-            send_message(base, token, conversation_id, result['model'],
+            send_message(base, token, conversation_id, result['model_key'],
                          'Write me a Python function that finds duplicate filenames.'),
-            send_message(base, token, conversation_id, result['model'],
+            send_message(base, token, conversation_id, result['model_key'],
                          'Can you modify that function to ignore file extensions?'),
         ]
-        result['cancel_check'] = cancel_message(base, token, conversation_id, result['model'])
+        result['cancel_check'] = cancel_message(base, token, conversation_id, result['model_key'])
         expected_messages = request(base, token,
             f'/api/chat/conversations/{conversation_id}')['messages']
         result['messages_before_restart'] = len(expected_messages)
@@ -196,7 +206,7 @@ def main():
         result['messages_after_restart'] = len(restored_row['messages'])
         result['conversation_restored'] = result['messages_after_restart'] == result['messages_before_restart']
         result['verified'] = (result['provider_connection'] == 'ready'
-            and result['model'] in result['installed_models']
+            and result['model_key'] in result['installed_models']
             and all(turn['response'] for turn in result['turns'])
             and result['conversation_restored']
             and result['cancel_check']['stop_accepted'])

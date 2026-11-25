@@ -114,6 +114,14 @@ class ConversationStore:
                     refs=[]
                 if refs and message['role']=='assistant':
                     item['sources']=refs
+                operation = message.get('operation')
+                if (message['role'] == 'assistant' and isinstance(operation, dict)
+                        and set(operation) == {'operation_id', 'kind', 'state'}
+                        and isinstance(operation.get('operation_id'), str)
+                        and CONVERSATION_ID.fullmatch(operation['operation_id'])
+                        and operation.get('kind') in {'register', 'tests', 'patch', 'multi_patch'}
+                        and operation.get('state') == 'awaiting_approval'):
+                    item['operation'] = dict(operation)
             stream_id=message.get('stream_id')
             stream_status=message.get('stream_status')
             if (message['role']=='assistant' and isinstance(stream_id,str)
@@ -174,7 +182,7 @@ class ConversationStore:
             return row
 
     def update_assistant_stream(self, conversation_id: str, stream_id: str, content: str, *,
-                                status='generating', sources=None) -> dict:
+                                status='generating', sources=None, operation=None) -> dict:
         if (not isinstance(stream_id,str) or not CONVERSATION_ID.fullmatch(stream_id)
                 or not isinstance(content,str) or len(content)>MAX_MESSAGE
                 or status not in {'generating','complete','cancelled','failed'}):
@@ -192,6 +200,14 @@ class ConversationStore:
                 message['sources']=refs
             else:
                 message.pop('sources',None)
+            if operation is not None:
+                if (not isinstance(operation, dict)
+                        or set(operation) != {'operation_id', 'kind', 'state'}
+                        or not CONVERSATION_ID.fullmatch(str(operation.get('operation_id', '')))
+                        or operation.get('kind') not in {'register', 'tests', 'patch', 'multi_patch'}
+                        or operation.get('state') != 'awaiting_approval'):
+                    raise ValueError('Conversation operation reference is invalid.')
+                message['operation'] = dict(operation)
             self._save(row)
             return row
 

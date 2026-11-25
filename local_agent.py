@@ -500,6 +500,15 @@ def function(name, description, properties=None, required=None):
                        'required': required or [], 'additionalProperties': False}}}
 
 
+def _broker_python_executable():
+    """Use the real Windows interpreter process so Broker PID ownership is exact."""
+    if os.name == 'nt':
+        base_executable = getattr(sys, '_base_executable', None)
+        if isinstance(base_executable, str) and Path(base_executable).is_file():
+            return base_executable
+    return sys.executable
+
+
 TEXT = {'type': 'string'}
 TOOLS = [
     function('search_web', 'Search public web pages for the user’s question. Returns bounded result titles, URLs and untrusted snippets; cite source URLs in the answer.',
@@ -556,10 +565,10 @@ def validate_source_mutation_scope(limit, writes, assistant_writes, test_config,
                                    temporary_registration):
     if limit is None:
         return
-    if type(limit) is not int or limit != 1:
-        raise AgentError('The source mutation budget must be one.')
-    if len(writes) > 1 or assistant_writes or test_config is not None:
-        raise AgentError('A source mutation budget permits at most one project path and excludes assistant writes and pinned tests.')
+    if type(limit) is not int or not 1 <= limit <= 3:
+        raise AgentError('The source mutation budget must be between one and three.')
+    if len(writes) > limit or len({path.casefold() for path in writes}) != len(writes) or assistant_writes or test_config is not None:
+        raise AgentError('A bounded source mutation budget permits only its exact distinct project paths and excludes assistant writes and tests.')
     if isinstance(temporary_registration, dict) and writes and (
             tuple(writes) != (temporary_registration.get('allowed_source_path'),)):
         raise AgentError('A bounded temporary project write must target its registered source path.')
@@ -570,7 +579,8 @@ class Broker:
                  assistant_write_paths=(), allowed_tools=None,
                  require_test_after_each_write=False,
                  restricted_evaluation_authorization=None,
-                 temporary_project_registration=None, max_source_mutations=None):
+                 temporary_project_registration=None, max_source_mutations=None,
+                 authorized_dirty_baseline=None):
         self.project, self.run = project, Path(run)
         validate_source_mutation_scope(max_source_mutations, writes, assistant_write_paths,
                                        test_config, temporary_project_registration)
@@ -632,7 +642,14 @@ class Broker:
         self.cancel_event = None
         self.assistant_writes = []
         self.allowed_assistant_writes = set(assistant_write_paths)
-        self.dirty = bool(project.state()['status'].strip())
+        current_state = project.state()
+        dirty = bool(current_state['status'].strip())
+        if authorized_dirty_baseline is not None and (
+                not isinstance(authorized_dirty_baseline, dict)
+                or current_state != authorized_dirty_baseline
+                or authorized_dirty_baseline.get('project_id') != project.identity):
+            raise AgentError('Authorized dirty worktree baseline is stale; source write refused.')
+        self.dirty = dirty and authorized_dirty_baseline is None
         self.loaded_memory = project.memory()
         self.fetched_sources = {}
         self.source_library = None
@@ -757,7 +774,10 @@ class Broker:
         if name == 'tests':
             if self.test_config is None:
                 raise AgentError('General project tests/shell need a qualified OS sandbox and separate approval; no automatic execution.')
-            command = [sys.executable, '-B', '-I', str(HUB/'pure_tests.py'), str(self.project.root), str(self.test_config)]
+            command = [_broker_python_executable(), '-B', '-I', '-S', str(HUB/'pure_tests.py'),
+                       str(self.project.root), str(self.test_config)]
+            if os.environ.get('LOCAL_AGENT_DIAGNOSTIC_IMPORT_TRACE') == '1':
+                command[1:1] = ['-X', 'importtime']
         elif name in adapter.command_names:
             target = self.project.path(path)
             invocation = adapter.invocation(name, target, HUB)
@@ -766,14 +786,26 @@ class Broker:
             raise AgentError('Command is not on the fixed capability allowlist; no shell interpolation.')
         env = {k: v for k, v in os.environ.items() if not any(word in k.upper() for word in ('TOKEN', 'SECRET', 'API_KEY', 'PASSWORD'))}
         env.update(extra_env)
+        if name == 'tests':
+            private_root = (HUB / '.local').resolve()
+            if self.run.resolve().is_relative_to(private_root):
+                env['LOCAL_AGENT_PURE_TEST_TRACEBACK'] = str(
+                    self.run.resolve() / 'pure-test-runner-tracebacks.txt')
         if self.journal:
             self.journal.begin('command', command=name, path=path)
         began = time.monotonic()
-        child = subprocess.Popen(command, cwd=self.project.root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        child = subprocess.Popen(command, cwd=self.project.root, env=env,
+                                  stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         try:
             if self.journal:
                 self.journal.command_process(child_pid=child.pid)
-            deadline = began + 15
+            # Start the bounded command window only after the child PID is
+            # durably recorded. Process creation and recovery-journal I/O are
+            # setup work; including them here can expire the test budget before
+            # the pinned runner has had its authorized execution window.
+            command_budget = 60 if name == 'tests' else 15
+            deadline = time.monotonic() + command_budget
             while True:
                 if self.cancel_event is not None and self.cancel_event.is_set():
                     raise AgentError('Harness cancellation interrupted the owned command.')
@@ -789,9 +821,23 @@ class Broker:
                     continue
         except BaseException:
             if child.poll() is None:child.kill()
-            child.communicate(timeout=10)
+            partial_output, _ = child.communicate(timeout=10)
+            partial_evidence = None
+            if name == 'tests' and partial_output:
+                bounded_output = partial_output[:32000]
+                try:
+                    no_secrets(bounded_output.decode('utf-8', errors='replace'))
+                    partial_path = self.run.resolve() / 'timeout-partial-output.txt'
+                    atomic_write(partial_path, bounded_output)
+                    partial_evidence = {'path': str(partial_path),
+                        'sha256': file_hash(partial_path), 'bytes': len(bounded_output),
+                        'truncated': len(partial_output) > len(bounded_output),
+                        'untrusted': True}
+                except AgentError:
+                    partial_evidence = {'omitted': 'secret-like content detected'}
             if self.journal and not self.journal.broken:
-                self.journal.command_process(process_stopped=True)
+                self.journal.command_process(process_stopped=True,
+                    partial_output_evidence=partial_evidence)
             raise
         if len(output) > 32000:
             raise AgentError('Command output exceeds limit.')

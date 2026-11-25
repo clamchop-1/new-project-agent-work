@@ -24,6 +24,36 @@ function rebuildResearchSourcePanels(rows){
   article.append(panel);
  }
 }
+function operationLabel(state,result={}){
+ const learning=result.learning_candidate;
+ const note=learning?.status==='candidate'?' · review candidate captured':learning?.status==='not_recorded'?' · candidate not saved':'';
+ if(state==='passed')return 'Tests passed Â· Broker receipt verified'+note;
+ if(state==='failed')return 'Tests failed Â· Broker result recorded';
+ if(state==='completed')return 'Repository registered and indexed';
+ if(state==='modified')return 'Source file modified · Broker recovery receipt verified · pinned tests need separate approval';
+ if(state==='denied')return 'Operation denied';
+ if(state==='cancelled')return 'Run cancelled; inspect Broker recovery evidence';
+ if(state==='timed_out')return 'Broker run timed out; reconcile execution evidence';
+ if(state==='interrupted')return 'Run interrupted; inspect Broker recovery evidence before retrying';
+ if(state==='expired')return 'Approval expired';
+ return 'Operation '+state;
+}
+function rebuildOperationPanels(rows){
+ const assistants=rows.filter(row=>row.role==='assistant'),articles=$('messages').querySelectorAll('.message.assistant');
+ for(let i=0;i<Math.min(assistants.length,articles.length);i++){
+  const operation=assistants[i].operation,article=articles[i];article.querySelectorAll('.operation-approval').forEach(node=>node.remove());
+  if(!operation||operation.state!=='awaiting_approval'||!/^[a-f0-9]{32}$/.test(operation.operation_id||''))continue;
+  const panel=document.createElement('div');panel.className='operation-approval';panel.style.cssText='display:flex;gap:8px;align-items:center;margin-top:12px;padding:10px;border:1px solid var(--line);border-radius:10px';
+  const label=document.createElement('span');label.textContent=operation.kind==='tests'?'Windows Broker test run requires approval':operation.kind==='multi_patch'?'Validated multi-file change set requires approval':operation.kind==='patch'?'Validated one-file source patch requires approval':'Repository registration requires approval';
+  const approve=document.createElement('button');approve.textContent='Approve';
+  const deny=document.createElement('button');deny.textContent='Deny';
+  const cancel=document.createElement('button');cancel.textContent='Cancel run';cancel.hidden=true;
+  const decide=async decision=>{approve.disabled=true;deny.disabled=true;label.textContent=decision==='approve'?'Executing approved operation…':'Recording denial…';cancel.hidden=decision!=='approve';try{const result=await api('/api/chat/conversations/'+conversationId+'/operations/'+operation.operation_id+'/decision',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({decision})});label.textContent=operationLabel(result.status,result);if(result.output)label.title=result.output;cancel.hidden=true}catch(error){label.textContent='Operation could not complete: '+error.message;approve.disabled=false;deny.disabled=false;cancel.hidden=true}};
+  cancel.onclick=async()=>{cancel.disabled=true;label.textContent='Stopping the owned Broker process…';try{await api('/api/chat/conversations/'+conversationId+'/operations/'+operation.operation_id+'/cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})}catch(error){label.textContent=error.message}};
+  approve.onclick=()=>decide('approve');deny.onclick=()=>decide('deny');panel.append(label,approve,deny,cancel);article.append(panel);
+  api('/api/chat/conversations/'+conversationId+'/operations/'+operation.operation_id).then(saved=>{if(saved.state==='awaiting_approval')return;approve.disabled=true;deny.disabled=true;cancel.hidden=true;label.textContent=operationLabel(saved.state,saved.result||{});const recovery=saved.recovery;if(saved.state==='interrupted'&&recovery){const files=recovery.file_classifications||[];label.textContent='Interrupted multi-file write; tests are blocked. '+files.map(item=>item.path+': '+item.classification).join(' · ');label.title='Broker recovery evidence: '+recovery.evidence_directory;for(const action of (recovery.options||[]).filter(value=>value==='accept'||value==='abort')){const button=document.createElement('button');button.textContent=action==='accept'?'Accept verified complete set':'Abort after original files verified';button.onclick=async()=>{button.disabled=true;label.textContent='Rechecking every file hash and Broker journal…';try{const result=await api('/api/chat/conversations/'+conversationId+'/operations/'+operation.operation_id+'/reconcile',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,review_sha256:recovery.review_sha256})});label.textContent=operationLabel(result.state,result)}catch(error){label.textContent='Recovery stopped: '+error.message;button.disabled=false}};panel.append(button)}if(!(recovery.options||[]).some(value=>value==='accept'||value==='abort'))label.textContent+=' Manual source review is required; no write will be retried.'}}).catch(()=>{});
+ }
+}
 const latestButton=document.createElement('button');
 latestButton.textContent='↓ Latest response';latestButton.className='plain hidden';
 latestButton.style.cssText='position:absolute;right:24px;bottom:116px;z-index:2;background:var(--bg);border:1px solid var(--line);border-radius:18px;padding:7px 12px';
@@ -41,13 +71,14 @@ renderMessages=rows=>{
  }
  priorRenderMessages(visible);
  rebuildResearchSourcePanels(visible);
+ rebuildOperationPanels(visible);
  const assistantRows=visible.filter(row=>row.role==='assistant'),assistantArticles=box.querySelectorAll('.message.assistant');
  for(let i=0;i<Math.min(assistantRows.length,assistantArticles.length);i++){
   const row=assistantRows[i],article=assistantArticles[i];
   if(!row.stream_status||row.stream_status==='complete'||(activeChatRequest&&activeChatRequest.conversationId===conversationId&&row.stream_status==='generating'))continue;
   if(article.querySelector('[data-stream-state]'))continue;
   const note=document.createElement('div');note.className='message-label';note.dataset.streamState=row.stream_status;
-  note.textContent=row.stream_status==='cancelled'?'Response stopped · partial text saved':row.stream_status==='failed'?'Response failed · partial text saved':row.stream_status==='generating'?'Response is still generating':'Response interrupted · partial text saved';article.append(note);
+  note.textContent=row.stream_status==='cancelled'?'Response stopped · partial text saved':row.stream_status==='failed'?(row.content?'Response failed · partial text saved':'Response failed · no text received'):row.stream_status==='generating'?'Response is still generating':(row.content?'Response interrupted · partial text saved':'Response interrupted · no text received');article.append(note);
  }
  if(activeChatRequest&&activeChatRequest.conversationId===conversationId){
   const articles=box.querySelectorAll('.message.assistant');activeChatRequest.article=articles.length?articles[articles.length-1]:null;
@@ -67,7 +98,7 @@ function paintLiveReply(request){
  const state=request.assistant.stream_status;
  if(state&&state!=='complete'){
   const note=document.createElement('div');note.className='message-label';
-  note.textContent=state==='generating'?'Response in progress':state==='cancelled'?'Response stopped · partial text saved':state==='failed'?'Response failed · partial text saved':'Response interrupted · partial text saved';
+  note.textContent=state==='generating'?'Response in progress':state==='cancelled'?'Response stopped · partial text saved':state==='failed'?(request.assistant.content?'Response failed · partial text saved':'Response failed · no text received'):(request.assistant.content?'Response interrupted · partial text saved':'Response interrupted · no text received');
   article.append(note);
  }
  if(follow)box.scrollTop=box.scrollHeight;else{box.scrollTop=top;latestButton.classList.remove('hidden')}
@@ -107,7 +138,7 @@ async function watchActiveConversation(id){
   const [state,row]=await Promise.all([api('/api/chat/conversations/'+id+'/status'),api('/api/chat/conversations/'+id)]);
   const snapshot=JSON.stringify(row.messages);
   if(conversationId===id&&snapshot!==previous){previous=snapshot;renderMessages(row.messages)}
-  if(!state.active){await loadConversations();return}
+  if(!state.active){if(state.state==='interrupted'){const recovered=await api('/api/chat/conversations/'+id);if(conversationId===id){renderMessages(recovered.messages);$('status').textContent='The previous dashboard stopped during generation. Any saved partial response is labelled above.'}}await loadConversations();return}
  }}catch(error){if(conversationId===id)$('status').textContent='Reconnecting to the saved response… '+error.message}
  finally{streamWatchers.delete(id)}
 }
@@ -117,6 +148,7 @@ openConversation=async id=>{
   renderMessages(row.messages);renderConversations(items);
   const state=await api('/api/chat/conversations/'+id+'/status');
   if(state.active&&(!activeChatRequest||activeChatRequest.conversationId!==id))watchActiveConversation(id);
+  else if(state.state==='interrupted'){const recovered=await api('/api/chat/conversations/'+id);renderMessages(recovered.messages);$('status').textContent='The previous dashboard stopped during generation. Any saved partial response is labelled above.';}
   else if(state.state==='interrupted')$('status').textContent='The previous dashboard stopped during generation. Any saved partial response is shown above.';
  }catch(error){$('status').textContent='Could not open this conversation: '+error.message}
 };
@@ -164,6 +196,7 @@ sendChat=async()=>{
    else if(event.type==='token'){clearActivity();request.assistant.content+=event.text;scheduleLivePaint(request)}
    else if(event.type==='sources'&&Array.isArray(event.sources)){const online=event.sources.length>0&&event.sources.every(source=>source&&typeof source.url==='string'&&typeof source.provider_id==='string'&&typeof source.source_id==='string');if(online){request.assistant.sources=event.sources;streamResearchSources=event.sources;streamResearchConversationId=activeId;if(conversationId===activeId)renderMessages(request.rows)}}
    else if(event.type==='research_proposal'){try{sessionStorage.setItem('researchProposal:'+activeId,JSON.stringify(event))}catch{}$('status').textContent='Waiting for your research approval.'}
+   else if(event.type==='operation_proposal'){request.assistant.operation={operation_id:event.proposal.operation_id,kind:event.proposal.kind,state:'awaiting_approval'};renderMessages(request.rows);$('status').textContent='Waiting for your approval.'}
    else if(event.type==='research_summary')$('status').textContent=event.retrieved_sources?'Research sources ready · preparing response':'Research completed without readable sources';
    else if(event.type==='error')responseError=event.message||'The local model could not complete this response.';
    else if(event.type==='done'){if(event.conversation_id&&event.conversation_id!==activeId)throw Error('Completion belonged to another conversation.');receivedDone=true;request.assistant.stream_status=event.cancelled?'cancelled':(responseError?'failed':'complete')}

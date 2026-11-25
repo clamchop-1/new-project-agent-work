@@ -166,6 +166,25 @@ class RecoveryTests(FixtureCase):
         self.assertEqual(self.store.inspect(journal.row['run_id'])['pending_outcome'],
                          'unverified_command')
 
+    def test_timed_out_owned_test_process_is_killed_and_requires_review(self):
+        child = Mock(args=['pinned'], pid=1235)
+        child.poll.return_value = None
+        child.communicate.return_value = (b'', None)
+        with self.store.locked():
+            journal = self.start()
+            broker = Broker(self.project, self.output, test_config=self.test_config)
+            broker.journal = journal
+            with patch('local_agent.subprocess.Popen', return_value=child), \
+                    patch('local_agent.time.monotonic', side_effect=[10.0, 10.0, 71.0]), \
+                    patch('execution_recovery.checkpoint', return_value=journal.row['checkpoint']):
+                with self.assertRaisesRegex(AgentError, 'timed out'):
+                    broker.execute('tests')
+            child.kill.assert_called_once()
+            self.assertEqual(broker.commands, [])
+        report = self.store.inspect(journal.row['run_id'])
+        self.assertEqual(report['pending_outcome'], 'unverified_command')
+        self.assertTrue(report['safe_to_reconcile'])
+
     def test_provider_timeout_preserves_recorded_write_for_restart(self):
         output = self.base / 'timeout'
         arguments = {'path': 'calculator.py', 'expected_sha256': file_hash(self.target),

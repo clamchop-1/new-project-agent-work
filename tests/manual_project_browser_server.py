@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -51,7 +53,20 @@ def create_repo(root: Path, title: str, source: str, readme: str) -> None:
     (root / 'test_pipeline.py').write_text(
         'def test_fixture_pipeline_has_expected_entrypoint():\n'
         '    assert callable(__import__("pipeline").run_pipeline)\n', encoding='utf-8')
-    git(root, 'add', '.gitignore', 'README.md', 'pipeline.py', 'test_pipeline.py')
+    if title == 'FixtureAlpha':
+        (root / 'tests').mkdir(parents=True, exist_ok=True)
+        (root / 'calculator.py').write_text(
+            'def average(values):\n    return sum(values) / (len(values) + 1)\n', encoding='utf-8')
+        (root / 'stats.py').write_text(
+            'def clamp(value, low, high):\n'
+            '    if value < low:\n        return low\n'
+            '    if value > high:\n        return high\n'
+            '    return value\n', encoding='utf-8')
+        pinned = Path(__file__).resolve().parents[1] / '.local' / 'interactive-codex-d1567508' / 'repo' / 'tests' / 'test_stats.py'
+        if not pinned.is_file():
+            raise RuntimeError('Preserved exact pinned stats acceptance test is unavailable.')
+        shutil.copyfile(pinned, root / 'tests' / 'test_stats.py')
+    git(root, 'add', '-A')
     git(root, 'commit', '-qm', title + ' initial fixture')
 
 
@@ -60,6 +75,7 @@ def main() -> None:
     parser.add_argument('--state-root', required=True, type=Path)
     args = parser.parse_args()
     state = args.state_root.resolve()
+    os.environ['LOCAL_AGENT_DIAGNOSTIC_IMPORT_TRACE'] = '1'
     app_root = state / 'app'
     app_root.mkdir(parents=True, exist_ok=True)
     if not (app_root / '.git').is_dir():

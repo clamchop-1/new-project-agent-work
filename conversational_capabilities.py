@@ -101,8 +101,9 @@ class CapabilityRegistry:
             items.append(f"- {item.capability_id}: {item.purpose}; {item.availability}; "
                          f"approval: {item.approval}.")
         items.extend((
-            '- Project registration is available only through the authenticated Projects control, which requires explicit confirmation.',
-            '- Source changes, arbitrary commands, builds, and test execution are not available as conversational capabilities.',
+            '- Repository registration is available in chat after a one-use, expiring, conversation-bound application confirmation; it grants local read-only indexing.',
+            '- A selected project can offer only its matching code-owned pinned test profile through the Windows Broker after an application approval. Results are untrusted evidence and must cite a verified receipt.',
+            '- Source changes, arbitrary commands, builds, and dependency installation are not available as conversational capabilities.',
             '- Models cannot grant themselves permissions or call unregistered capabilities.'
         ))
         return '\n'.join(items)
@@ -119,11 +120,16 @@ class IntentRouter:
     def propose(self, text: str, *, selected_project: bool) -> ActionProposal | None:
         if not isinstance(text, str):
             return None
-        value = text.strip()
+        # Natural chat commonly ends requests with sentence punctuation. Strip
+        # only terminal punctuation before applying the strict intent grammar;
+        # keep punctuation inside a quoted project name intact.
+        value = text.strip().rstrip('?.!').rstrip()
         folded = value.casefold()
         if re.fullmatch(r'(what )?(projects|registered projects)( do i have)?( registered)?\??', folded):
             return ActionProposal('projects.list', {})
-        select = re.fullmatch(r'(open|select|use) (?:the )?project ["\']?(.+?)["\']?\s*', value, re.I)
+        select = re.fullmatch(
+            r'(open|select|use) (?:the )?(?:registered )?project ["\']?(.+?)["\']?\s*',
+            value, re.I)
         if select:
             return ActionProposal('project.select', {'name': select.group(2).strip()})
         if not selected_project:

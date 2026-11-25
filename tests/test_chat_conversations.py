@@ -13,6 +13,7 @@ from unittest.mock import patch
 from chat_conversations import ConversationStore
 from coding_dashboard import CodingDashboard
 from local_agent import HUB
+from inference_provider import ProviderFailure
 from research_service import ResearchAuthorizationService
 
 
@@ -87,6 +88,18 @@ class ConversationStoreTests(unittest.TestCase):
         self.assertEqual([item['role'] for item in final],['user','assistant'])
         self.assertEqual(final[-1]['stream_status'],'complete')
         self.assertEqual(final[-1]['content'],'Complete response')
+
+    def test_multi_file_approval_control_survives_stream_completion_and_reload(self):
+        row = self.store.create(); stream_id = 'b' * 32; operation_id = 'c' * 32
+        self.store.add_user(row['id'], 'Update the helper and its caller across two files')
+        self.store.start_assistant_stream(row['id'], stream_id)
+        self.store.update_assistant_stream(row['id'], stream_id, 'Review both file diffs.',
+            status='complete', operation={'operation_id': operation_id,
+                'kind': 'multi_patch', 'state': 'awaiting_approval'})
+        saved = self.store.load(row['id'])['messages'][-1]
+        self.assertEqual(saved['stream_status'], 'complete')
+        self.assertEqual(saved['operation'], {'operation_id': operation_id,
+            'kind': 'multi_patch', 'state': 'awaiting_approval'})
 
 
 class ChatDashboardTests(unittest.TestCase):
@@ -289,7 +302,7 @@ class ChatDashboardTests(unittest.TestCase):
 
     def test_inference_failure_is_clear_and_does_not_leak_provider_details(self):
         def failed_runner(*args):
-            raise RuntimeError('private tunnel detail')
+            raise ProviderFailure('timeout', 'private tunnel detail')
         self.dashboard.chat_runner = failed_runner
         conversation = self.store.create()
         status, body = self.request('/api/chat/conversations/' + conversation['id'] + '/messages',
@@ -299,7 +312,7 @@ class ChatDashboardTests(unittest.TestCase):
         events = [json.loads(line) for line in body.splitlines() if line]
         errors = [event['message'] for event in events if event['type'] == 'error']
         self.assertEqual(len(errors), 1)
-        self.assertIn('local model could not complete', errors[0])
+        self.assertIn('timed out', errors[0])
         self.assertNotIn('private tunnel detail', errors[0])
 
     def test_cancellation_stops_generation_and_keeps_partial_reply(self):

@@ -80,6 +80,30 @@ class RegisteredFixtureTests(unittest.TestCase):
         self.assertEqual(pure_tests._load_pinned_config(
             self.m4_root / '.local' / 'pinned-tests.json'), self.config)
 
+    def test_source_imports_are_limited_to_fixed_profile_modules(self):
+        pure_tests.validate_source('from stats import validate_values\n'
+            'def average(values):\n    return validate_values(values)\n',
+            approved_modules=('calculator', 'stats'))
+        with self.assertRaisesRegex(ValueError, 'fixed pinned-profile modules'):
+            pure_tests.validate_source('import os\ndef value():\n    return 1\n',
+                approved_modules=('calculator', 'stats'))
+        with self.assertRaisesRegex(ValueError, 'Relative, wildcard'):
+            pure_tests.validate_source('from stats import *\ndef value():\n    return 1\n',
+                approved_modules=('calculator', 'stats'))
+
+    def test_multi_module_profile_allows_only_simple_argument_iteration(self):
+        source = ('def validate_values(values):\n'
+                  '    for value in values:\n'
+                  '        if not isinstance(value, (int, float)):\n'
+                  '            raise ValueError("numeric values required")\n')
+        pure_tests.validate_source(source, allow_local_assignment=True,
+            allow_bounded_iteration=True)
+        with self.assertRaisesRegex(ValueError, 'Loops must iterate'):
+            pure_tests.validate_source('def value(values):\n    for item in range(1000000000):\n        return item\n',
+                allow_local_assignment=True, allow_bounded_iteration=True)
+        with self.assertRaisesRegex(ValueError, 'Unsupported pure-fixture syntax'):
+            pure_tests.validate_source(source, allow_local_assignment=True)
+
 
 if __name__ == '__main__':
     unittest.main()

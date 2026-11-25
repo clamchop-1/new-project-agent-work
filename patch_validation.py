@@ -188,6 +188,8 @@ def build_unified_diff_from_proposal(raw: bytes, *, root: Path,
                                      allowed_paths: set[str],
                                      planned_paths: set[str] | None = None,
                                      protected_paths: set[str] | None = None,
+                                     max_files: int = 8,
+                                     allow_test_files: bool = False,
                                      max_bytes: int = 16_384) -> ValidatedPatch:
     """Turn strict JSON full-file intents into a locally constructed, validated diff.
 
@@ -212,12 +214,15 @@ def build_unified_diff_from_proposal(raw: bytes, *, root: Path,
     if not isinstance(value, dict) or set(value) != {'files'}:
         raise PatchValidationError('Structured proposal schema is invalid.')
     rows = value['files']
-    if not isinstance(rows, list) or not 1 <= len(rows) <= 8:
-        raise PatchValidationError('Structured proposal must contain one to eight files.')
+    if type(max_files) is not int or not 1 <= max_files <= 8:
+        raise PatchValidationError('Change-set file limit is invalid.')
+    if not isinstance(rows, list) or not 1 <= len(rows) <= max_files:
+        raise PatchValidationError(f'Structured proposal must contain one to {max_files} files.')
     root = Path(root).resolve(strict=True)
     planned = allowed_paths if planned_paths is None else planned_paths
     protected = protected_paths or set()
     seen: set[str] = set()
+    seen_folded: set[str] = set()
     hunks = []
     aggregate = 0
     for row in rows:
@@ -226,7 +231,8 @@ def build_unified_diff_from_proposal(raw: bytes, *, root: Path,
         relative, content, base_sha = row['path'], row['content'], row['base_sha256']
         if (not isinstance(relative, str) or relative not in allowed_paths
                 or relative not in planned or relative in protected or relative in seen
-                or relative.startswith('.local/') or relative.startswith('tests/')):
+                or relative.startswith('.local/')
+                or (relative.startswith('tests/') and not allow_test_files)):
             raise PatchValidationError('Structured proposal contains an unauthorized, unplanned, or duplicate path.')
         safe = _safe_path(('b/' + relative).encode('utf-8'), b'b/')
         if safe != relative:
@@ -250,6 +256,8 @@ def build_unified_diff_from_proposal(raw: bytes, *, root: Path,
         else:
             old = b''
         expected_base = hashlib.sha256(old).hexdigest() if existed else None
+        if relative.casefold() in seen_folded:
+            raise PatchValidationError('Change set contains case-insensitive path collisions.')
         if base_sha != expected_base:
             raise PatchValidationError(f'Stale source hash for {relative}; refresh authorized context before retrying.')
         new = _post_image(old, content)
@@ -268,6 +276,7 @@ def build_unified_diff_from_proposal(raw: bytes, *, root: Path,
             raise PatchValidationError('Structured proposal produced no changes.')
         hunks.extend((header, body))
         seen.add(relative)
+        seen_folded.add(relative.casefold())
     diff = b''.join(hunks)
     return validate_unified_diff(diff, root=root, allowed_paths=allowed_paths,
                                  max_bytes=256_000)
