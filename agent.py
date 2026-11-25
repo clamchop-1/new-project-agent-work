@@ -234,49 +234,95 @@ def _coding_workflow_cli(args, config):
         runner = (lambda workflow, role_models, cancel, limits: _run_collaborative_proposal(
             workflow, role_models, config, provider_name, args.routing_mode,
             args.endpoint, limits['timeout'], limits['attempts'], cancel)) if not chat_only else None
+        from model_catalog import discover_model_catalog, save_catalog
+        if args.provider:
+            chat_specs = provider_specs(config, args.endpoint, 'configured', provider_name)
+        else:
+            chat_specs = provider_specs(config, args.endpoint, 'remote_allowed')
+        chat_host_ids = {
+            'ollama': 'windows',
+            'ssh_tunnel_ollama': config['inference'].get('remote', {}).get('profile_id', 'mac_studio'),
+        }
+        catalog_path = PRIVATE / 'model-catalog.json'
+
+        def refresh_chat_models():
+            catalog = discover_model_catalog(chat_specs, host_ids=chat_host_ids)
+            save_catalog(catalog_path, catalog)
+            return catalog
+
         provider_status = {'status': 'unavailable', 'checked_at': None, 'installed_models': [],
-                           'provider': provider_name}
+                           'provider': provider_name, 'providers': [], 'discovery_errors': []}
+        chat_catalog = {'models': [], 'providers': [], 'errors': [], 'observed_at': None}
         try:
-            specs = provider_specs(config, args.endpoint, args.routing_mode, provider_name)
-            selected = specs[provider_name]
-            provider = create_inference_provider(provider_name, selected['endpoint'], selected.get('profile'))
-            try:
-                health = provider.health_check()
-                installed = provider.models()
-                provider_status = {'status': 'connected', 'checked_at': datetime.now(timezone.utc).isoformat(),
-                    'provider': provider_name,
-                    'installed_models': [item.get('name') for item in installed
-                        if isinstance(item, dict) and isinstance(item.get('name'), str)]}
-            finally:
-                provider.close()
+            chat_catalog = refresh_chat_models()
+            primary = next((row for row in chat_catalog['providers']
+                            if row['provider_id'] == provider_name), None)
+            installed = [row['model_id'] for row in chat_catalog['models']
+                         if row['provider_id'] == provider_name and row['available']]
+            provider_status = {'status': 'connected' if primary and primary['available'] else 'unavailable',
+                'checked_at': chat_catalog['observed_at'], 'provider': provider_name,
+                'installed_models': installed, 'providers': chat_catalog['providers'],
+                'discovery_errors': chat_catalog['errors'],
+                'catalog_observed_at': chat_catalog['observed_at']}
         except (AgentError, OSError, ValueError) as exc:
-            provider_status.update({'status': 'unavailable', 'checked_at': datetime.now(timezone.utc).isoformat(),
+            provider_status.update({'checked_at': datetime.now(timezone.utc).isoformat(),
                                     'error': type(exc).__name__})
-        specs = provider_specs(config, args.endpoint, args.routing_mode, provider_name)
-        selected = specs[provider_name]
+        default_chat_model = next((row['model_key'] for row in chat_catalog.get('models', [])
+                                   if row['provider_id'] == provider_name
+                                   and row['model_id'] == config['inference']['model']
+                                   and row['authorized'] and row['available']
+                                   and row['compatible']), None)
         def chat_runner(messages, model, cancel_event, on_token):
+            if not isinstance(model, dict):
+                raise AgentError('Chat model selection has no provider identity.')
+            selected_provider = model.get('provider_id')
+            selected_model = model.get('model_id')
+            spec = chat_specs.get(selected_provider)
+            if spec is None or not isinstance(selected_model, str):
+                raise AgentError('Chat model provider is no longer authorized for this session.')
             PRIVATE.mkdir(parents=True, exist_ok=True)
             with exclusive(PRIVATE / 'inference.lock', 'local-chat'):
-                provider = create_inference_provider(provider_name, selected['endpoint'], selected.get('profile'))
+                provider = create_inference_provider(selected_provider, spec['endpoint'], spec.get('profile'))
                 try:
-                    provider.model(model)
-                    provider.chat_stream(model, messages, 16384, {'temperature': 0.2}, on_token,
+                    provider.model(selected_model)
+                    provider.chat_stream(selected_model, messages, 16384, {'temperature': 0.2}, on_token,
                                          cancel_event=cancel_event, timeout=args.chat_timeout)
                 finally:
                     provider.close()
         chat_store = ConversationStore(HUB)
+        knowledge_store = None
+        project_intelligence = None
+        if chat_only:
+            from knowledge_documents import DocumentKnowledgeLibrary
+            from knowledge_embeddings import LocalSentenceTransformerProvider
+            embedding_provider = None
+            try:
+                embedding_provider = LocalSentenceTransformerProvider()
+            except (AgentError, OSError, ValueError, KeyError, TypeError):
+                pass
+            knowledge_store = DocumentKnowledgeLibrary(Project(HUB),
+                embedding_provider=embedding_provider)
+            from project_intelligence import ProjectIntelligence
+            project_intelligence = ProjectIntelligence(Project(HUB),
+                embedding_provider=embedding_provider)
         dashboard = CodingDashboard(args.dashboard_root, allowed_paths=tuple(args.coding_path),
                                     allowed_models=models, runner=runner,
                                     test_profile=args.coding_test_profile,
                                     provider_status=provider_status,
                                     chat_store=chat_store, chat_runner=chat_runner,
-                                    chat_models=models)
+                                    chat_models=chat_catalog.get('models', []),
+                                    chat_model_refresher=refresh_chat_models,
+                                    chat_default_model=default_chat_model,
+                                    knowledge_store=knowledge_store,
+                                    project_intelligence=project_intelligence)
         server = dashboard.start(port=args.dashboard_port)
         print('Inference provider check: ' + provider_status['status']
               + (' (cached at ' + provider_status['checked_at'] + ')' if provider_status.get('checked_at') else ''))
         installed = provider_status.get('installed_models', [])
-        print('Authorized models: ' + ', '.join(models))
-        print('Installed models confirmed: ' + (', '.join(installed) if installed else 'not confirmed'))
+        print('Chat model inventory: ' + str(len(chat_catalog.get('models', [])))
+              + ' discovered across authorized Ollama providers')
+        print('Configured provider models confirmed: '
+              + (', '.join(installed) if installed else 'not confirmed'))
         print('Local dashboard: http://127.0.0.1:' + str(server.server_port))
         print('One-run dashboard bearer token: ' + dashboard.token)
         if chat_only and not args.no_browser_open:
@@ -293,6 +339,8 @@ def _coding_workflow_cli(args, config):
             print('Dashboard stopped by operator.')
         finally:
             server.shutdown(); server.server_close()
+            if knowledge_store is not None:
+                knowledge_store.close()
         return
     if not args.coding_root or args.project or args.temporary_project:
         raise AgentError('Coding actions require only an exact --coding-root disposable repository.')

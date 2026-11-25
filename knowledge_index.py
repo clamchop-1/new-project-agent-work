@@ -26,13 +26,15 @@ from agent_core import AgentError, Project, atomic_write, encoded, file_hash, no
 
 SCHEMA_VERSION = 1
 SUPPORTED_EXTENSIONS = frozenset({'.md', '.markdown', '.txt', '.py', '.js', '.jsx', '.ts',
-    '.tsx', '.html', '.htm', '.css', '.json'})
+    '.tsx', '.html', '.htm', '.css', '.json', '.toml', '.yaml', '.yml', '.ini', '.cfg',
+    '.java', '.cs', '.go', '.rs', '.cpp', '.c', '.h', '.hpp', '.sql', '.xml', '.swift',
+    '.rb', '.php', '.kt'})
 BLOCKED_DIRS = frozenset({'.git', '.local', '.venv', 'venv', 'node_modules', '__pycache__',
     '.pytest_cache', '.mypy_cache', '.ruff_cache', 'build', 'dist', 'coverage', 'site-packages'})
 BLOCKED_FILES = frozenset({'credentials.json', 'auth.json', 'secrets.json', 'id_rsa',
     'id_ed25519', 'known_hosts', 'authorized_keys'})
 BLOCKED_SUFFIXES = frozenset({'.pem', '.key', '.p12', '.pfx', '.kdbx', '.sqlite', '.db', '.pyc'})
-MAX_SOURCES = 64
+MAX_SOURCES = 2048
 MAX_DOCUMENTS = 2000
 MAX_DOCUMENT_BYTES = 1_000_000
 MAX_TOTAL_BYTES = 50_000_000
@@ -46,7 +48,11 @@ MAX_CONTEXT_CHARS = 8000
 RRF_K = 60
 LANGUAGE_BY_SUFFIX = {'.md': 'markdown', '.markdown': 'markdown', '.txt': 'text',
     '.py': 'python', '.js': 'javascript', '.jsx': 'javascript', '.ts': 'typescript',
-    '.tsx': 'typescript', '.html': 'html', '.htm': 'html', '.css': 'css', '.json': 'json'}
+    '.tsx': 'typescript', '.html': 'html', '.htm': 'html', '.css': 'css', '.json': 'json',
+    '.toml': 'toml', '.yaml': 'yaml', '.yml': 'yaml', '.ini': 'ini', '.cfg': 'ini',
+    '.java': 'java', '.cs': 'csharp', '.go': 'go', '.rs': 'rust', '.cpp': 'cpp',
+    '.c': 'c', '.h': 'c', '.hpp': 'cpp', '.sql': 'sql', '.xml': 'xml', '.swift': 'swift',
+    '.rb': 'ruby', '.php': 'php', '.kt': 'kotlin'}
 
 
 class EmbeddingProvider(Protocol):
@@ -354,26 +360,44 @@ def chunk_document(text: str, suffix: str) -> list[dict[str, Any]]:
 
 class KnowledgeIndex:
     """One exact Git project, one private SQLite index and explicit source allowlist."""
-    def __init__(self, project: Project):
+    def __init__(self, project: Project, *, storage_owner: Project | None = None,
+                 storage_namespace: str | None = None):
         if not isinstance(project, Project):
             raise AgentError('Knowledge index requires a validated Project root.')
+        if (storage_owner is None) != (storage_namespace is None):
+            raise AgentError('External knowledge storage requires an owner and namespace.')
+        if storage_owner is not None and (not isinstance(storage_owner, Project)
+                or not isinstance(storage_namespace, str)
+                or not re.fullmatch(r'[a-f0-9]{64}', storage_namespace)):
+            raise AgentError('External knowledge storage identity is invalid.')
         self.project = project
         self.root = project.root
-        self.private = self.root / '.local'
-        self.directory = self.private / 'knowledge'
+        self.storage_owner = storage_owner
+        self.private = storage_owner.root / '.local' if storage_owner else self.root / '.local'
+        self.directory = (self.private / 'project-intelligence' / 'indexes' / storage_namespace / 'knowledge'
+                          if storage_owner else self.private / 'knowledge')
         self.database = self.directory / 'index.sqlite3'
         self.sources_file = self.directory / 'sources.json'
         self.lock = self.directory / 'index.lock'
 
     def _check_private(self, create: bool = False) -> None:
-        if self.private.is_symlink() or not self.private.resolve().is_relative_to(self.root):
+        owner_root = self.storage_owner.root if self.storage_owner else self.root
+        if _is_reparse(self.private) or not self.private.resolve().is_relative_to(owner_root):
             raise AgentError('Knowledge state root is linked or outside the project.')
         if create:
-            if not self.project.git('check-ignore', '--', '.local/knowledge/index.sqlite3').strip():
+            relative_directory = self.directory.relative_to(owner_root).as_posix()
+            ignored = (bool(self.storage_owner.git('check-ignore', '--',
+                        relative_directory + '/index.sqlite3').strip()) if self.storage_owner
+                       else bool(self.project.git('check-ignore', '--', '.local/knowledge/index.sqlite3').strip()))
+            if not ignored:
                 raise AgentError('Knowledge index is not Git-ignored; private data would be exposed.')
             self.directory.mkdir(parents=True, exist_ok=True)
-        if self.directory.exists() and (_is_reparse(self.directory)
-                or self.directory.resolve().parent != self.private.resolve()):
+        current = self.private
+        for part in self.directory.relative_to(self.private).parts:
+            current = current / part
+            if _is_reparse(current):
+                raise AgentError('Knowledge index path contains a reparse point.')
+        if self.directory.exists() and not self.directory.resolve().is_relative_to(self.private.resolve()):
             raise AgentError('Knowledge index directory is linked or outside private storage.')
         for path in (self.database, self.sources_file, self.lock):
             if _is_reparse(path) or (path.exists() and path.is_file() and path.stat().st_nlink > 1):
@@ -420,13 +444,44 @@ class KnowledgeIndex:
             CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5(
                 chunk_id UNINDEXED, content, tokenize='unicode61'
             );
+            CREATE TABLE IF NOT EXISTS library_documents (
+                doc_id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+                scope TEXT NOT NULL CHECK(scope IN ('global','conversation')),
+                conversation_id TEXT, title TEXT NOT NULL, original_name TEXT NOT NULL,
+                extension TEXT NOT NULL, mime_type TEXT NOT NULL,
+                content_sha256 TEXT NOT NULL, byte_size INTEGER NOT NULL,
+                page_count INTEGER, status TEXT NOT NULL, duplicate_of TEXT,
+                semantic_status TEXT NOT NULL DEFAULT 'requires_reindex',
+                document_version INTEGER NOT NULL DEFAULT 1, version_of TEXT,
+                created_at TEXT NOT NULL, original BLOB NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS library_documents_scope
+                ON library_documents(project_id,scope,conversation_id,status);
+            CREATE INDEX IF NOT EXISTS library_documents_hash
+                ON library_documents(project_id,content_sha256);
+            CREATE TABLE IF NOT EXISTS library_chunks (
+                chunk_id TEXT PRIMARY KEY, doc_id TEXT NOT NULL
+                    REFERENCES library_documents(doc_id) ON DELETE CASCADE,
+                ordinal INTEGER NOT NULL, section TEXT NOT NULL,
+                page_number INTEGER, line_start INTEGER NOT NULL,
+                line_end INTEGER NOT NULL, content TEXT NOT NULL,
+                content_sha256 TEXT NOT NULL, embedding BLOB, embedding_dimensions INTEGER,
+                embedding_provider TEXT, embedding_model TEXT, embedding_version TEXT,
+                embedding_digest TEXT, UNIQUE(doc_id,ordinal)
+            );
+            CREATE INDEX IF NOT EXISTS library_chunks_doc_id ON library_chunks(doc_id);
+            CREATE VIRTUAL TABLE IF NOT EXISTS library_fts USING fts5(
+                chunk_id UNINDEXED, content, tokenize='unicode61'
+            );
+            INSERT INTO metadata(key,value) VALUES('library_schema_version','3')
+                ON CONFLICT(key) DO NOTHING;
         ''')
 
     def _sources(self) -> dict:
         self._check_private()
         if not self.sources_file.exists():
             return {'schema_version': SCHEMA_VERSION, 'project_id': self.project.identity, 'sources': []}
-        if self.sources_file.stat().st_size > 128 * 1024:
+        if self.sources_file.stat().st_size > 1024 * 1024:
             raise AgentError('Knowledge source allowlist exceeds its size limit.')
         try:
             value = json.loads(self.sources_file.read_bytes())
@@ -490,6 +545,30 @@ class KnowledgeIndex:
                                      'added_at': _now()})
             atomic_write(self.sources_file, encoded(value))
         return {'added': True, 'path': relative, 'source_type': source_type}
+
+    def replace_sources(self, relative_paths: Sequence[str], *,
+                        source_type: str = 'project_documentation') -> dict:
+        """Replace the bounded allowlist with validated regular files under this project."""
+        source_type = self._source_kind(source_type)
+        if (not isinstance(relative_paths, (list, tuple)) or len(relative_paths) > MAX_SOURCES
+                or any(not isinstance(value, str) for value in relative_paths)):
+            raise AgentError('Project source inventory exceeds its fixed bound.')
+        normalized = []
+        seen = set()
+        for value in relative_paths:
+            target = self._safe_source(value)
+            if not target.is_file():
+                raise AgentError('Project source inventory may contain files only.')
+            relative = target.relative_to(self.root).as_posix()
+            if relative.casefold() in seen:
+                continue
+            seen.add(relative.casefold())
+            normalized.append({'path': relative, 'source_type': source_type, 'added_at': _now()})
+        self._check_private(create=True)
+        with _writer_lock(self.lock, 'knowledge-source-replace:' + uuid.uuid4().hex):
+            atomic_write(self.sources_file, encoded({'schema_version': SCHEMA_VERSION,
+                'project_id': self.project.identity, 'sources': normalized}))
+        return {'sources': len(normalized)}
 
     def list_sources(self) -> list[dict]:
         return self._sources()['sources']
@@ -676,12 +755,19 @@ class KnowledgeIndex:
         sources = self._sources()
         rows, excluded = self._walk(sources['sources'])
         with _writer_lock(self.lock, 'knowledge-index:' + uuid.uuid4().hex):
-            current = None if rebuild else self._connect_initialized()
+            previous_index_corrupt = False
+            try:
+                current = self._connect_initialized()
+            except AgentError as exc:
+                if not rebuild or not str(exc).startswith('Knowledge index is corrupt;'):
+                    raise
+                # The active bytes are retained in recovery below. A corrupt DB
+                # cannot safely supply its uploaded-document tables to staging.
+                current = None
+                previous_index_corrupt = True
             staging = None
             target = self.database
             if rebuild:
-                if current is not None:
-                    current.close()
                 staging = self.directory / ('index.rebuild.' + uuid.uuid4().hex + '.sqlite3')
                 target = staging
                 connection = self._connect(target)
@@ -735,6 +821,28 @@ class KnowledgeIndex:
                         connection.execute('DELETE FROM documents WHERE doc_id=?', (old['doc_id'],))
                         removed.append(old['relative_path'])
                 connection.commit()
+                if rebuild and current is not None:
+                    connection.execute('ATTACH DATABASE ? AS preserved_library', (str(self.database),))
+                    tables = {row['name'] for row in connection.execute(
+                        "SELECT name FROM preserved_library.sqlite_master WHERE type IN ('table','view')").fetchall()}
+                    if {'library_documents', 'library_chunks', 'library_fts'} <= tables:
+                        for table in ('library_documents', 'library_chunks'):
+                            target_columns = [row['name'] for row in connection.execute(
+                                f'PRAGMA main.table_info({table})').fetchall()]
+                            old_columns = {row['name'] for row in connection.execute(
+                                f'PRAGMA preserved_library.table_info({table})').fetchall()}
+                            columns = [name for name in target_columns if name in old_columns]
+                            column_list = ','.join(columns)
+                            connection.execute(f'INSERT INTO main.{table}({column_list}) '
+                                f'SELECT {column_list} FROM preserved_library.{table}')
+                        connection.execute('INSERT INTO main.library_fts SELECT * FROM preserved_library.library_fts')
+                        connection.execute('INSERT INTO metadata(key,value) VALUES(?,?) '
+                            'ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                            ('library_schema_version', '3'))
+                    connection.commit()
+                    connection.execute('DETACH DATABASE preserved_library')
+                    current.close()
+                    current = None
                 if rebuild:
                     check = connection.execute('PRAGMA integrity_check').fetchone()[0]
                     if check != 'ok':
@@ -758,14 +866,19 @@ class KnowledgeIndex:
                     'embedding': descriptor if dimension is not None else None,
                     'embedding_dimensions': dimension,
                     'mode': 'hybrid_ready' if provider and dimension is not None else 'keyword_only',
+                    'previous_index_corrupt_preserved': previous_index_corrupt,
                     'rebuilt': rebuild}
             except BaseException:
                 if connection is not None:
                     if connection.in_transaction:
                         connection.rollback()
                     connection.close()
+                if current is not None:
+                    current.close()
                 raise
             finally:
+                if current is not None:
+                    current.close()
                 if staging is not None and staging.exists():
                     staging.unlink()
 
@@ -817,12 +930,16 @@ class KnowledgeIndex:
             return None, 'provider_failed_keyword_fallback'
 
     def search(self, query: str, *, limit: int = 8,
-               provider: EmbeddingProvider | None = None) -> dict:
+               provider: EmbeddingProvider | None = None,
+               semantic_min_similarity: float = 0.0) -> dict:
         if not isinstance(query, str) or not query.strip() or len(query.encode('utf-8')) > 2000:
             raise AgentError('Knowledge query must contain 1 to 2000 UTF-8 bytes.')
         no_secrets(query)
         if type(limit) is not int or not 1 <= limit <= 12:
             raise AgentError('Knowledge result limit must be between 1 and 12.')
+        if (isinstance(semantic_min_similarity, bool) or not isinstance(semantic_min_similarity, (int, float))
+                or not math.isfinite(semantic_min_similarity) or not 0.0 <= semantic_min_similarity <= 1.0):
+            raise AgentError('Semantic relevance threshold is invalid.')
         started = time.monotonic()
         connection = self._connect_initialized()
         if connection is None:
@@ -865,7 +982,8 @@ class KnowledgeIndex:
                     if row['dimensions'] != len(query_vector):
                         raise AgentError('Stored vector dimensions differ from the active embedding model.')
                     score = sum(a * b for a, b in zip(query_vector, vector))
-                    scored.append((score, row))
+                    if score >= semantic_min_similarity:
+                        scored.append((score, row))
                 semantic_rows = [row for _, row in sorted(scored, key=lambda pair: (-pair[0], pair[1]['chunk_id']))[:MAX_CANDIDATES]]
             ranks: dict[str, tuple[sqlite3.Row, float]] = {}
             for rows in (keyword_rows, semantic_rows):

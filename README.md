@@ -130,6 +130,28 @@ older unmanaged remote profile is rejected. The SSH transport is inference-only;
 all tools and authorization remain on Windows. Direct LAN Ollama and remote
 execution are not supported.
 
+## Read-only project intelligence in chat
+
+Start the chat with `local-chat.cmd`. In **Projects**, enter the full path to an
+existing local Git repository and register it read-only. Choose **Refresh** to
+index supported text/source files and update local Git status, then start a new
+project chat. Project source context is filtered to that conversation and the
+shared authorized local chat models. The assistant appends verified relative
+paths, line ranges, commit IDs, and file hashes to project-aware answers.
+
+Registration does not clone, fetch, execute repository code, modify source
+files, or run tests. Branch comparisons use locally cached remote-tracking refs;
+they may be stale. A configured GitHub remote is identified from Git metadata,
+but network retrieval from GitHub is not part of this slice. Online research
+continues to require the existing explicit/approval-based research controls.
+Project indexes are stored under the LocalCodingAgent private `.local`
+directory, outside the registered repository.
+
+The next chat experience redesign may explore a sound-wave-inspired visual while
+the model works and an optional Mac/AI metrics panel. These are roadmap ideas;
+future metrics must be measured and timestamped, with unavailable values shown
+as unavailable rather than simulated.
+
 ### Explicit Mac inference profile (prepared; hardware not validated)
 
 Remote inference is disabled by default. When explicitly selected, the Windows
@@ -581,11 +603,24 @@ cmd.exe /c local-chat.cmd
 
 The launcher opens `http://127.0.0.1:52718/` in your default browser and prints
 a one-run token in the PowerShell window. Paste that token into the local login
-form, and keep the window open. The chat uses the
-configured Mac Studio provider through the pinned SSH tunnel, streams model
-responses, and stores bounded conversations under `.local/chat/conversations`.
-The default model is `qwen3-coder:30b`; `qwen3:8b` is available under Settings
-when authorized. Chat has no project, filesystem, shell, Broker, or VM tools.
+form, and keep the window open. At startup, chat discovers installed Windows
+Ollama models and configured Mac Studio Ollama models through the pinned SSH
+tunnel. The host-qualified inventory is stored privately at
+`.local/model-catalog.json`; choose a model under Settings and use **Refresh
+models** to recheck availability. Chat streams responses and stores bounded
+conversations under `.local/chat/conversations`. The selected model is checked
+again before use. The **Knowledge Library** accepts TXT, Markdown, and text-based
+PDF files. Choose persistent project-library storage or a conversation-only
+attachment; retrieval uses FTS5 plus verified local MiniLM vectors when the
+embedding runtime is available and adds citations from trusted index metadata.
+Keyword retrieval remains available if embedding inference fails. Scanned PDFs
+need an OCR capability. Chat does not have arbitrary filesystem, shell, Broker,
+VM, source-write, build, or test-execution authority. For an explicitly
+registered and conversation-selected project, you can ask `What projects do I
+have registered?`, `Open project <name>`, `Show git status`, `List source files`,
+`Read file <relative-path>`, or `Search project for <term>`. Reads are bounded,
+secret-scanned, read-only, and source citations are revalidated. Registration
+still uses the authenticated Projects control and explicit confirmation.
 Authentication remains enabled; never put the token in a URL or persistent log.
 
 If port 52718 is occupied, the launcher leaves the existing process untouched.
@@ -593,3 +628,25 @@ Use `cmd.exe /c local-chat.cmd --dashboard-port 52719` to start another local
 instance. The older workflow dashboard remains available for registered
 disposable fixtures at `/developer` when launched with `coding-dashboard.cmd`.
 It is not required for ordinary conversation.
+
+### Online research
+
+Chat is local-only unless you choose **Ask before online research** or **Research
+online now**. Ask-before mode checks the local Knowledge Library first and, when
+it has no relevant passages, presents an approval with its bounded topic and
+limits. No network request happens before approval. Research sends only the
+sanitized topic to Firecrawl's keyless search API (no account or API key); its
+daily per-IP limits are provider-controlled. LocalCodingAgent retrieves up to
+three result pages through its own safe HTTPS reader, which checks and caches
+each host's `robots.txt` policy and refuses unknown or disallowed policies.
+There is no automatic
+provider substitution. Keyless search is not zero-data-retention, so do not
+include private project details or sensitive information. Retrieved pages are
+untrusted evidence. Use the source links to inspect them; **Save to Knowledge
+Library** retains a bounded excerpt in this project’s existing library.
+
+Ordinary chat never performs background research. No private project files,
+uploaded documents, or full conversation history are sent to the search
+provider. The online query is limited to the user’s research request and
+obvious secrets, local paths, code blocks, and email addresses are rejected or
+removed. For safe use, phrase the search as a general public topic.

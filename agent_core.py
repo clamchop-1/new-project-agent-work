@@ -201,9 +201,21 @@ class Project:
         self.identity = digest(str(self.root).casefold().encode())
 
     def git(self, *args):
+        # Repository inspection must not invoke a user configured fsmonitor
+        # helper or consult global/system Git settings. Those helpers can hang
+        # an authenticated project registration request before the bounded
+        # inventory code is reached. Preserve configured file-format settings
+        # such as core.autocrlf so Git status matches the user's repository.
         env = dict(os.environ, GIT_OPTIONAL_LOCKS='0', GIT_TERMINAL_PROMPT='0')
-        result = subprocess.run(['git', '-c', 'safe.directory=' + str(self.root), '-C', str(self.root), *args],
-                                env=env, capture_output=True, timeout=20)
+        command = ['git', '-c', 'core.fsmonitor=false', '-c',
+                   'safe.directory=' + str(self.root), '-C', str(self.root), *args]
+        try:
+            result = subprocess.run(command, env=env, stdin=subprocess.DEVNULL,
+                                    capture_output=True, timeout=20)
+        except subprocess.TimeoutExpired as exc:
+            raise AgentError('Git inspection exceeded its 20 second time limit.') from exc
+        except OSError as exc:
+            raise AgentError('Git inspection could not start safely.') from exc
         if result.returncode:
             raise AgentError('Git inspection failed: ' + result.stderr.decode(errors='replace')[:300])
         return result.stdout.decode('utf-8', errors='strict')

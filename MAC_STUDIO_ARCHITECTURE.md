@@ -363,3 +363,281 @@ patch validation, and conversation security. Full test discovery was not run.
 Project selection, source retrieval, automatic intent routing, coding proposals
 from chat, SkillLibrary integration, and authenticated browser review remain
 later phases. This status records Phase A only; it does not start Milestone 5.
+
+## Unified platform architecture and model inventory slice (2026-11-24)
+
+`PLAN.md` is the authoritative unified roadmap. This document remains the
+inference and model-runtime boundary reference. The platform should continue to
+use the Windows installation as the execution authority and the Mac as an
+inference host; inventory of a file never grants permission to load or run it.
+
+### Current model flow
+
+- `provider_specs` derives eligible endpoints from validated host configuration.
+  By default, local chat can discover Windows loopback Ollama and the enabled
+  Mac Studio Ollama profile; an explicit `--provider` scopes discovery to that
+  configured provider. The remote endpoint is still created only by the
+  enrolled `ssh_tunnel_ollama` factory and pinned-host SSH lifecycle.
+- `model_catalog.py` normalizes bounded `/api/version` and `/api/tags` results
+  into persistent provider/runtime/host/model/digest identities under ignored
+  `.local/model-catalog.json`. It records installed, discovered, available,
+  compatible, and authorized states separately, plus runtime metadata. Model
+  task capabilities remain unknown until independently measured and verified.
+- The chat selector displays host and model identity. Refresh repeats bounded
+  discovery. Submission resolves a current catalog key and rejects missing,
+  unavailable, incompatible, or unauthorized entries. Before inference, the
+  existing provider verifies the installed model again. No cloud fallback,
+  model download, Broker tool, or project context is involved.
+- `model_registry.py` remains the separate store for evidence-backed task
+  capability profiles and performance evidence; the runtime inventory does not
+  turn model tags into quality scores. `model_router.py` remains deterministic
+  routing for agent workflows, not an Auto chat router yet.
+
+This slice is functional for Ollama and managed SSH-tunnel Ollama only. The
+provider/runtime factory, streaming API, cancellation, and inventory row
+normalizer must be adapted before another runtime can be invoked. A future
+adapter must supply bounded discovery, stable identity/digest, compatibility
+and availability checks, capability provenance, resource requirements,
+streaming/cancellation, and deterministic cleanup. The Broker remains local.
+
+### Verified model/runtime inventory
+
+On 2026-11-24, Windows Ollama `0.40.18` returned these 11 installed tags:
+
+- `qwen3:8b-codex-8k`
+- `qwen3.5:4b-codex-test`
+- `qwen3:4b-codex-test`
+- `deepseek-r1:8b`
+- `qwen3.8:27b`
+- `qwen3.5:4b`
+- `qwen3:8b`
+- `gemma3:4b`
+- `llama3.2:3b`
+- `qwen2.5-coder:7b-instruct`
+- `qwen3:4b`
+
+Mac Ollama `0.40.17`, reached through the existing pinned route, returned
+`qwen3-coder:30b` and `qwen3:8b`. Both hosts report the same digest for
+`qwen3:8b`; the registry keeps their host identities separate. Ollama tag
+metadata reports GGUF format for all 13 host-tag entries, so they are
+compatible with the existing Ollama provider path. This does not prove
+task-specific quality, exact modality, current loaded status, or an adequate
+resource budget. The live registry obtains these entries each time the app
+starts or the user refreshes; persisted inventory alone is not an invocation
+grant.
+
+The live smoke at `.local/tests/model-catalog-live-468d9e437b5b/result.json`
+discovered and refreshed all 13 entries, then observed streamed output for
+Mac `qwen3-coder:30b` and Windows `qwen3:4b` in the same persistent
+conversation. Each stream included a selected-model identity event. This is
+live inference evidence for these two Ollama models, not a benchmark or a
+claim about the other models. Browser UI verification was blocked because the
+available browser helper could not determine the existing tab URL; no
+authenticated page was navigated.
+
+Windows hardware was checked read-only: MSI MS-7D25, Core i7-12700K, about
+31.8 GiB physical memory, RTX 3070 Ti with 8 GiB reported VRAM, and Intel UHD
+Graphics 770. Windows Ollama has no public/LAN exposure. Mac hardware and OS
+were not queried: the approved tunnel exposes Ollama's loopback HTTP API, not a
+host inventory API, and no shell was opened. To verify Mac hardware and local
+MLX/Hugging Face caches, authorize a separate read-only helper with a fixed
+allowlist of paths/fields and a bounded response schema. Do not widen the SSH
+tunnel or provide a general remote shell.
+
+### Other discovered runtimes and artifacts
+
+Bounded read-only inventory also identified:
+
+- Windows Hugging Face snapshot
+  `sentence-transformers/all-MiniLM-L6-v2`, snapshot
+  `1110a243fdf4706b3f48f1d95db1a4f5529b4d41`, with BERT config (hidden size
+  384, max positions 512) and safetensors/PyTorch/ONNX files. It is cached but
+  not registered with the current app, runtime compatibility is unverified,
+  and this chat path does not invoke it.
+- KronosStage private artifacts include MOSS-Audio-4B-Instruct,
+  MOSS-Music-8B-Instruct, Qwen3-Omni-30B-A3B-Thinking Q4_K_M with mmproj,
+  Demucs, and TinyMu/SmolLM2 experiment files. Static file presence was
+  observed. The local installation summary reports older inference validation
+  for MOSS-Audio, Qwen3-Omni, Demucs, CLAP, and an Ollama Qwen3 8B. That
+  summary is project evidence, not a fresh validation from this session.
+  MOSS-Music and the TinyMu experiments have no current runtime compatibility
+  evidence in this slice.
+- These artifacts are not exposed as selectable chat models. Additional
+  adapters need explicit runtime/environment identity, file integrity and
+  provenance checks, modality and hardware requirements, licensing review,
+  resource admission, safe weight loading, and cancellation/cleanup tests.
+  Do not execute project scripts or weight files during discovery.
+
+### Supported and planned adapter path
+
+| Source/runtime | Discovery boundary | Current state |
+|---|---|---|
+| Windows Ollama | Configured IPv4 loopback `/api/version` + `/api/tags` | Discovered, persisted, selectable through existing provider |
+| Mac Ollama | Existing enrolled profile, pinned host, run-scoped loopback SSH tunnel | Discovered, persisted, selectable; tunnel closes after discovery/request |
+| Mac MLX | No read-only host inventory adapter | Requires separately authorized fixed-output helper; runtime not integrated |
+| Hugging Face cache | Windows bounded snapshot path was inspected read-only | Artifact discovered, no safe runtime adapter or invocation grant |
+| Standalone GGUF / llama.cpp | KronosStage bounded directories inspected | GGUF files discovered; no catalog adapter or chat invocation path |
+| PyTorch / ONNX / sentence-transformers | Static files and cache/config inspected where named | No registry-backed adapter, resource policy, or selection/invocation path |
+| Audio / vision / speech | MOSS, Qwen Omni, Demucs, CLAP records/artifacts | Specialized model paths are candidates; no universal modality registry or chat routing |
+| Other projects / cloud providers | Not scanned or configured | Not authorized for this slice; no silent external transmission |
+
+The next architectural increment should define and contract-test the
+runtime-adapter interface, then integrate one non-chat capability (likely the
+cached embedding model) behind explicit local authorization. Keep Auto routing
+disabled until capability evidence, resource telemetry, model-selection
+receipts, and bounded fallback behavior can be explained. Continue to use the
+Windows Broker for every project read/write/test capability and approval.
+
+
+### Local document knowledge in chat (2026-11-24)
+
+The chat-only service now exposes a local Knowledge Library adapter backed by the
+same project-bound SQLite database as `KnowledgeIndex`. It stores TXT, Markdown,
+and bounded PDF imports, original bytes, chunk metadata, FTS5 keyword entries, and
+source hashes. Conversation-only attachments are filtered by conversation identity;
+persistent library entries remain project-bound to LocalCodingAgent. Evidence is
+passed as bounded untrusted excerpts to whichever already-authorized Ollama model
+the user selects. The application constructs the citation block from database
+metadata, including document hash and page or heading location. Imported document
+content does not become a skill or grant authority.
+
+The local Hugging Face `all-MiniLM-L6-v2` snapshot is now used through a bounded,
+offline CPU worker reusing the existing isolated OpenWebUI Python environment; no
+dependencies or model weights were installed or changed. The provider validates
+the snapshot digest and reports 384-dimensional normalized embeddings. FTS5 and
+semantic results are combined with reciprocal-rank fusion and preserve keyword
+fallback. `DocumentKnowledgeLibrary` backup now includes vectors, model identities,
+SkillLibrary registry, hash-verified referenced evidence, and bounded SkillLibrary
+recovery artifacts. Restore remains same-project and refuses nonempty destinations.
+Cross-root migration needs explicit evidence rebinding and review because project
+identity and approved skill references are root-bound. Disposable live API
+verification passed through both the Mac and Windows conversational models,
+including restart, restore, citations, and deletion. Browser UI verification
+remains unavailable because the computer-use browser host is down.
+
+### User-controlled internet research (2026-11-24)
+
+Research is a Windows-side, task-scoped adapter using the existing safe public
+web retrieval boundary. Local-only is the default. The chat offers explicit
+research-now and ask-before-research modes; an approval is one-use and bound to
+the conversation, sanitized objective, and selected authorized model. The Mac
+inference tunnel is not widened and the Mac model receives only bounded public
+source excerpts when the user has authorized research. There is no model shell,
+general network tool, background crawler, cloud fallback, or automatic source
+retention.
+
+The configured `firecrawl_keyless` provider calls Firecrawl's documented JSON
+Search API using the standard library and no account or API key. Its keyless
+service is free within provider-controlled daily per-IP limits; higher limits
+and zero-data-retention search require separate paid/enterprise authorization.
+Only the sanitized search topic is sent, and keyless search is not ZDR. Do not
+send private project details or sensitive searches to this provider. The prior
+DuckDuckGo HTML adapter returned an anti-bot challenge during a live check; the
+application does not bypass it or use it as an automatic fallback. Sessions are
+bounded to one search, three HTTPS page attempts, one cached `robots.txt` check
+per source host, 55 seconds, per-page and context character caps, a 2-second
+minimum inter-session interval, and 30 sessions per hour per process. Webpage
+URLs are DNS-checked and pinned to public addresses, redirects are refused,
+robots policy is checked fail-closed, and all fetched content remains untrusted.
+Sensitive-looking credentials, paths,
+emails, and code are filtered from query text before dispatch. The user-facing
+Research now option identifies that the topic is sent to Firecrawl, and the
+approval prompt explains the same disclosure before a request.
+
+The KnowledgeIndex remains the only persistent knowledge store. Research is
+temporary by default; users can explicitly save a bounded excerpt with URL,
+retrieval/publication metadata, and hashes into the current project library.
+Future search APIs must implement the provider contract without granting model
+network authority, must disclose data handling and credentials, and must honor
+retention restrictions before results can be persisted. Optional autonomous
+learning remains a future user-started, budgeted, reviewable session; ordinary
+chat never initiates it.
+
+### Read-only project intelligence (2026-11-24)
+
+Project registration is a separate user-authorized capability in the chat
+dashboard. A registered project ID is the existing canonical-root-derived
+`Project.identity`; project scope is persisted on each conversation. General
+conversations have no project identity, and project retrieval is limited to the
+one registered project bound to that conversation.
+
+The project adapter uses fixed read-only Git metadata commands only: branch,
+commit, porcelain status, bounded recent history, remotes, local remote-tracking
+refs, and a bounded `git ls-files` inventory. It never fetches, clones, checks
+out, changes the index, or executes repository scripts. Remote relationships
+are explicitly labeled cached. Remote URLs are reduced to host/repository
+identity so embedded userinfo and query values are not retained.
+
+Supported source files are hash-indexed by the existing `KnowledgeIndex` and
+FTS5/optional MiniLM retrieval. The KnowledgeIndex now accepts an owner-validated
+storage location: project source bytes remain read-only while the index is stored
+under the LocalCodingAgent ignored `.local/project-intelligence/indexes/<project
+identity>/` tree. The per-project database records the source project's own
+identity. File discovery and indexing have explicit byte, file, size, and time
+bounds. Generated directories, environment files, credentials, binary/model
+weights, audio/media, linked/reparse paths, and hard-linked files are excluded
+or rejected. Untrusted project instructions and source text are passed only as
+bounded reference excerpts; they cannot grant tools or authority.
+
+Before emitting source references, the service reopens each indexed chunk,
+rechecks the current document hash and indexed line range, and withholds stale
+citations if source bytes changed during generation. Citations include project,
+relative path, lines, section, commit, and SHA-256. The user-supplied public
+research policy remains unchanged; project analysis never triggers a network
+fetch. GitHub URL identity may be displayed from local remote config, but public
+API/issue/PR retrieval is a future adapter that must use task-scoped research
+authorization.
+
+Live disposable verification on 2026-11-24 used actual Windows Ollama
+`qwen3:8b` and Mac Studio Ollama `qwen3-coder:30b`. Each generated a response
+from the same project index and emitted a currently hash-validated citation to
+`pipeline.py`; no production project was registered. Evidence is retained under
+`.local/tests/project-live-44343b6fe354465f8c6bf7637201eb52/result.json`.
+The browser helper reported that its browser access host was unavailable, so
+this is authenticated API/live-model evidence, not browser acceptance. Use the
+manual checklist in PLAN.md before treating project UI acceptance as complete.
+
+### Future chat visual and live metrics
+
+The user wants a later visual redesign that may use a sound-recording waveform
+motif while the model is working, plus an optional live Mac/AI metrics view for
+resource use, tokens, and generation speed. These are not implemented here.
+Animations must reflect real lifecycle state, not fabricated model activity.
+Any metric must identify its source and observation time; unsupported or
+unavailable telemetry must be clearly marked. Mac hardware/OS introspection
+requires a separate fixed-output read-only mechanism; the current SSH tunnel
+remains inference-only.
+
+### Trusted conversational capability dispatch
+
+The chat dashboard describes a code-owned capability registry at runtime and
+recognizes a narrow set of clear user requests for registered-project
+operations. Current handlers list registered projects, bind a conversation to
+an exact registered project, inspect bounded local Git status, list eligible
+relative paths, read one explicitly named bounded UTF-8 file, and search the
+existing project KnowledgeIndex. Dispatch accepts fixed capability identifiers
+and strict input schemas; model output and repository content cannot add
+handlers.
+
+All returned project data is marked as untrusted reference material. File reads
+use the existing Git inventory, source exclusions, path containment checks,
+regular-file and size checks, and secret scan. Direct reads are rehashed after
+model generation; indexed passages are revalidated against index metadata and
+current bytes before citations are emitted. Capability audit records retain
+identities, result/argument hashes, state, and time, not source content or raw
+arguments. Shell access, writes, builds, and test execution remain outside the
+chat registry. Registration remains a separate authenticated explicit-confirm
+operation until a one-use approval card can bind the selected root, scope, and
+conversation.
+
+The next integration should expose a time-limited one-use registration approval
+then, separately, a Broker-backed pinned-test capability that preserves the
+existing operator approval, receipt, cancellation, and recovery behavior. Do
+not grant tools from model-authored proposals or add arbitrary terminal access.
+
+Future model inventory remains adapter-based and may add Ollama, MLX,
+Hugging Face Transformers, PyTorch, ONNX, GGUF, and interchangeable audio and
+vision runtimes after compatibility and authorization checks. Any future use of
+Music Flamingo, Audio Flamingo 3, Qwen3-Omni, CLAP, Demucs, or Basic Pitch must
+record checkpoint provenance and license terms. Verify exact checkpoint rights
+before paid-performance, commercial, or distribution use.

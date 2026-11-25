@@ -11,6 +11,8 @@ import re
 import socket
 import ssl
 from urllib.parse import parse_qs, quote_plus, urljoin, urlsplit, urlunsplit
+from urllib.robotparser import RobotFileParser
+import threading
 import uuid
 
 from agent_core import AgentError, atomic_write, exclusive, no_secrets
@@ -18,6 +20,8 @@ from agent_core import AgentError, atomic_write, exclusive, no_secrets
 MAX_RESPONSE_BYTES = 1_000_000
 MAX_TEXT_CHARS = 16_000
 USER_AGENT = 'LocalCodingAgent/1.0 (public read-only retrieval)'
+_ROBOTS_LOCK = threading.Lock()
+_ROBOTS_CACHE = {}
 
 
 def _safe_url(url):
@@ -99,8 +103,16 @@ class _VisibleText(HTMLParser):
         self.parts = []
         self.skip = 0
         self.in_title = False
+        self.publication_date = None
 
     def handle_starttag(self, tag, attrs):
+        values = dict(attrs)
+        if tag == 'meta' and not self.publication_date:
+            key = (values.get('property') or values.get('name') or values.get('itemprop') or '').casefold()
+            if key in {'article:published_time','datepublished','date','dc.date','pubdate'}:
+                candidate = values.get('content') or values.get('datetime')
+                if candidate and re.fullmatch(r'\d{4}-\d{2}-\d{2}(?:[tT][0-9:.+zZ-]+)?',candidate):
+                    self.publication_date = candidate[:80]
         if tag in ('script', 'style', 'noscript', 'svg'):
             self.skip += 1
         if tag == 'title':
@@ -120,6 +132,7 @@ class _VisibleText(HTMLParser):
 
 
 def read_web_page(url):
+    _check_robots_policy(url)
     canonical, content_type, body = fetch(url)
     if 'html' not in content_type.casefold() and not body.lstrip().startswith(b'<'):
         raise AgentError('The URL did not return an HTML page.')
@@ -129,13 +142,41 @@ def read_web_page(url):
     text = re.sub(r'\s+', ' ', ' '.join(parser.parts)).strip()[:MAX_TEXT_CHARS]
     if not text:
         raise AgentError('No readable page text was found.')
-    return _source('webpage', canonical, title, text)
+    return _source('webpage', canonical, title, text,
+                   publication_date=parser.publication_date)
 
 
-def _source(kind, url, title, content):
+def _check_robots_policy(url):
+    """Fail closed unless a public host's bounded robots policy permits the page."""
+    host, _, _, canonical = _safe_url(url)
+    now = datetime.now(timezone.utc).timestamp()
+    with _ROBOTS_LOCK:
+        cached = _ROBOTS_CACHE.get(host)
+        if cached and cached[0] > now:
+            allowed = cached[1].can_fetch(USER_AGENT, canonical)
+            if not allowed:
+                raise AgentError('The source site robots policy disallows this page.')
+            return
+    robots_url = f'https://{host}/robots.txt'
+    _, content_type, body = fetch(robots_url, limit=65_536, timeout=4)
+    if content_type and 'text/plain' not in content_type.casefold():
+        raise AgentError('Could not verify the source site robots policy.')
+    try:
+        policy = RobotFileParser(robots_url)
+        policy.parse(body.decode('utf-8', errors='replace').splitlines())
+    except (UnicodeError, ValueError) as exc:
+        raise AgentError('Could not parse the source site robots policy.') from exc
+    with _ROBOTS_LOCK:
+        _ROBOTS_CACHE[host] = (now + 600, policy)
+    if not policy.can_fetch(USER_AGENT, canonical):
+        raise AgentError('The source site robots policy disallows this page.')
+
+
+def _source(kind, url, title, content, *, publication_date=None):
     no_secrets(content)
     return {'source_id': uuid.uuid4().hex, 'kind': kind, 'url': url,
             'title': title[:300], 'retrieved_at': datetime.now(timezone.utc).isoformat(),
+            'publication_date':publication_date,
             'content': content[:MAX_TEXT_CHARS], 'content_sha256': hashlib.sha256(content.encode()).hexdigest(),
             'untrusted_content': True}
 
@@ -178,6 +219,7 @@ class _SearchResults(HTMLParser):
 def search_web(query, limit=5):
     if not isinstance(query, str) or not query.strip() or len(query) > 300:
         raise AgentError('Search query must contain 1 to 300 characters.')
+    no_secrets(query)
     if type(limit) is not int or not 1 <= limit <= 8:
         raise AgentError('Search result limit must be between 1 and 8.')
     url = 'https://html.duckduckgo.com/html/?q=' + quote_plus(query.strip())

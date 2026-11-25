@@ -44,3 +44,33 @@ class InferenceProvider(Protocol):
     def close(self) -> None:
         """Release provider-owned resources such as a managed SSH tunnel."""
         ...
+
+
+@runtime_checkable
+class StreamingModelAdapter(Protocol):
+    """Extension contract for future authorized model runtimes.
+
+    Adapters normalize runtime-specific discovery into provider/model identities,
+    verify an already-installed model immediately before use, stream text, honor
+    cancellation, and release only resources they own. Implementing this
+    protocol does not grant permission to discover or execute that runtime.
+    """
+
+    runtime_id: str
+
+    def discover_models(self) -> Sequence[Mapping[str, Any]]:
+        """Return a bounded inventory of installed models without loading them."""
+        ...
+
+    def verify_model(self, model_key: str) -> Mapping[str, Any]:
+        """Recheck availability and compatibility for one authorized identity."""
+        ...
+
+    def stream_chat(self, model_key: str, messages: Sequence[Mapping[str, Any]],
+                    on_token, *, cancel_event=None, timeout=None) -> None:
+        """Generate a bounded stream without exposing execution tools."""
+        ...
+
+    def close(self) -> None:
+        """Clean up only adapter-owned resources."""
+        ...
