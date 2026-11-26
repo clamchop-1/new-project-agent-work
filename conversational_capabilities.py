@@ -74,6 +74,58 @@ CAPABILITIES = (
         ('read-only registered project source',), 'none', 'low', '4 passages; 8,000 context characters',
         'citation hashes and current file bytes revalidated', 'fall back to a clear retrieval error; no source writes',
         'implemented; unit tested'),
+    Capability('knowledge.inventory', 'List accessible uploaded documents and indexed coverage',
+        {'name_filter': 'optional exact title or filename substring'}, 'bounded document inventory and coverage totals',
+        'knowledge_inventory', 'Windows dashboard', 'available in the active project library and current conversation scope',
+        ('read-only project document metadata',), 'none', 'low', '20 documents per response; no document text',
+        'project identity and global/current-conversation scope enforced by library',
+        'return a bounded inventory error; no index changes', 'implemented; unit tested'),
+    Capability('knowledge.latest', 'Identify and inspect the most recent accessible upload', {},
+        'latest document metadata and ingestion state', 'knowledge_latest', 'Windows dashboard',
+        'available in the active project library and current conversation scope',
+        ('read-only project document metadata',), 'none', 'low', 'one document',
+        'ordered by trusted upload timestamp; no semantic reference resolution',
+        'return unavailable when no accessible upload exists', 'implemented; unit tested'),
+    Capability('knowledge.inspect', 'Inspect one accessible document and its processing coverage',
+        {'reference': 'exact or unambiguous title, filename, or document identity'},
+        'document metadata, processing state and coverage', 'knowledge_inspect', 'Windows dashboard',
+        'available in the active project library and current conversation scope',
+        ('read-only project document metadata',), 'none', 'low', 'one document',
+        'exact identity or unambiguous title/filename match only',
+        'return ambiguity rather than guessing a document', 'implemented; unit tested'),
+    Capability('knowledge.sections', 'List extracted chapter, section, or page navigation labels',
+        {'reference': 'exact or unambiguous title, filename, or document identity'},
+        'bounded section list and source page ranges', 'knowledge_sections', 'Windows dashboard',
+        'available for an accessible indexed document', ('read-only indexed passages',), 'none', 'low',
+        '40 sections per response', 'document scope and stored passage hashes validated',
+        'report missing heading metadata without inventing a chapter list', 'implemented; unit tested'),
+    Capability('knowledge.chapter', 'Read a selected extracted chapter or section progressively',
+        {'reference': 'exact or unambiguous title, filename, or document identity',
+         'section': 'chapter or heading label'}, 'bounded section text, coverage and source page range',
+        'knowledge_chapter', 'Windows dashboard', 'available when indexed headings are present',
+        ('read-only indexed passages',), 'none', 'low', '5,000 characters per operation',
+        'selected document and each passage hash verified; truncation is explicit',
+        'report absent heading or remaining content; no guessed pages', 'implemented; unit tested'),
+    Capability('knowledge.pages', 'Read a verified PDF page range from original stored bytes',
+        {'reference': 'exact or unambiguous title, filename, or document identity',
+         'start_page': 'integer, 1-based', 'end_page': 'integer, at most 20 pages from start'},
+        'page text and verified document/page references', 'knowledge_pages', 'Windows dashboard',
+        'available for an accessible stored PDF', ('read-only original document bytes',), 'none', 'low',
+        '20 pages and 6,000 extracted characters', 'original SHA-256 and page count rechecked',
+        'report empty or failed pages explicitly; no OCR fallback', 'implemented; unit tested'),
+    Capability('knowledge.search', 'Search the library or one named document with bounded cited passages',
+        {'query': 'nonempty search text', 'reference': 'empty for all documents or exact/unambiguous document reference'},
+        'relevant indexed passages with page and chunk citations', 'knowledge_search', 'Windows dashboard',
+        'available in the active project library and current conversation scope',
+        ('read-only indexed passages',), 'none', 'low', '4 passages per response',
+        'document filters and conversation scope enforced; stored passage hashes checked',
+        'distinguish no matching excerpt from unavailable document', 'implemented; unit tested'),
+    Capability('knowledge.adjacent', 'Read neighboring chunks for a cited passage in the same document',
+        {'reference': 'exact or unambiguous document reference', 'chunk_id': '64-character stored chunk identity'},
+        'bounded adjacent excerpts with verified citations', 'knowledge_adjacent', 'Windows dashboard',
+        'available for an accessible indexed document', ('read-only indexed passages',), 'none', 'low',
+        'at most three adjacent passages', 'chunk identity must belong to selected document; hashes checked',
+        'report stale or mismatched chunk identity; no other documents read', 'implemented; unit tested'),
 )
 
 
@@ -132,6 +184,43 @@ class IntentRouter:
             value, re.I)
         if select:
             return ActionProposal('project.select', {'name': select.group(2).strip()})
+        if re.fullmatch(r'(what did i just upload|what did i upload|can you read (the )?(latest|most recent) document|read (the )?(latest|most recent) document)',folded):
+            return ActionProposal('knowledge.latest',{})
+        if re.fullmatch(r'(how many pages are indexed|how many documents are indexed|what is the knowledge library status)',folded):
+            return ActionProposal('knowledge.inventory',{'name_filter':''})
+        if re.fullmatch(r'(what documents (are|do i have)( available)?|what programming documentation do i have|which documents did i upload)',folded):
+            return ActionProposal('knowledge.inventory',{'name_filter':''})
+        inventory=re.fullmatch(r'(list|show)( me)?( all)?( my| available| accessible| uploaded)? (documents|uploads|knowledge library)',folded)
+        if inventory:
+            return ActionProposal('knowledge.inventory',{'name_filter':''})
+        named_inventory=re.fullmatch(r'(show|list)(?: me)? all my (.+?) (?:docs?|documents|documentation)',value,re.I)
+        if named_inventory:
+            return ActionProposal('knowledge.inventory',{'name_filter':named_inventory.group(2).strip()[:80]})
+        if re.fullmatch(r'(status|progress) of (the )?(knowledge library|my documents)',folded):
+            return ActionProposal('knowledge.inventory',{'name_filter':''})
+        chapter=re.fullmatch(r'(read|summarize) (?:chapter|section) (.+?)(?: of (.+))?',value,re.I)
+        if chapter:
+            return ActionProposal('knowledge.chapter',{'reference':(chapter.group(3) or 'latest').strip(),
+                'section':(chapter.group(2) or '').strip()})
+        pages=re.fullmatch(r'read pages? (\d+)(?:\s*[-–]\s*(\d+))?(?: of (.+))?',value,re.I)
+        if pages:
+            first=int(pages.group(1));last=int(pages.group(2) or first)
+            return ActionProposal('knowledge.pages',{'reference':(pages.group(3) or 'latest').strip(),
+                'start_page':first,'end_page':last})
+        inspect=re.fullmatch(r'(inspect|describe|check the status of) (?:the )?document (.+)',value,re.I)
+        if inspect:
+            return ActionProposal('knowledge.inspect',{'reference':inspect.group(2).strip()})
+        scoped_search=re.fullmatch(r'(?:search|find) (?:in )?(?:the )?(.+?) (?:documentation|document|manual) for (.+)',value,re.I)
+        if scoped_search:
+            return ActionProposal('knowledge.search',{'query':scoped_search.group(2).strip()[:240],
+                'reference':scoped_search.group(1).strip()})
+        search_examples=re.fullmatch(r'(?:find|search for) (?:examples? of )?(.+)',value,re.I)
+        if search_examples and re.search(r'\b(examples?|decorators?|api|selenium|python|documentation|docs?)\b',folded):
+            return ActionProposal('knowledge.search',{'query':search_examples.group(1).strip()[:240],'reference':''})
+        search_in=re.fullmatch(r'(?:search|find) (.+) in (?:the )?(.+?) (?:documentation|document|manual)',value,re.I)
+        if search_in:
+            return ActionProposal('knowledge.search',{'query':search_in.group(1).strip()[:240],
+                'reference':search_in.group(2).strip()})
         if not selected_project:
             return None
         if re.fullmatch(r'(show|get|inspect|check) (the )?(git )?status\??', folded):
@@ -150,9 +239,11 @@ class IntentRouter:
 
 
 class CapabilityDispatcher:
-    def __init__(self, project_intelligence, chat_store, *, registry=None, router=None):
+    def __init__(self, project_intelligence, chat_store, *, knowledge_store=None,
+                 registry=None, router=None):
         self.projects = project_intelligence
         self.conversations = chat_store
+        self.knowledge = knowledge_store
         self.registry = registry or CapabilityRegistry()
         self.router = router or IntentRouter()
         self._audit_lock = threading.Lock()
@@ -171,16 +262,25 @@ class CapabilityDispatcher:
             raise AgentError('Action arguments do not match the registered schema.')
         if cancel_event is not None and cancel_event.is_set():
             raise AgentError('Action was cancelled before execution.')
-        if self.projects is None:
+        if self.projects is None and not proposal.capability_id.startswith('knowledge.'):
             raise AgentError('Project registry is unavailable.')
+        if capability.capability_id.startswith('knowledge.'):
+            if self.knowledge is None:
+                raise AgentError('Knowledge Library is unavailable.')
+            audit_project_id=self.knowledge.project.identity
+        else:
+            audit_project_id=current_project_id
         action_id = __import__('uuid').uuid4().hex
         self._write_audit(action_id, 'started', conversation_id, capability.capability_id,
-                          current_project_id, proposal.arguments)
+                          audit_project_id, proposal.arguments)
         try:
             if capability.capability_id == 'projects.list':
                 result = self._list_projects()
             elif capability.capability_id == 'project.select':
                 result = self._select(proposal.arguments['name'], conversation_id)
+            elif capability.capability_id.startswith('knowledge.'):
+                result = self._execute_knowledge(capability.capability_id,
+                    proposal.arguments, conversation_id, cancel_event)
             else:
                 if current_project_id is None:
                     raise AgentError('Select a registered project before this action.')
@@ -199,12 +299,42 @@ class CapabilityDispatcher:
             if len(result_bytes) > MAX_RESULT_CHARS:
                 raise AgentError('Capability result exceeded its response budget.')
             self._write_audit(action_id, 'completed', conversation_id, capability.capability_id,
-                              current_project_id, proposal.arguments, result_bytes)
+                              audit_project_id, proposal.arguments, result_bytes)
             return {'capability_id': capability.capability_id, 'result': result}
         except Exception:
             self._write_audit(action_id, 'failed', conversation_id, capability.capability_id,
-                              current_project_id, proposal.arguments)
+                              audit_project_id, proposal.arguments)
             raise
+
+    def _execute_knowledge(self, capability_id, arguments, conversation_id, cancel_event):
+        if cancel_event is not None and cancel_event.is_set():
+            raise AgentError('Knowledge request was cancelled.')
+        if capability_id=='knowledge.inventory':
+            return self.knowledge.document_inventory(conversation_id=conversation_id,
+                name_filter=arguments['name_filter'] or None,limit=20)
+        if capability_id=='knowledge.latest':
+            return self.knowledge.inspect_document(None,conversation_id=conversation_id)
+        if capability_id=='knowledge.inspect':
+            return self.knowledge.inspect_document(arguments['reference'],conversation_id=conversation_id)
+        if capability_id=='knowledge.sections':
+            return self.knowledge.list_sections(arguments['reference'],conversation_id=conversation_id,limit=40)
+        if capability_id=='knowledge.chapter':
+            return self.knowledge.read_section(arguments['reference'],arguments['section'],
+                conversation_id=conversation_id)
+        if capability_id=='knowledge.pages':
+            return self.knowledge.read_pages(arguments['reference'],arguments['start_page'],
+                arguments['end_page'],conversation_id=conversation_id)
+        if capability_id=='knowledge.search':
+            reference=arguments['reference'].strip()
+            document_id=(self.knowledge._resolve_document(reference,conversation_id=conversation_id)['doc_id']
+                         if reference else None)
+            return self.knowledge.search(arguments['query'],conversation_id=conversation_id,limit=4,
+                provider=getattr(self.knowledge,'_embedding_provider',None),cancel_event=cancel_event,
+                document_id=document_id)
+        if capability_id=='knowledge.adjacent':
+            return self.knowledge.adjacent_chunks(arguments['reference'],arguments['chunk_id'],
+                conversation_id=conversation_id,before=1,after=1)
+        raise AgentError('Knowledge capability handler is unavailable.')
 
     def _write_audit(self, action_id, state, conversation_id, capability_id,
                      project_id, arguments, result_bytes=None):

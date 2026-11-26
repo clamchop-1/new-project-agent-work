@@ -1,14 +1,17 @@
 import hashlib
 import io
+import ctypes
 import sqlite3
 import json
 from pathlib import Path
 import shutil
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
+from unittest.mock import patch
 
 from agent_core import AgentError, file_hash
 from fixture_repo import make_fixture
@@ -22,6 +25,7 @@ from test_shared_memory import FixtureCase
 
 
 class FixtureEmbeddingProvider:
+    MAX_BATCH=64
     def __init__(self, model_id='fixture-minilm-v1', fail=False):
         self.model_id = model_id
         self.fail = fail
@@ -50,6 +54,127 @@ class KnowledgeDocumentTests(FixtureCase):
         super().setUp()
         self.library = DocumentKnowledgeLibrary(self.project)
 
+    @staticmethod
+    def process_working_set():
+        class Counters(ctypes.Structure):
+            _fields_=[('cb',ctypes.c_ulong),('page_fault_count',ctypes.c_ulong),
+                ('peak_working_set',ctypes.c_size_t),('working_set',ctypes.c_size_t),
+                ('peak_paged_pool',ctypes.c_size_t),('paged_pool',ctypes.c_size_t),
+                ('peak_nonpaged_pool',ctypes.c_size_t),('nonpaged_pool',ctypes.c_size_t),
+                ('pagefile',ctypes.c_size_t),('peak_pagefile',ctypes.c_size_t)]
+        try:
+            counters=Counters();counters.cb=ctypes.sizeof(counters)
+            psapi=ctypes.WinDLL('psapi',use_last_error=True);kernel=ctypes.WinDLL('kernel32',use_last_error=True)
+            if not psapi.GetProcessMemoryInfo(kernel.GetCurrentProcess(),ctypes.byref(counters),counters.cb):
+                return None
+            return counters.working_set
+        except (AttributeError,OSError):
+            return None
+
+    @staticmethod
+    def large_text_pdf(page_count):
+        from pypdf import PdfWriter
+        from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+        writer=PdfWriter()
+        font=writer._add_object(DictionaryObject({NameObject('/Type'):NameObject('/Font'),
+            NameObject('/Subtype'):NameObject('/Type1'),NameObject('/BaseFont'):NameObject('/Helvetica')}))
+        resources=DictionaryObject({NameObject('/Font'):DictionaryObject({NameObject('/F1'):font})})
+        for number in range(1,page_count+1):
+            page=writer.add_blank_page(width=612,height=792)
+            page[NameObject('/Resources')]=resources
+            if number==1:
+                text='Chapter One LCASTARTUNIQUE bounded queue programming manual'
+            elif number==page_count//2:
+                text='Chapter Five LCAMIDDLEUNIQUE Python decorators and explicit waits'
+            elif number==page_count:
+                text='Chapter Ten LCAENDUNIQUE API usage and common mistakes'
+            else:
+                text=f'Page {number} programming documentation examples'
+            stream=DecodedStreamObject()
+            stream.set_data(f'BT /F1 12 Tf 72 720 Td ({text}) Tj ET'.encode('ascii'))
+            page[NameObject('/Contents')]=writer._add_object(stream)
+        output=io.BytesIO();writer.write(output)
+        return output.getvalue()
+
+    def test_background_ingestion_resumes_after_restart_and_covers_thousand_pages(self):
+        provider=FixtureEmbeddingProvider()
+        library=DocumentKnowledgeLibrary(self.project,embedding_provider=provider)
+        self.addCleanup(library.close)
+        raw=self.large_text_pdf(1000)
+        started=time.monotonic()
+        peak_working_set=self.process_working_set() or 0
+        queued=library.queue_ingestion_stream('large-manual.pdf',io.BytesIO(raw),len(raw))
+        self.assertEqual(queued['status'],'queued')
+        job_id=queued['job_id']
+        deadline=time.monotonic()+30
+        while time.monotonic()<deadline:
+            job=library.list_ingestion_jobs()[0]
+            if job['processed_pages']>=5 or job['state'] in {'ready','partially_available','failed'}:
+                break
+            time.sleep(.01)
+        self.assertGreaterEqual(job['processed_pages'],5)
+        library.cancel_ingestion(job_id)
+        deadline=time.monotonic()+30
+        while time.monotonic()<deadline:
+            job=library.list_ingestion_jobs()[0]
+            if job['state']=='cancelled':break
+            time.sleep(.01)
+        self.assertEqual(job['state'],'cancelled')
+        checkpoint=job['processed_pages']
+        self.assertGreater(checkpoint,0)
+        self.assertLess(checkpoint,1000)
+
+        connection=library.index._connect()
+        try:
+            connection.execute("UPDATE library_ingestion_jobs SET state='extracting',cancel_requested=0 WHERE job_id=?",
+                               (job_id,));connection.commit()
+        finally:
+            connection.close()
+        restarted=DocumentKnowledgeLibrary(self.project,embedding_provider=provider)
+        self.addCleanup(restarted.close)
+        restarted.start_ingestion_worker()
+        deadline=time.monotonic()+180
+        while time.monotonic()<deadline:
+            peak_working_set=max(peak_working_set,self.process_working_set() or 0)
+            job=restarted.list_ingestion_jobs()[0]
+            if job['state'] in {'ready','partially_available','failed'}:break
+            time.sleep(.02)
+        elapsed=time.monotonic()-started
+        self.assertEqual(job['state'],'ready',job.get('error'))
+        self.assertEqual((job['total_pages'],job['processed_pages'],job['extracted_pages']),
+                         (1000,1000,1000))
+        self.assertEqual(job['indexed_chunks'],1000)
+        self.assertEqual(job['embedded_chunks'],1000)
+        self.assertGreater(elapsed,0)
+        self.assertTrue(restarted.verify()['valid'])
+        for sentinel,page in [('lcastartunique',1),('lcamiddleunique',500),('lcaendunique',1000)]:
+            hits=restarted.search(sentinel,document_id=job_id,limit=1,retrieval_mode='keyword')['results']
+            self.assertEqual(hits[0]['page_number'],page)
+        page=restarted.read_pages('large-manual.pdf',500,500)
+        self.assertEqual(page['pages'][0]['status'],'read')
+        self.assertIn('LCAMIDDLEUNIQUE',page['pages'][0]['text'])
+        sections=restarted.list_sections('large-manual.pdf',limit=40)
+        self.assertTrue(any('Chapter Five' in item['section'] for item in sections['sections']))
+        chapter=restarted.read_section('large-manual.pdf','chapter five')
+        self.assertFalse(chapter['text_complete'])
+        self.assertEqual((chapter['page_start'],chapter['page_end']),(500,999))
+        hit=restarted.search('lcamiddleunique',document_id=job_id,limit=1,retrieval_mode='keyword')['results'][0]
+        self.assertEqual(len(restarted.adjacent_chunks('large-manual.pdf',hit['chunk_id'])['chunks']),3)
+        duplicate=restarted.queue_ingestion_stream('renamed.pdf',io.BytesIO(raw),len(raw))
+        self.assertTrue(duplicate['duplicate'])
+        self.assertEqual(duplicate['document_id'],job_id)
+        connection=restarted.index._connect()
+        try:
+            chunk_storage=connection.execute('SELECT sum(length(content)) FROM library_chunks WHERE doc_id=?',
+                (job_id,)).fetchone()[0]
+        finally:
+            connection.close()
+        print(f'Large-document benchmark: 1000 pages, {len(raw)} upload bytes, '
+            f'{job["indexed_chunks"]} chunks, {job["embedded_chunks"]} embeddings, '
+            f'{elapsed:.2f}s ({1000/elapsed:.1f} pages/s), {chunk_storage} chunk bytes, '
+            f'{restarted.index.database.stat().st_size} database bytes, '
+            f'{peak_working_set or "unavailable"} peak working set bytes.')
+
     def test_upload_persists_original_hash_and_returns_verifiable_citation(self):
         raw = b'# Backpressure\nA bounded queue prevents unbounded memory growth in streaming pipelines.\n'
         saved = self.library.ingest('queues.md', raw)
@@ -60,6 +185,27 @@ class KnowledgeDocumentTests(FixtureCase):
         self.assertEqual(hit['citation']['location'], 'Backpressure')
         self.assertEqual(hit['evidence_state'], 'indexed_content_hash_verified')
         self.assertTrue(self.library.verify()['valid'])
+
+    def test_document_study_persists_progress_and_unverified_candidates(self):
+        saved=self.library.ingest('study-guide.md',b'# Chapter One\nUse bounded retries with exponential backoff.\n\n# Chapter Two\nValidate inputs before parsing.')
+        study=self.library.start_study(saved['document_id'])
+        section=self.library.next_study_section(study['study_id'])['section']
+        self.assertTrue(section['passages'])
+        recorded=self.library.record_study_section(study['study_id'],section['ordinal'],
+            summary='The chapter recommends bounded retries.',concepts=['backoff'],
+            examples=['retry loop'],lessons=['Cap retries and add jitter.'])
+        self.assertEqual(recorded['completed_sections'],1)
+        connection=self.library.index._connect()
+        try:
+            row=connection.execute('SELECT * FROM library_study_sections WHERE study_id=? AND ordinal=?',
+                (study['study_id'],section['ordinal'])).fetchone()
+            self.assertTrue(json.loads(row['source_chunks_json']))
+            self.assertEqual(json.loads(row['lessons_json'])[0]['status'],'unverified_candidate')
+            self.assertFalse(json.loads(row['lessons_json'])[0]['executable'])
+        finally: connection.close()
+        resumed=DocumentKnowledgeLibrary(self.project)
+        self.addCleanup(resumed.close)
+        self.assertEqual(resumed.study_status(study['study_id'])['completed_sections'],1)
 
     def test_exact_duplicates_are_detected_and_not_reindexed(self):
         raw = b'The immutable index stores provenance and content hashes.'
@@ -88,10 +234,12 @@ class KnowledgeDocumentTests(FixtureCase):
 
     def test_unsupported_oversized_invalid_and_secret_content_are_rejected(self):
         for name, raw in [('book.epub', b'not supported'), ('bad.txt', b'\xff'),
-                          ('big.md', b'x' * (8 * 1024 * 1024 + 1)),
                           ('secret.txt', b'password = "not-a-public-example"')]:
             with self.subTest(name=name), self.assertRaises(AgentError):
                 self.library.ingest(name, raw)
+        with patch('knowledge_documents.MAX_UPLOAD_BYTES',100):
+            with self.assertRaisesRegex(AgentError,'Document must be nonempty'):
+                self.library.ingest('big.md',b'x'*101)
 
     def test_malicious_document_text_remains_untrusted_reference_and_not_a_skill(self):
         self.library.ingest('injection.md',

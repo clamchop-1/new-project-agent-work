@@ -1,5 +1,35 @@
 # Local coding agent implementation
 
+## Priority Knowledge Library remediation — 2026-11-25
+
+**Active objective:** temporarily suspend Increment 5 and remediate large-document ingestion, inventory/navigation capabilities, retrieval strategy, study progress, and citation rendering. Preserve all Increment 1–4 work and historical roadmap items below. Do not begin Increment 5 until large-document and document-awareness acceptance is adequate.
+
+### Audit evidence before remediation
+
+- The existing project library is `.local/knowledge/index.sqlite3`, schema v4, bound to this repository identity. Read-only inspection found three current global PDFs (24, 30, and 38 pages), 94 indexed chunks and 94 embeddings. Each stored original length and SHA-256 matched; fresh pypdf parsing confirmed page counts. Two documents each have one page yielding no text. The reported thousands-page documents are not in this library, so their upload outcome cannot be inferred from persisted records.
+- Existing implementation limits: 8 MiB upload and HTTP body, 300 PDF pages, 4,000,000 extracted characters, 12,000 library chunks, 256 chunks per semantic batch, and at most eight retrieved passages (two per document). Upload/extraction/chunking/indexing are synchronous; failures leave no durable ingestion job record. Empty pages are skipped without coverage warnings.
+- Conversational capabilities do not include document inventory/navigation. Ordinary chat runs one hybrid top-K passage search. Source citations are appended to assistant text and also emitted as a token alongside structured sources, creating duplicate presentation.
+
+### Work sequence
+
+1. Preserve the read-only audit and add isolated large-document fixtures; never rebuild or reprocess the existing library without verified backup and task-specific authorization.
+2. Implement persistent, bounded ingestion jobs with streamed upload, page-level extraction, incremental index/embedding batches, truthful progress, cancellation, interruption recovery, duplicate and coverage verification, and explicit partial/failure states.
+3. Add trusted read-only document inventory, metadata, page-range, section, adjacent-chunk and document-scoped search capabilities; route inventory/navigation/study requests separately from factual retrieval.
+4. Add progressive study records and unpromoted candidate lessons with page provenance; preserve project/conversation isolation and prompt-injection boundaries.
+5. Improve Knowledge Library UI, retrieval context budgeting, and single-source citation rendering; verify browser acceptance with authenticated Mac and Windows inference.
+6. Exercise hundreds- and thousands-page disposable fixtures, including start/middle/end sentinels, interruption/resume, resource measurements, retrieval scope, citations, and isolation. Run focused checks, then one bounded regression after stabilization.
+
+### Hold and authorization boundaries
+
+- Increment 5 remains suspended through acceptance of this remediation.
+- Existing documents, conversations, indexes, candidates, registrations, and evidence are preserved. Existing-library acceptance is read-only. Any reprocessing requires a verified backup and task-specific authorization.
+- The separate Phase B.6C forensic hold remains in force. Do not touch VHDX/VM artifacts or ledgers.
+- Mac Studio remains inference-only; Windows Broker remains source-write/test authority. Document contents are untrusted and cannot grant execution authority. Candidate skills remain unpromoted until validated and approved.
+
+### Historical roadmap preservation
+
+Retain all prior future phases below: authorized file/project creation and coding, compilation/build and controlled runs, debugging, Git/GitHub, intelligent multi-agent/model routing, additional local model runtimes and licensing, music/audio/vision recognition, validated knowledge/skill acquisition, telemetry and performance metrics, activity-driven UI, knowledge portability, and secure multi-computer access. These remain deferred until the priority Knowledge Library exit criteria are met.
+
 **Historical handoff:** The prior low-usage stop and `.local/SETUP_HANDOFF.md`
 remain in force for work outside the narrowly authorized integration milestone
 below. Recalling project memory alone does not resume held work.

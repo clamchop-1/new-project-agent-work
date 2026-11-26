@@ -12,6 +12,7 @@ import json
 import os
 import re
 import sqlite3
+import threading
 from typing import Protocol, runtime_checkable
 import uuid
 from urllib.parse import urlsplit
@@ -22,11 +23,12 @@ from agent_core import AgentError, Project, atomic_write
 from knowledge_index import (KnowledgeIndex, _content_text, chunk_document, _is_reparse,
                              _pack_vector, _unpack_vector, _vector, RRF_K)
 
-MAX_UPLOAD_BYTES = 8 * 1024 * 1024
-MAX_EXTRACTED_CHARS = 4_000_000
-MAX_PDF_PAGES = 300
+MAX_UPLOAD_BYTES = 512 * 1024 * 1024
+MAX_EXTRACTED_CHARS = 250_000_000
+MAX_PDF_PAGES = 10_000
 MAX_LIBRARY_DOCUMENTS = 500
 MAX_LIBRARY_CHUNKS = 12000
+MAX_EMBEDDING_BATCH = 64
 MAX_DOCUMENT_VERSIONS = 32
 MAX_BACKUP_BYTES = 256 * 1024 * 1024
 MAX_RETRIEVAL_RESULTS = 8
@@ -38,6 +40,14 @@ SUPPORTED = {'.txt': 'text/plain', '.md': 'text/markdown', '.markdown': 'text/ma
              '.pdf': 'application/pdf'}
 CONVERSATION_ID = re.compile(r'^[a-f0-9]{32}$')
 DOCUMENT_ID = re.compile(r'^[a-f0-9]{32}$')
+
+
+class _IngestionCancelled(Exception):
+    """Internal signal for a safely checkpointed user cancellation."""
+
+
+class _IngestionPaused(Exception):
+    """Internal signal for a clean shutdown between durable checkpoints."""
 
 
 @runtime_checkable
@@ -72,7 +82,7 @@ def _safe_filename(value: str) -> str:
 def _extract(filename: str, raw: bytes) -> tuple[list[dict], int | None, str]:
     suffix = '.' + filename.rsplit('.', 1)[-1].casefold()
     if not raw or len(raw) > MAX_UPLOAD_BYTES:
-        raise AgentError('Document must be nonempty and no larger than 8 MiB.')
+        raise AgentError(f'Document must be nonempty and no larger than {MAX_UPLOAD_BYTES // (1024 * 1024)} MiB.')
     pages = None
     if suffix == '.pdf':
         if not raw.startswith(b'%PDF-'):
@@ -85,7 +95,7 @@ def _extract(filename: str, raw: bytes) -> tuple[list[dict], int | None, str]:
                 raise AgentError('Encrypted PDFs are not supported.')
             pages = len(reader.pages)
             if pages < 1 or pages > MAX_PDF_PAGES:
-                raise AgentError('PDF must contain between 1 and 300 pages.')
+                raise AgentError(f'PDF must contain between 1 and {MAX_PDF_PAGES} pages.')
             chunks = []
             total = 0
             for number, page in enumerate(reader.pages, 1):
@@ -169,11 +179,52 @@ class DocumentKnowledgeLibrary:
                     publication_date TEXT, source_content_sha256 TEXT NOT NULL,
                     research_objective_sha256 TEXT NOT NULL
                 );
-                INSERT INTO metadata(key,value) VALUES('library_schema_version','4')
+                CREATE TABLE IF NOT EXISTS library_ingestion_jobs (
+                    job_id TEXT PRIMARY KEY, doc_id TEXT NOT NULL UNIQUE
+                        REFERENCES library_documents(doc_id) ON DELETE CASCADE,
+                    project_id TEXT NOT NULL, spool_name TEXT NOT NULL,
+                    state TEXT NOT NULL, stage TEXT NOT NULL,
+                    total_bytes INTEGER NOT NULL, total_pages INTEGER,
+                    processed_pages INTEGER NOT NULL DEFAULT 0,
+                    extracted_pages INTEGER NOT NULL DEFAULT 0,
+                    indexed_chunks INTEGER NOT NULL DEFAULT 0,
+                    embedded_chunks INTEGER NOT NULL DEFAULT 0,
+                    extracted_chars INTEGER NOT NULL DEFAULT 0,
+                    active_section TEXT NOT NULL DEFAULT '',
+                    empty_page_count INTEGER NOT NULL DEFAULT 0,
+                    empty_pages_json TEXT NOT NULL DEFAULT '[]',
+                    failure_pages_json TEXT NOT NULL DEFAULT '[]',
+                    warnings_json TEXT NOT NULL DEFAULT '[]',
+                    error TEXT, cancel_requested INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS library_jobs_scope
+                    ON library_ingestion_jobs(project_id,state,updated_at);
+                CREATE TABLE IF NOT EXISTS library_studies (
+                    study_id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+                    doc_id TEXT NOT NULL REFERENCES library_documents(doc_id) ON DELETE CASCADE,
+                    conversation_id TEXT, source_sha256 TEXT NOT NULL, state TEXT NOT NULL,
+                    total_sections INTEGER NOT NULL, completed_sections INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS library_study_sections (
+                    study_id TEXT NOT NULL REFERENCES library_studies(study_id) ON DELETE CASCADE,
+                    ordinal INTEGER NOT NULL, section TEXT NOT NULL, page_start INTEGER, page_end INTEGER,
+                    source_chunks_json TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending',
+                    summary TEXT, concepts_json TEXT NOT NULL DEFAULT '[]',
+                    examples_json TEXT NOT NULL DEFAULT '[]', lessons_json TEXT NOT NULL DEFAULT '[]',
+                    updated_at TEXT NOT NULL, PRIMARY KEY(study_id,ordinal)
+                );
+                INSERT INTO metadata(key,value) VALUES('library_schema_version','5')
                     ON CONFLICT(key) DO NOTHING;
             ''')
+            job_columns = {row['name'] for row in connection.execute(
+                'PRAGMA table_info(library_ingestion_jobs)').fetchall()}
+            if 'active_section' not in job_columns:
+                connection.execute("ALTER TABLE library_ingestion_jobs ADD COLUMN active_section TEXT NOT NULL DEFAULT ''")
+                connection.commit()
             version = self.index._meta(connection, 'library_schema_version')
-            if version in {'1','2','3'}:
+            if version in {'1','2','3','4'}:
                 document_columns = {row['name'] for row in connection.execute(
                     'PRAGMA table_info(library_documents)').fetchall()}
                 if version in {'1','2'}:
@@ -190,10 +241,10 @@ class DocumentKnowledgeLibrary:
                         ('embedding_version', 'TEXT'), ('embedding_digest', 'TEXT')):
                         if name not in chunk_columns:
                             connection.execute(f'ALTER TABLE library_chunks ADD COLUMN {name} {declaration}')
-                connection.execute("UPDATE metadata SET value='4' WHERE key='library_schema_version'")
+                connection.execute("UPDATE metadata SET value='5' WHERE key='library_schema_version'")
                 connection.commit()
-                version = '4'
-            if version != '4':
+                version = '5'
+            if version != '5':
                 raise AgentError('Document library schema is unsupported; preserve the knowledge index.')
             identity = self.index._meta(connection, 'project_id')
             if identity is None:
@@ -221,6 +272,11 @@ class DocumentKnowledgeLibrary:
         except AgentError:
             # A concurrent or unreconciled writer owns the database; leave its state untouched.
             pass
+        self._job_condition = threading.Condition()
+        self._worker = None
+        self._worker_stop = False
+        self._active_job = None
+        self._requeue_interrupted_jobs()
 
     def _provider(self):
         provider = self._embedding_provider
@@ -243,6 +299,506 @@ class DocumentKnowledgeLibrary:
         if value is not None and (not isinstance(value, str) or not CONVERSATION_ID.fullmatch(value)):
             raise AgentError('Conversation identity is invalid.')
         return value
+
+    def queue_ingestion_stream(self, filename, source, content_length, *, scope='global',
+                               conversation_id=None, title=None) -> dict:
+        """Persist an upload and a resumable job while reading it in bounded blocks."""
+        filename = _safe_filename(filename)
+        if (type(content_length) is not int or not 1 <= content_length <= MAX_UPLOAD_BYTES
+                or not callable(getattr(source, 'read', None))):
+            raise AgentError(f'Document must be nonempty and no larger than {MAX_UPLOAD_BYTES // (1024 * 1024)} MiB.')
+        if scope not in {'global', 'conversation'}:
+            raise AgentError('Document retention must be global or this conversation.')
+        conversation_id = self._conversation(conversation_id)
+        if scope == 'conversation' and conversation_id is None:
+            raise AgentError('Choose or create a conversation before attaching a temporary document.')
+        if scope == 'global':
+            conversation_id = None
+        display_title = title.strip() if isinstance(title, str) else filename.rsplit('.', 1)[0]
+        display_title = display_title[:160]
+        if not display_title or len(display_title.encode('utf-8')) > 512:
+            raise AgentError('Document title is invalid.')
+
+        self.index._check_private(create=True)
+        spool_directory = self.index.directory / 'ingestion-spool'
+        spool_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if spool_directory.is_symlink() or not spool_directory.resolve().is_relative_to(self.index.directory.resolve()):
+            raise AgentError('Knowledge upload spool is not a private project-local directory.')
+        job_id = uuid.uuid4().hex
+        spool_name = job_id + '.upload'
+        spool_path = spool_directory / spool_name
+        digest = hashlib.sha256()
+        received = 0
+        try:
+            with spool_path.open('xb') as spool:
+                while received < content_length:
+                    block = source.read(min(1024 * 1024, content_length - received))
+                    if not block:
+                        raise AgentError('Upload ended before its declared content length.')
+                    if not isinstance(block, bytes):
+                        raise AgentError('Upload stream returned non-byte content.')
+                    received += len(block)
+                    if received > content_length:
+                        raise AgentError('Upload exceeded its declared content length.')
+                    digest.update(block)
+                    spool.write(block)
+                spool.flush()
+                os.fsync(spool.fileno())
+
+            raw_hash = digest.hexdigest()
+            with self._writer_lock('document-ingestion-queue'):
+                connection = self.index._connect()
+                try:
+                    existing = connection.execute('''SELECT doc_id,title,scope FROM library_documents
+                        WHERE project_id=? AND scope=? AND ifnull(conversation_id,'')=ifnull(?,'')
+                        AND content_sha256=? AND status='current' LIMIT 1''',
+                        (self.project.identity, scope, conversation_id, raw_hash)).fetchone()
+                    if existing:
+                        spool_path.unlink(missing_ok=True)
+                        return {'document_id': existing['doc_id'], 'duplicate': True,
+                                'duplicate_of': existing['doc_id'], 'title': existing['title'],
+                                'scope': existing['scope'], 'status': 'already_indexed'}
+                    previous = connection.execute('''SELECT doc_id,document_version FROM library_documents
+                        WHERE project_id=? AND scope=? AND ifnull(conversation_id,'')=ifnull(?,'')
+                        AND lower(original_name)=lower(?) AND status='current' LIMIT 1''',
+                        (self.project.identity, scope, conversation_id, filename)).fetchone()
+                    if previous and previous['document_version'] >= MAX_DOCUMENT_VERSIONS:
+                        raise AgentError('Document version history reached its bounded 32-version limit.')
+                    active_count = connection.execute('''SELECT count(*) FROM library_documents
+                        WHERE project_id=? AND status='current' ''', (self.project.identity,)).fetchone()[0]
+                    if active_count >= MAX_LIBRARY_DOCUMENTS:
+                        raise AgentError('Knowledge library is at its bounded document capacity.')
+                    connection.execute('BEGIN IMMEDIATE')
+                    cursor = connection.execute('''INSERT INTO library_documents
+                        (doc_id,project_id,scope,conversation_id,title,original_name,extension,mime_type,
+                         content_sha256,byte_size,page_count,status,duplicate_of,semantic_status,
+                         document_version,version_of,created_at,original)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,NULL,'current',NULL,'extracting',?,?,?,zeroblob(?))''',
+                        (job_id, self.project.identity, scope, conversation_id, display_title, filename,
+                         '.' + filename.rsplit('.', 1)[-1].casefold(),
+                         SUPPORTED['.' + filename.rsplit('.', 1)[-1].casefold()], raw_hash,
+                         content_length, (previous['document_version'] + 1) if previous else 1,
+                         previous['doc_id'] if previous else None, _now(), content_length))
+                    rowid = cursor.lastrowid
+                    with connection.blobopen('library_documents', 'original', rowid, readonly=False) as target:
+                        with spool_path.open('rb') as stored:
+                            while True:
+                                block = stored.read(1024 * 1024)
+                                if not block:
+                                    break
+                                target.write(block)
+                    connection.execute('''INSERT INTO library_ingestion_jobs
+                        (job_id,doc_id,project_id,spool_name,state,stage,total_bytes,created_at,updated_at)
+                        VALUES(?,?,?,?,?,?,?,?,?)''',
+                        (job_id, job_id, self.project.identity, spool_name, 'queued', 'queued',
+                         content_length, _now(), _now()))
+                    connection.commit()
+                except BaseException:
+                    if connection.in_transaction:
+                        connection.rollback()
+                    raise
+                finally:
+                    connection.close()
+        except BaseException:
+            spool_path.unlink(missing_ok=True)
+            raise
+        self._notify_worker()
+        return {'document_id': job_id, 'job_id': job_id, 'duplicate': False,
+                'title': display_title, 'scope': scope, 'status': 'queued',
+                'byte_size': content_length, 'content_sha256': raw_hash}
+
+    def _notify_worker(self):
+        self.start_ingestion_worker()
+        with self._job_condition:
+            self._job_condition.notify_all()
+
+    def start_ingestion_worker(self):
+        """Start one project-scoped daemon worker for queued durable jobs."""
+        connection=self.index._connect()
+        try:
+            pending=connection.execute('''SELECT count(*) FROM library_ingestion_jobs
+                WHERE project_id=? AND state='queued' ''',(self.project.identity,)).fetchone()[0]
+        finally:
+            connection.close()
+        if not pending:
+            return
+        with self._job_condition:
+            if self._worker is not None and self._worker.is_alive():
+                return
+            self._worker_stop = False
+            self._worker = threading.Thread(target=self._ingestion_loop,
+                name='knowledge-ingestion-' + self.project.identity[:8], daemon=True)
+            self._worker.start()
+
+    def _requeue_interrupted_jobs(self):
+        connection = self.index._connect()
+        try:
+            connection.execute('''UPDATE library_ingestion_jobs SET state='queued',stage='resuming',updated_at=?
+                WHERE project_id=? AND state IN ('extracting','indexing','embedding')''',
+                (_now(), self.project.identity))
+            connection.commit()
+        finally:
+            connection.close()
+
+    def list_ingestion_jobs(self, *, conversation_id=None) -> list[dict]:
+        conversation_id = self._conversation(conversation_id)
+        connection = self.index._connect()
+        try:
+            rows = connection.execute('''SELECT j.*,d.title,d.original_name,d.extension,d.byte_size,
+                    d.content_sha256,d.scope,d.conversation_id,d.page_count,d.semantic_status
+                FROM library_ingestion_jobs j JOIN library_documents d ON d.doc_id=j.doc_id
+                WHERE j.project_id=? AND (d.scope='global' OR d.conversation_id=?)
+                ORDER BY j.created_at DESC LIMIT ?''',
+                (self.project.identity, conversation_id or '', MAX_LIBRARY_DOCUMENTS)).fetchall()
+            result = []
+            for row in rows:
+                item = dict(row)
+                for name in ('empty_pages_json','failure_pages_json','warnings_json'):
+                    try:
+                        item[name[:-5]] = json.loads(item.pop(name))
+                    except (json.JSONDecodeError, TypeError):
+                        item[name[:-5]] = []
+                item['processing_percent'] = (round(100 * item['processed_pages'] / item['total_pages'], 1)
+                    if item['total_pages'] else (100.0 if item['state'] in {'ready','partially_available'} else None))
+                item['search_ready'] = item['indexed_chunks'] > 0
+                result.append(item)
+            return result
+        finally:
+            connection.close()
+
+    def cancel_ingestion(self, job_id: str) -> dict:
+        if not isinstance(job_id, str) or not DOCUMENT_ID.fullmatch(job_id):
+            raise AgentError('Knowledge ingestion job identity is invalid.')
+        connection = self.index._connect()
+        try:
+            row = connection.execute('''SELECT state FROM library_ingestion_jobs
+                WHERE job_id=? AND project_id=?''', (job_id, self.project.identity)).fetchone()
+            if row is None:
+                raise AgentError('Knowledge ingestion job is unavailable in this project.')
+            if row['state'] in {'ready','partially_available','cancelled','failed'}:
+                return {'job_id': job_id, 'state': row['state']}
+            connection.execute('UPDATE library_ingestion_jobs SET cancel_requested=1,updated_at=? WHERE job_id=?',
+                                (_now(), job_id))
+            connection.commit()
+        finally:
+            connection.close()
+        self._notify_worker()
+        return {'job_id': job_id, 'state': 'cancelling'}
+
+    def resume_ingestion(self, job_id: str) -> dict:
+        if not isinstance(job_id, str) or not DOCUMENT_ID.fullmatch(job_id):
+            raise AgentError('Knowledge ingestion job identity is invalid.')
+        connection = self.index._connect()
+        try:
+            row = connection.execute('''SELECT state,spool_name FROM library_ingestion_jobs
+                WHERE job_id=? AND project_id=?''', (job_id, self.project.identity)).fetchone()
+            if row is None:
+                raise AgentError('Knowledge ingestion job is unavailable in this project.')
+            if row['state'] in {'ready','partially_available'}:
+                return {'job_id': job_id, 'state': row['state']}
+            spool_path = self.index.directory / 'ingestion-spool' / row['spool_name']
+            if spool_path.is_symlink() or not spool_path.is_file():
+                raise AgentError('Original upload spool is missing; preserve the document and job record.')
+            connection.execute('''UPDATE library_ingestion_jobs SET state='queued',stage='queued',
+                cancel_requested=0,error=NULL,updated_at=? WHERE job_id=?''', (_now(), job_id))
+            connection.commit()
+        finally:
+            connection.close()
+        self._notify_worker()
+        return {'job_id': job_id, 'state': 'queued'}
+
+    def _ingestion_loop(self):
+        while not self._worker_stop:
+            connection = self.index._connect()
+            try:
+                row = connection.execute('''SELECT job_id FROM library_ingestion_jobs
+                    WHERE project_id=? AND state='queued' ORDER BY created_at LIMIT 1''',
+                    (self.project.identity,)).fetchone()
+            finally:
+                connection.close()
+            if row is None:
+                return
+            self._active_job = row['job_id']
+            try:
+                self._process_ingestion_job(row['job_id'])
+            except _IngestionCancelled:
+                pass
+            except _IngestionPaused:
+                self._update_ingestion(row['job_id'], state='queued', stage='resuming')
+                return
+            except Exception as exc:
+                self._finish_ingestion_job(row['job_id'], 'failed', 'failed', str(exc)[:500])
+            finally:
+                self._active_job = None
+
+    def _job_row(self, job_id):
+        connection = self.index._connect()
+        try:
+            row = connection.execute('''SELECT j.*,d.original_name,d.extension,d.content_sha256,
+                    d.byte_size,d.page_count,d.version_of FROM library_ingestion_jobs j
+                JOIN library_documents d ON d.doc_id=j.doc_id
+                WHERE j.job_id=? AND j.project_id=?''', (job_id, self.project.identity)).fetchone()
+            if row is None:
+                raise AgentError('Knowledge ingestion job disappeared from its project index.')
+            return dict(row)
+        finally:
+            connection.close()
+
+    def _update_ingestion(self, job_id, *, state=None, stage=None, **values):
+        permitted = {'total_pages','processed_pages','extracted_pages','indexed_chunks',
+            'embedded_chunks','extracted_chars','empty_page_count','empty_pages_json',
+            'failure_pages_json','warnings_json','error','cancel_requested'}
+        if set(values) - permitted:
+            raise AgentError('Knowledge job attempted an unsupported state update.')
+        fields = {**values, 'updated_at': _now()}
+        if state is not None:
+            fields['state'] = state
+        if stage is not None:
+            fields['stage'] = stage
+        assignments = ','.join(f'{key}=?' for key in fields)
+        connection = self.index._connect()
+        try:
+            connection.execute(f'UPDATE library_ingestion_jobs SET {assignments} WHERE job_id=? AND project_id=?',
+                (*fields.values(), job_id, self.project.identity))
+            connection.commit()
+        finally:
+            connection.close()
+
+    def _finish_ingestion_job(self, job_id, state, stage, error=None):
+        self._update_ingestion(job_id, state=state, stage=stage, error=error)
+        if state == 'failed':
+            self._set_semantic_status(job_id, 'ingestion_failed')
+
+    def _process_ingestion_job(self, job_id):
+        job = self._job_row(job_id)
+        spool = self.index.directory / 'ingestion-spool' / job['spool_name']
+        if spool.is_symlink() or not spool.is_file() or not spool.resolve().is_relative_to(
+                (self.index.directory / 'ingestion-spool').resolve()):
+            raise AgentError('Original upload spool is missing or outside its private directory.')
+        digest = hashlib.sha256()
+        byte_count = 0
+        with spool.open('rb') as source:
+            while block := source.read(1024 * 1024):
+                digest.update(block); byte_count += len(block)
+        if byte_count != job['total_bytes'] or digest.hexdigest() != job['content_sha256']:
+            raise AgentError('Original upload failed length or SHA-256 verification.')
+        extension = job['extension']
+        if extension == '.pdf':
+            from pypdf import PdfReader
+            with spool.open('rb') as source:
+                reader = PdfReader(source, strict=True)
+                if reader.is_encrypted:
+                    raise AgentError('Encrypted PDFs are not supported.')
+                page_count = len(reader.pages)
+                if not 1 <= page_count <= MAX_PDF_PAGES:
+                    raise AgentError(f'PDF must contain between 1 and {MAX_PDF_PAGES} pages.')
+                self._update_ingestion(job_id, state='extracting', stage='extracting', total_pages=page_count)
+                job=self._job_row(job_id)
+                active_section=job['active_section']
+                empty_pages=json.loads(job['empty_pages_json'])
+                failures=json.loads(job['failure_pages_json'])
+                batch_chunks=[];batch_chars=0;batch_extracted=0;batch_empty=0
+                for page_number, page in enumerate(reader.pages, 1):
+                    if self._worker_stop:
+                        raise _IngestionPaused
+                    if page_number <= job['processed_pages']:
+                        continue
+                    if page_number % 5 == 0:
+                        latest=self._job_row(job_id)
+                        if latest['cancel_requested']:
+                            self._finish_ingestion_job(job_id, 'cancelled', 'cancelled')
+                            return
+                    try:
+                        text = page.extract_text() or ''
+                    except Exception as exc:
+                        text='';failure=f'{type(exc).__name__}: {exc}'
+                    else:
+                        failure='page text exceeds 1,000,000 characters' if len(text)>1_000_000 else None
+                    if batch_chars+job['extracted_chars']+len(text)>MAX_EXTRACTED_CHARS:
+                        failure='document text exceeds the configured character limit';text=''
+                    if failure:
+                        if len(failures)<200:
+                            failures.append({'page':page_number,'error':failure[:240]})
+                    elif not text.strip():
+                        batch_empty+=1
+                        if len(empty_pages)<200:
+                            empty_pages.append(page_number)
+                    else:
+                        page_chunks,active_section=self._page_chunks(text,page_number,active_section)
+                        batch_chunks.extend(page_chunks);batch_chars+=len(text);batch_extracted+=1
+                    is_checkpoint=(page_number%25==0 or page_number==page_count)
+                    if is_checkpoint:
+                        self._insert_ingestion_chunks(job_id,batch_chunks,progress={
+                            'page':page_number,'text_chars':batch_chars,'extracted_pages':batch_extracted,
+                            'empty_count':batch_empty,'empty_pages':empty_pages,'failures':failures,
+                            'active_section':active_section})
+                        job=self._job_row(job_id)
+                        batch_chunks=[];batch_chars=0;batch_extracted=0;batch_empty=0
+            self._complete_ingestion_index(job_id)
+            return
+        self._update_ingestion(job_id, state='extracting', stage='extracting')
+        self._process_text_file(job_id, spool, extension)
+        self._complete_ingestion_index(job_id)
+
+    def _process_text_file(self, job_id, path, extension):
+        from agent_core import no_secrets
+        import io
+        total_chars = 0
+        line_number = 0
+        current_section = ''
+        buffer = []
+        buffer_chars = 0
+        chunk_group = 0
+        initial_progress = self._job_row(job_id)['processed_pages']
+        with path.open('rb') as raw:
+            text_stream = io.TextIOWrapper(raw, encoding='utf-8-sig', errors='strict')
+            try:
+                for line in text_stream:
+                    if self._worker_stop:
+                        raise _IngestionPaused
+                    line_number += 1
+                    total_chars += len(line)
+                    if total_chars > MAX_EXTRACTED_CHARS:
+                        raise AgentError('Extracted text exceeds the configured character limit.')
+                    heading = re.match(r'^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$', line) if extension in {'.md','.markdown'} else None
+                    if heading and buffer:
+                        self._record_text_group(job_id, buffer, chunk_group, current_section,
+                                                total_chars, initial_progress)
+                        chunk_group += 1; buffer = []; buffer_chars = 0
+                    if heading:
+                        current_section = heading.group(1).strip()[:180]
+                    no_secrets(line)
+                    buffer.append(line)
+                    buffer_chars += len(line)
+                    if buffer_chars >= 40_000:
+                        self._record_text_group(job_id, buffer, chunk_group, current_section,
+                                                total_chars, initial_progress)
+                        chunk_group += 1; buffer = []; buffer_chars = 0
+                if buffer:
+                    self._record_text_group(job_id, buffer, chunk_group, current_section,
+                                            total_chars, initial_progress)
+            finally:
+                text_stream.detach()
+        if line_number == 0 or total_chars == 0:
+            raise AgentError('Document contains no extractable text.')
+
+    def _record_text_group(self, job_id, lines, group_number, section, total_chars, initial_progress):
+        latest = self._job_row(job_id)
+        if latest['cancel_requested']:
+            self._finish_ingestion_job(job_id, 'cancelled', 'cancelled')
+            raise _IngestionCancelled
+        progress_number = group_number + 1
+        if progress_number <= initial_progress:
+            return
+        text = ''.join(lines)
+        if not text.strip():
+            return
+        chunks = chunk_document(text, '.txt')
+        for part in chunks:
+            part['section'] = section or part.get('section') or ''
+        self._insert_ingestion_chunks(job_id, chunks, progress={
+            'page':progress_number,'text_chars':len(text),'empty':False,'failure':None,
+            'empty_pages':json.loads(latest['empty_pages_json']),
+            'failures':json.loads(latest['failure_pages_json']),'warnings':[],'text_block':True})
+
+    @staticmethod
+    def _page_chunks(text, page_number, active_section):
+        chunks=chunk_document(text,'.txt')
+        section=active_section or f'Page {page_number}'
+        for line in text.splitlines()[:24]:
+            heading=re.match(r'^\s{0,3}#{1,6}\s+(.+)',line) or re.match(
+                r'^\s*((?:chapter|part|section)\s+[\w.-]+[^\n]{0,140})$',line,re.I)
+            if heading:
+                active_section=heading.group(1).strip()[:180]
+                section=active_section
+                break
+        for chunk in chunks:
+            chunk['section']=section
+            chunk['page_number']=page_number
+        return chunks,active_section
+
+    def _insert_ingestion_chunks(self, job_id, chunks, progress=None):
+        with self._writer_lock('document-ingestion-page'):
+            connection = self.index._connect()
+            try:
+                connection.execute('BEGIN IMMEDIATE')
+                job = connection.execute('''SELECT * FROM library_ingestion_jobs WHERE job_id=? AND project_id=?''',
+                    (job_id,self.project.identity)).fetchone()
+                if job is None:
+                    raise AgentError('Knowledge ingestion job disappeared.')
+                indexed = job['indexed_chunks']
+                total = connection.execute('SELECT count(*) FROM library_chunks').fetchone()[0]
+                if total + len(chunks) > MAX_LIBRARY_CHUNKS:
+                    raise AgentError('Knowledge library passage capacity was reached; document remains partially available.')
+                for part in chunks:
+                    ordinal = indexed
+                    chunk_hash = hashlib.sha256(part['text'].encode('utf-8')).hexdigest()
+                    chunk_id = hashlib.sha256(f'{job_id}\0{ordinal}\0{chunk_hash}'.encode()).hexdigest()
+                    connection.execute('''INSERT INTO library_chunks
+                        (chunk_id,doc_id,ordinal,section,page_number,line_start,line_end,content,content_sha256)
+                        VALUES(?,?,?,?,?,?,?,?,?)''', (chunk_id,job_id,ordinal,part.get('section') or '',
+                        part.get('page_number'),part['line_start'],part['line_end'],part['text'],chunk_hash))
+                    connection.execute('INSERT INTO library_fts(chunk_id,content) VALUES(?,?)',
+                                       (chunk_id,part['text']))
+                    indexed += 1
+                updates = {'indexed_chunks':indexed,'updated_at':_now()}
+                if progress is not None:
+                    updates['processed_pages'] = progress['page']
+                    updates['extracted_chars'] = job['extracted_chars'] + progress['text_chars']
+                    if not progress.get('text_block'):
+                        updates['extracted_pages'] = job['extracted_pages'] + progress['extracted_pages']
+                        updates['empty_page_count'] = job['empty_page_count'] + progress['empty_count']
+                        updates['empty_pages_json'] = json.dumps(progress['empty_pages'])
+                        updates['failure_pages_json'] = json.dumps(progress['failures'])
+                        updates['active_section'] = progress.get('active_section',job['active_section'])
+                assignments = ','.join(f'{key}=?' for key in updates)
+                connection.execute(f'UPDATE library_ingestion_jobs SET {assignments} WHERE job_id=?',
+                    (*updates.values(),job_id))
+                connection.commit()
+            except BaseException:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+    def _complete_ingestion_index(self, job_id):
+        job = self._job_row(job_id)
+        if job['indexed_chunks'] == 0:
+            self._finish_ingestion_job(job_id,'failed','failed','No searchable text was extracted from this document.')
+            return
+        with self._writer_lock('document-ingestion-complete'):
+            connection = self.index._connect()
+            try:
+                connection.execute('''UPDATE library_documents SET page_count=? WHERE doc_id=? AND project_id=?''',
+                    (job['total_pages'],job_id,self.project.identity))
+                if job['version_of']:
+                    connection.execute("UPDATE library_documents SET status='superseded' WHERE doc_id=? AND project_id=?",
+                                       (job['version_of'],self.project.identity))
+                connection.commit()
+            finally:
+                connection.close()
+        self._update_ingestion(job_id,state='embedding',stage='embedding')
+        semantic = self._embed_document(job_id)
+        job = self._job_row(job_id)
+        complete_pages = (job['total_pages'] is None or job['processed_pages'] == job['total_pages'])
+        no_gaps = not json.loads(job['failure_pages_json']) and job['empty_page_count'] == 0
+        complete_vectors = semantic == 'ready'
+        ready = complete_pages and no_gaps and complete_vectors
+        state = 'ready' if ready else 'partially_available'
+        warnings = json.loads(job['warnings_json'])
+        if job['empty_page_count']:
+            warnings.append({'kind':'empty_pages','count':job['empty_page_count'],
+                             'pages':json.loads(job['empty_pages_json'])[:200]})
+        if json.loads(job['failure_pages_json']):
+            warnings.append({'kind':'extraction_failures','count':len(json.loads(job['failure_pages_json']))})
+        if not complete_vectors:
+            warnings.append({'kind':'semantic_index_incomplete','status':semantic})
+        self._update_ingestion(job_id,state=state,stage='complete' if ready else 'partial',
+            warnings_json=json.dumps(warnings),error=None)
+        if ready:
+            spool = self.index.directory / 'ingestion-spool' / job['spool_name']
+            spool.unlink(missing_ok=True)
 
     def ingest(self, filename: str, content: bytes, *, scope='global', conversation_id=None,
                title=None) -> dict:
@@ -390,7 +946,7 @@ class DocumentKnowledgeLibrary:
                 'source_url':source['url'],'source_content_sha256':source['content_sha256']}
 
     def _embed_document(self, document_id: str) -> str:
-        """Attach a complete vector set atomically; keep committed FTS on any failure."""
+        """Attach vectors in resumable bounded batches while keyword search remains available."""
         provider = self._provider()
         if provider is None:
             self._set_semantic_status(document_id, 'keyword_only')
@@ -404,47 +960,71 @@ class DocumentKnowledgeLibrary:
             connection = self.index._connect()
             try:
                 rows = connection.execute('''SELECT chunk_id,content FROM library_chunks
-                    WHERE doc_id=? ORDER BY ordinal''', (document_id,)).fetchall()
+                    WHERE doc_id=? AND (embedding IS NULL OR embedding_provider<>? OR embedding_model<>?
+                        OR embedding_version<>? OR embedding_digest<>? OR embedding_dimensions<>?)
+                    ORDER BY ordinal''', (document_id,descriptor['provider_id'],descriptor['model_id'],
+                    descriptor['model_version'],descriptor['model_digest'],descriptor['dimensions'])).fetchall()
+                embedded = connection.execute('''SELECT count(*) FROM library_chunks WHERE doc_id=?
+                    AND embedding_provider=? AND embedding_model=? AND embedding_version=?
+                    AND embedding_digest=? AND embedding_dimensions=? AND embedding IS NOT NULL''',
+                    (document_id,descriptor['provider_id'],descriptor['model_id'],descriptor['model_version'],
+                     descriptor['model_digest'],descriptor['dimensions'])).fetchone()[0]
             finally:
                 connection.close()
-            if not rows or len(rows) > 256:
-                raise AgentError('Document exceeds one bounded semantic indexing batch.')
-            vectors = provider.embed([row['content'] for row in rows])
-            if len(vectors) != len(rows):
-                raise AgentError('Embedding provider returned an incomplete document batch.')
-            packed = []
-            for vector in vectors:
-                normalized = _vector(vector, descriptor['dimensions'])
-                packed.append(_pack_vector(normalized))
-            with self._writer_lock('document-vector-index'):
-                connection = self.index._connect()
+            if not rows:
+                if embedded == 0:
+                    raise AgentError('Document has no passages to embed.')
+                self._set_semantic_status(document_id,'ready')
+                return 'ready'
+            batch_limit=min(MAX_EMBEDDING_BATCH,getattr(provider,'MAX_BATCH',8))
+            for offset in range(0, len(rows), batch_limit):
+                if self._worker_stop:
+                    raise _IngestionPaused
+                batch = rows[offset:offset + batch_limit]
+                vectors = provider.embed([row['content'] for row in batch])
+                if len(vectors) != len(batch):
+                    raise AgentError('Embedding provider returned an incomplete document batch.')
+                packed = [_pack_vector(_vector(vector, descriptor['dimensions'])) for vector in vectors]
+                with self._writer_lock('document-vector-index'):
+                    connection = self.index._connect()
+                    try:
+                        connection.execute('BEGIN IMMEDIATE')
+                        current = connection.execute('''SELECT status FROM library_documents
+                            WHERE doc_id=? AND project_id=?''', (document_id,self.project.identity)).fetchone()
+                        if current is None or current['status'] != 'current':
+                            connection.rollback()
+                            return 'removed'
+                        connection.executemany('''UPDATE library_chunks SET embedding=?,embedding_dimensions=?,
+                            embedding_provider=?,embedding_model=?,embedding_version=?,embedding_digest=?
+                            WHERE chunk_id=? AND doc_id=?''', [
+                            (sqlite3.Binary(vector),descriptor['dimensions'],descriptor['provider_id'],
+                             descriptor['model_id'],descriptor['model_version'],descriptor['model_digest'],
+                             row['chunk_id'],document_id) for row,vector in zip(batch,packed)])
+                        connection.execute('UPDATE library_documents SET semantic_status=? WHERE doc_id=?',
+                            ('semantic_indexing' if offset + len(batch) < len(rows) else 'ready',document_id))
+                        connection.commit()
+                    except BaseException:
+                        if connection.in_transaction:
+                            connection.rollback()
+                        raise
+                    finally:
+                        connection.close()
+                embedded += len(batch)
                 try:
-                    connection.execute('BEGIN IMMEDIATE')
-                    current = connection.execute('''SELECT status FROM library_documents
-                        WHERE doc_id=? AND project_id=?''',
-                        (document_id, self.project.identity)).fetchone()
-                    if current is None or current['status'] != 'current':
-                        connection.rollback()
-                        return 'removed'
-                    connection.executemany('''UPDATE library_chunks SET embedding=?,embedding_dimensions=?,
-                        embedding_provider=?,embedding_model=?,embedding_version=?,embedding_digest=?
-                        WHERE chunk_id=? AND doc_id=?''', [
-                        (sqlite3.Binary(vector), descriptor['dimensions'], descriptor['provider_id'],
-                         descriptor['model_id'], descriptor['model_version'], descriptor['model_digest'],
-                         row['chunk_id'], document_id) for row, vector in zip(rows, packed)])
-                    connection.execute('''UPDATE library_documents SET semantic_status='ready'
-                        WHERE doc_id=? AND project_id=?''', (document_id, self.project.identity))
-                    connection.commit()
-                except BaseException:
-                    if connection.in_transaction:
-                        connection.rollback()
-                    raise
-                finally:
-                    connection.close()
+                    self._update_ingestion(document_id, embedded_chunks=embedded, stage='embedding')
+                except sqlite3.Error:
+                    pass
             return 'ready'
         except (AgentError, OSError, ValueError, KeyError, TypeError, RuntimeError, TimeoutError):
-            self._set_semantic_status(document_id, 'keyword_only')
-            return 'keyword_only'
+            connection = self.index._connect()
+            try:
+                embedded = connection.execute('''SELECT count(*) FROM library_chunks
+                    WHERE doc_id=? AND embedding IS NOT NULL''',(document_id,)).fetchone()[0]
+            finally:
+                connection.close()
+            status = 'keyword_only' if embedded == 0 else 'partial_embedding'
+            self._set_semantic_status(document_id, status)
+            return status
 
     def _set_semantic_status(self, document_id: str, status: str) -> None:
         with self._writer_lock('document-semantic-status'):
@@ -524,14 +1104,200 @@ class DocumentKnowledgeLibrary:
         conversation_id = self._conversation(conversation_id)
         connection = self.index._connect()
         try:
-            rows = connection.execute('''SELECT doc_id,title,original_name,extension,mime_type,
-                content_sha256,byte_size,page_count,status,semantic_status,document_version,version_of,
-                duplicate_of,scope,created_at
-                FROM library_documents WHERE project_id=? AND status='current'
-                AND (scope='global' OR (scope='conversation' AND conversation_id=?))
-                ORDER BY created_at DESC LIMIT ?''',
+            rows = connection.execute('''SELECT d.doc_id,d.title,d.original_name,d.extension,d.mime_type,
+                d.content_sha256,d.byte_size,d.page_count,d.status,d.semantic_status,d.document_version,d.version_of,
+                d.duplicate_of,d.scope,d.created_at,
+                (SELECT count(*) FROM library_chunks c WHERE c.doc_id=d.doc_id) AS indexed_chunks,
+                (SELECT count(*) FROM library_chunks c WHERE c.doc_id=d.doc_id AND c.embedding IS NOT NULL) AS embedded_chunks,
+                (SELECT count(DISTINCT c.page_number) FROM library_chunks c WHERE c.doc_id=d.doc_id
+                    AND c.page_number IS NOT NULL) AS pages_with_chunks
+                FROM library_documents d WHERE d.project_id=? AND d.status='current'
+                AND (d.scope='global' OR (d.scope='conversation' AND d.conversation_id=?))
+                ORDER BY d.created_at DESC LIMIT ?''',
                 (self.project.identity, conversation_id or '', MAX_LIBRARY_DOCUMENTS + 1)).fetchall()
             return [dict(row) for row in rows]
+        finally:
+            connection.close()
+
+    def _resolve_document(self, reference=None, *, conversation_id=None):
+        rows = self.list_documents(conversation_id=conversation_id)
+        if not rows:
+            raise AgentError('No accessible documents are present in this project and conversation scope.')
+        if reference is None or (isinstance(reference,str) and reference.casefold().strip() in {'latest','most recent'}):
+            return rows[0]
+        if not isinstance(reference,str) or not reference.strip() or len(reference)>200:
+            raise AgentError('Document reference must be an exact title, filename, or document identity.')
+        value=reference.casefold().strip()
+        matches=[row for row in rows if value in {row['doc_id'].casefold(),row['title'].casefold(),
+            row['original_name'].casefold(),Path(row['original_name']).stem.casefold()}
+            or value in row['title'].casefold() or value in row['original_name'].casefold()]
+        if not matches:
+            raise AgentError('No accessible document has that exact title, filename, or identity.')
+        if len(matches)>1:
+            raise AgentError('Document reference is ambiguous; use its exact filename or document identity.')
+        return matches[0]
+
+    def document_inventory(self, *, conversation_id=None, name_filter=None, limit=30, offset=0):
+        if type(limit) is not int or not 1<=limit<=100 or type(offset) is not int or not 0<=offset<=10000:
+            raise AgentError('Document inventory page bounds are invalid.')
+        rows=self.list_documents(conversation_id=conversation_id)
+        if name_filter:
+            if not isinstance(name_filter,str) or len(name_filter)>80:
+                raise AgentError('Document inventory filter is invalid.')
+            needle=name_filter.casefold()
+            rows=[row for row in rows if needle in row['title'].casefold()
+                or needle in row['original_name'].casefold()]
+        return {'total':len(rows),'offset':offset,'limit':limit,
+            'totals':{'documents':len(rows),'pages':sum(row['page_count'] or 0 for row in rows),
+                'pages_with_chunks':sum(row['pages_with_chunks'] or 0 for row in rows),
+                'indexed_chunks':sum(row['indexed_chunks'] for row in rows),
+                'embedded_chunks':sum(row['embedded_chunks'] for row in rows)},
+            'documents':rows[offset:offset+limit],
+            'latest_document':rows[0] if offset==0 and rows else None,
+            'project_id':self.project.identity,'scope':'project and authorized conversation'}
+
+    def inspect_document(self, reference=None, *, conversation_id=None):
+        doc=self._resolve_document(reference,conversation_id=conversation_id)
+        jobs={job['doc_id']:job for job in self.list_ingestion_jobs(conversation_id=conversation_id)}
+        job=jobs.get(doc['doc_id'])
+        return {'document':doc,'ingestion':job or {'state':'legacy_indexed',
+            'coverage':'not recorded by the previous ingestion schema'},
+            'distinction':'Indexed excerpts are not a claim that the complete document was read.'}
+
+    def list_sections(self, reference=None, *, conversation_id=None, limit=40, offset=0):
+        if type(limit) is not int or not 1<=limit<=100 or type(offset) is not int or not 0<=offset<=10000:
+            raise AgentError('Document section page bounds are invalid.')
+        doc=self._resolve_document(reference,conversation_id=conversation_id)
+        connection=self.index._connect()
+        try:
+            total=connection.execute('SELECT count(DISTINCT section) FROM library_chunks WHERE doc_id=?',
+                (doc['doc_id'],)).fetchone()[0]
+            rows=connection.execute('''SELECT section,min(page_number) first_page,max(page_number) last_page,
+                count(*) chunks FROM library_chunks WHERE doc_id=? GROUP BY section ORDER BY min(ordinal) LIMIT ? OFFSET ?''',
+                (doc['doc_id'],limit,offset)).fetchall()
+            job=connection.execute('SELECT state,processed_pages,total_pages FROM library_ingestion_jobs WHERE doc_id=?',
+                (doc['doc_id'],)).fetchone()
+            return {'document_id':doc['doc_id'],'title':doc['title'],'sections':[dict(row) for row in rows],
+                'total_sections':total,'offset':offset,'limit':limit,
+                'ingestion_complete':bool(job and job['state']=='ready'),
+                'navigation_note':'Section labels come from extracted headings when available; otherwise pages or source blocks.'}
+        finally:
+            connection.close()
+
+    def read_pages(self, reference, start_page, end_page, *, conversation_id=None):
+        if (type(start_page) is not int or type(end_page) is not int or start_page<1
+                or end_page<start_page or end_page-start_page>19):
+            raise AgentError('Read at most 20 consecutive PDF pages per request.')
+        doc=self._resolve_document(reference,conversation_id=conversation_id)
+        if doc['extension']!='.pdf':
+            raise AgentError('Page navigation is supported for PDF documents; use source sections or search for text files.')
+        from pypdf import PdfReader
+        connection=self.index._connect()
+        try:
+            row=connection.execute('''SELECT rowid,content_sha256,byte_size,page_count FROM library_documents
+                WHERE doc_id=? AND project_id=? AND status='current' ''',
+                (doc['doc_id'],self.project.identity)).fetchone()
+            if row is None:
+                raise AgentError('Document is no longer available in this scope.')
+            with connection.blobopen('library_documents','original',row['rowid'],readonly=True) as original:
+                digest=hashlib.sha256()
+                while block:=original.read(1024*1024):
+                    digest.update(block)
+                if digest.hexdigest()!=row['content_sha256']:
+                    raise AgentError('Original document failed its SHA-256 check.')
+                original.seek(0)
+                reader=PdfReader(original,strict=True)
+                actual_pages=len(reader.pages)
+                if (row['page_count'] is not None and actual_pages!=row['page_count']) or end_page>actual_pages:
+                    raise AgentError('Requested page range is outside the verified document page count.')
+                pages=[]; total_chars=0
+                for number in range(start_page,end_page+1):
+                    try:
+                        content=reader.pages[number-1].extract_text() or ''
+                    except Exception as exc:
+                        pages.append({'page':number,'text':None,'status':'extraction_failed',
+                                      'error':type(exc).__name__})
+                        continue
+                    total_chars+=len(content)
+                    if total_chars>6000:
+                        raise AgentError('That page range exceeds the 6,000-character read bound; request fewer pages.')
+                    pages.append({'page':number,'text':content,'status':'read' if content.strip() else 'no_extractable_text'})
+                return {'document_id':doc['doc_id'],'title':doc['title'],'filename':doc['original_name'],
+                    'document_sha256':doc['content_sha256'],'pages':pages,
+                    'range':{'start':start_page,'end':end_page},'source':'original PDF bytes hash verified',
+                    'trust':'untrusted_reference_data'}
+        finally:
+            connection.close()
+
+    def read_section(self, reference, section_reference, *, conversation_id=None, max_chars=5000):
+        if (not isinstance(section_reference,str) or not section_reference.strip()
+                or len(section_reference)>100 or type(max_chars) is not int or not 500<=max_chars<=5000):
+            raise AgentError('Section reference or bounded read size is invalid.')
+        doc=self._resolve_document(reference,conversation_id=conversation_id)
+        sections=self.list_sections(reference,conversation_id=conversation_id,limit=100)
+        target=section_reference.casefold().strip()
+        words={'one':'1','two':'2','three':'3','four':'4','five':'5','six':'6','seven':'7',
+               'eight':'8','nine':'9','ten':'10','eleven':'11','twelve':'12'}
+        for word,digit in words.items():
+            target=re.sub(r'\b'+word+r'\b',digit,target)
+        def normalized(value):
+            result=value.casefold()
+            for word,digit in words.items():
+                result=re.sub(r'\b'+word+r'\b',digit,result)
+            return result
+        matches=[item for item in sections['sections'] if target in normalized(item['section'])]
+        if not matches:
+            raise AgentError('That heading is not present in the indexed section map. Ask for its PDF page range or a document search instead.')
+        connection=self.index._connect()
+        try:
+            rows=[]
+            for item in matches:
+                rows.extend(connection.execute('''SELECT chunk_id,ordinal,section,page_number,line_start,
+                    line_end,content,content_sha256 FROM library_chunks WHERE doc_id=? AND section=? ORDER BY ordinal''',
+                    (doc['doc_id'],item['section'])).fetchall())
+            content_parts=[]; total_chars=0; retained_chars=0
+            for row in rows:
+                if hashlib.sha256(row['content'].encode()).hexdigest()!=row['content_sha256']:
+                    raise AgentError('Section passage failed its stored content hash check.')
+                total_chars+=len(row['content'])
+                if retained_chars<max_chars:
+                    remaining=max_chars-retained_chars
+                    kept=row['content'][:remaining]
+                    content_parts.append(kept);retained_chars+=len(kept)
+            text='\n'.join(part for part in content_parts if part)
+            pages=sorted({row['page_number'] for row in rows if row['page_number'] is not None})
+            return {'document_id':doc['doc_id'],'title':doc['title'],'document_sha256':doc['content_sha256'],
+                'section':matches[0]['section'],'page_start':min(pages) if pages else None,
+                'page_end':max(pages) if pages else None,'text':text,'total_chunks':len(rows),
+                'text_complete':total_chars<=max_chars,
+                'omitted_chars':max(0,total_chars-max_chars),'trust':'untrusted_reference_data',
+                'source':'hash-verified indexed passages'}
+        finally:
+            connection.close()
+
+    def adjacent_chunks(self, reference, chunk_id, *, conversation_id=None, before=1, after=1):
+        if (not isinstance(chunk_id,str) or not re.fullmatch(r'[a-f0-9]{64}',chunk_id)
+                or type(before) is not int or type(after) is not int
+                or not 0<=before<=2 or not 0<=after<=2 or before+after>3):
+            raise AgentError('Adjacent chunk request is outside its bounded schema.')
+        doc=self._resolve_document(reference,conversation_id=conversation_id)
+        connection=self.index._connect()
+        try:
+            center=connection.execute('SELECT ordinal FROM library_chunks WHERE doc_id=? AND chunk_id=?',
+                (doc['doc_id'],chunk_id)).fetchone()
+            if center is None:
+                raise AgentError('Chunk identity does not belong to the selected document.')
+            rows=connection.execute('''SELECT chunk_id,ordinal,section,page_number,line_start,line_end,
+                content,content_sha256 FROM library_chunks WHERE doc_id=? AND ordinal BETWEEN ? AND ?
+                ORDER BY ordinal''',(doc['doc_id'],max(0,center['ordinal']-before),center['ordinal']+after)).fetchall()
+            result=[]
+            for row in rows:
+                if hashlib.sha256(row['content'].encode()).hexdigest()!=row['content_sha256']:
+                    raise AgentError('Adjacent document passage failed its stored content hash check.')
+                result.append({**dict(row),'trust':'untrusted_reference_data',
+                    'citation':self._citation({**dict(row),'doc_id':doc['doc_id'],'title':doc['title'],
+                        'document_sha256':doc['content_sha256']})})
+            return {'document_id':doc['doc_id'],'chunks':result,'source':'indexed adjacent chunks'}
         finally:
             connection.close()
 
@@ -572,8 +1338,118 @@ class DocumentKnowledgeLibrary:
             finally:
                 connection.close()
 
+    def start_study(self, reference, *, conversation_id=None):
+        """Create a persistent, source-version-bound section study plan."""
+        doc=self._resolve_document(reference,conversation_id=conversation_id)
+        connection=self.index._connect()
+        try:
+            prior=connection.execute('''SELECT study_id FROM library_studies WHERE doc_id=? AND source_sha256=?
+                AND coalesce(conversation_id,'')=coalesce(?,'') ORDER BY updated_at DESC LIMIT 1''',
+                (doc['doc_id'],doc['content_sha256'],conversation_id)).fetchone()
+            if prior: return self.study_status(prior['study_id'],conversation_id=conversation_id)
+            chunks=connection.execute('''SELECT chunk_id,section,page_number FROM library_chunks
+                WHERE doc_id=? ORDER BY ordinal''',(doc['doc_id'],)).fetchall()
+            if not chunks: raise AgentError('This document has no indexed passages to study.')
+            groups=[]
+            for chunk in chunks:
+                label=(chunk['section'] or '').strip() or (f"Page {chunk['page_number']}" if chunk['page_number'] else 'Document')
+                if not groups or groups[-1]['section']!=label: groups.append({'section':label,'chunks':[],'pages':[]})
+                groups[-1]['chunks'].append(chunk['chunk_id'])
+                if chunk['page_number'] is not None: groups[-1]['pages'].append(int(chunk['page_number']))
+            now=_now(); study_id=uuid.uuid4().hex
+            with self._writer_lock('create-document-study'):
+                connection.execute('''INSERT INTO library_studies(study_id,project_id,doc_id,conversation_id,
+                    source_sha256,state,total_sections,created_at,updated_at)
+                    VALUES(?,?,?,?,?,'in_progress',?,?,?)''',
+                    (study_id,self.project.identity,doc['doc_id'],conversation_id,doc['content_sha256'],len(groups),now,now))
+                connection.executemany('''INSERT INTO library_study_sections(study_id,ordinal,section,page_start,
+                    page_end,source_chunks_json,state,updated_at) VALUES(?,?,?,?,?,?,'pending',?)''',
+                    [(study_id,i,g['section'],min(g['pages']) if g['pages'] else None,
+                      max(g['pages']) if g['pages'] else None,json.dumps(g['chunks']),now)
+                     for i,g in enumerate(groups)])
+                connection.commit()
+            return self.study_status(study_id,conversation_id=conversation_id)
+        finally: connection.close()
+
+    def study_status(self, study_id, *, conversation_id=None):
+        connection=self.index._connect()
+        try:
+            row=connection.execute('''SELECT s.*,d.title,d.original_name FROM library_studies s
+                JOIN library_documents d ON d.doc_id=s.doc_id WHERE s.study_id=? AND s.project_id=?
+                AND (s.conversation_id IS NULL OR s.conversation_id=?)''',
+                (study_id,self.project.identity,conversation_id)).fetchone()
+            if row is None: raise AgentError('No accessible study session has that identity.')
+            return {'study_id':row['study_id'],'document_id':row['doc_id'],'document':row['title'],
+                'filename':row['original_name'],'state':row['state'],'total_sections':row['total_sections'],
+                'completed_sections':row['completed_sections'],'source_sha256':row['source_sha256']}
+        finally: connection.close()
+
+    def next_study_section(self, study_id, *, conversation_id=None, max_chars=6000):
+        status=self.study_status(study_id,conversation_id=conversation_id)
+        connection=self.index._connect()
+        try:
+            row=connection.execute('''SELECT * FROM library_study_sections WHERE study_id=?
+                AND state!='complete' ORDER BY ordinal LIMIT 1''',(study_id,)).fetchone()
+            if row is None: return {**status,'section':None,'complete':True}
+            ids=json.loads(row['source_chunks_json']); marks=','.join('?' for _ in ids)
+            chunks=connection.execute(f'''SELECT chunk_id,section,page_number,content,content_sha256
+                FROM library_chunks WHERE doc_id=? AND chunk_id IN ({marks}) ORDER BY ordinal''',
+                (status['document_id'],*ids)).fetchall()
+            passages=[]; used=0
+            for chunk in chunks:
+                if hashlib.sha256(chunk['content'].encode()).hexdigest()!=chunk['content_sha256']:
+                    raise AgentError('Study source passage failed integrity verification.')
+                part=chunk['content'][:max(0,max_chars-used)]; used+=len(part)
+                passages.append({'chunk_id':chunk['chunk_id'],'page':chunk['page_number'],
+                    'section':chunk['section'],'text':part,'truncated':len(part)<len(chunk['content'])})
+                if used>=max_chars: break
+            with self._writer_lock('start-study-section'):
+                connection.execute('''UPDATE library_study_sections SET state='in_progress',updated_at=?
+                    WHERE study_id=? AND ordinal=?''',(_now(),study_id,row['ordinal']))
+            return {**status,'section':{'ordinal':row['ordinal'],'label':row['section'],
+                'page_start':row['page_start'],'page_end':row['page_end'],'passages':passages,
+                'complete_source':len(passages)==len(chunks) and all(not p['truncated'] for p in passages)}}
+        finally: connection.close()
+
+    def record_study_section(self, study_id, ordinal, *, summary, concepts=(), examples=(), lessons=(),
+                             conversation_id=None):
+        """Record interpretations with source provenance as unverified candidate lessons."""
+        def bounded(values,limit):
+            if not isinstance(values,(list,tuple)): raise AgentError('Study annotations must be lists.')
+            return [str(v)[:limit] for v in values[:40] if str(v).strip()]
+        summary=str(summary)[:4000]
+        if not summary.strip(): raise AgentError('A nonempty section summary is required.')
+        connection=self.index._connect()
+        try:
+            with self._writer_lock('record-study-section'):
+                row=connection.execute('''SELECT s.doc_id,s.state,s.source_sha256,d.content_sha256 FROM library_studies s
+                    JOIN library_documents d ON d.doc_id=s.doc_id WHERE s.study_id=? AND s.project_id=?
+                    AND (s.conversation_id IS NULL OR s.conversation_id=?)''',
+                    (study_id,self.project.identity,conversation_id)).fetchone()
+                if row is None or row['source_sha256']!=row['content_sha256']:
+                    raise AgentError('Study session is unavailable or its source version changed.')
+                sec=connection.execute('''SELECT state,source_chunks_json FROM library_study_sections
+                    WHERE study_id=? AND ordinal=?''',(study_id,int(ordinal))).fetchone()
+                if sec is None: raise AgentError('Study section does not exist.')
+                lessons_value=[{'text':v,'status':'unverified_candidate','executable':False}
+                    for v in bounded(lessons,500)]
+                connection.execute('''UPDATE library_study_sections SET state='complete',summary=?,concepts_json=?,
+                    examples_json=?,lessons_json=?,updated_at=? WHERE study_id=? AND ordinal=?''',
+                    (summary,json.dumps(bounded(concepts,300)),json.dumps(bounded(examples,500)),
+                     json.dumps(lessons_value),_now(),study_id,int(ordinal)))
+                if sec['state']!='complete':
+                    connection.execute('''UPDATE library_studies SET completed_sections=completed_sections+1,
+                        updated_at=? WHERE study_id=?''',(_now(),study_id))
+                counts=connection.execute('SELECT total_sections,completed_sections FROM library_studies WHERE study_id=?',
+                    (study_id,)).fetchone()
+                state='complete' if counts['completed_sections']>=counts['total_sections'] else 'in_progress'
+                connection.execute('UPDATE library_studies SET state=?,updated_at=? WHERE study_id=?',
+                    (state,_now(),study_id)); connection.commit()
+            return self.study_status(study_id,conversation_id=conversation_id)
+        finally: connection.close()
+
     def search(self, query: str, *, conversation_id=None, limit=MAX_RETRIEVAL_RESULTS,
-               provider=None, cancel_event=None, retrieval_mode='hybrid') -> dict:
+               provider=None, cancel_event=None, retrieval_mode='hybrid', document_id=None) -> dict:
         if not isinstance(query, str) or not query.strip() or len(query.encode('utf-8')) > 2000:
             raise AgentError('Knowledge query must contain 1 to 2000 UTF-8 bytes.')
         if type(limit) is not int or not 1 <= limit <= MAX_RETRIEVAL_RESULTS:
@@ -583,6 +1459,11 @@ class DocumentKnowledgeLibrary:
         from agent_core import no_secrets
         no_secrets(query)
         conversation_id = self._conversation(conversation_id)
+        if document_id is not None:
+            if not isinstance(document_id,str) or not DOCUMENT_ID.fullmatch(document_id):
+                raise AgentError('Knowledge document identity is invalid.')
+            if document_id not in {row['doc_id'] for row in self.list_documents(conversation_id=conversation_id)}:
+                raise AgentError('Knowledge document is unavailable in this project and conversation scope.')
         terms = [term for term in dict.fromkeys(re.findall(r'[A-Za-z0-9_]{2,}', query.casefold()))
                  if term not in _FTS_STOPWORDS][:24]
         expression = (' OR '.join('"' + term.replace('"', '""') + '"' for term in terms)
@@ -619,9 +1500,10 @@ class DocumentKnowledgeLibrary:
                 JOIN library_documents d ON d.doc_id=c.doc_id
                 WHERE library_fts MATCH ? AND d.project_id=? AND d.status='current'
                 AND (d.scope='global' OR (d.scope='conversation' AND d.conversation_id=?))
+                AND (? IS NULL OR d.doc_id=?)
                 ORDER BY rank,c.chunk_id LIMIT 40''',
                 (expression or '"__no_fts_terms__"', self.project.identity,
-                 conversation_id or '')).fetchall() if expression and retrieval_mode != 'semantic' else []
+                 conversation_id or '',document_id,document_id)).fetchall() if expression and retrieval_mode != 'semantic' else []
             if len(terms) >= 3 and keyword_rows:
                 required_matches = 2
                 keyword_rows = [row for row in keyword_rows
@@ -638,10 +1520,11 @@ class DocumentKnowledgeLibrary:
                     AND c.embedding_provider=? AND c.embedding_model=? AND c.embedding_version=?
                     AND c.embedding_digest=? AND c.embedding_dimensions=?
                     AND (d.scope='global' OR (d.scope='conversation' AND d.conversation_id=?))
+                    AND (? IS NULL OR d.doc_id=?)
                     ORDER BY c.chunk_id LIMIT ?''',
                     (self.project.identity, descriptor['provider_id'], descriptor['model_id'],
                      descriptor['model_version'], descriptor['model_digest'], descriptor['dimensions'],
-                     conversation_id or '', MAX_LIBRARY_CHUNKS + 1)).fetchall()
+                     conversation_id or '',document_id,document_id, MAX_LIBRARY_CHUNKS + 1)).fetchall()
                 if len(stored) > MAX_LIBRARY_CHUNKS:
                     raise AgentError('Semantic candidate set exceeds its configured bound.')
                 scored = []
@@ -663,7 +1546,7 @@ class DocumentKnowledgeLibrary:
             ordered = sorted(ranked.values(), key=lambda item: (-item[1],item[0]['doc_id'],item[0]['ordinal']))
             results=[]; per_document={}
             for row, score, methods in ordered:
-                if per_document.get(row['doc_id'], 0) >= 2:
+                if document_id is None and per_document.get(row['doc_id'], 0) >= 2:
                     continue
                 if hashlib.sha256(row['content'].encode('utf-8')).hexdigest() != row['content_sha256']:
                     raise AgentError('Retrieved knowledge passage failed its stored content hash check.')
@@ -760,7 +1643,7 @@ class DocumentKnowledgeLibrary:
                     'SELECT count(*) FROM library_chunks c JOIN library_documents d ON d.doc_id=c.doc_id WHERE d.project_id=?',
                     (self.project.identity,)).fetchone()[0],
                     'embeddings_checked':vectors_checked,'invalid_embeddings':invalid_vectors,
-                'schema_version':4,'research_sources_checked':len(research_rows),
+                'schema_version':5,'research_sources_checked':len(research_rows),
                 'invalid_research_sources':invalid_research}
         finally:
             connection.close()
@@ -772,7 +1655,7 @@ class DocumentKnowledgeLibrary:
                 WHERE project_id=? AND status='current' GROUP BY semantic_status''',
                 (self.project.identity,)).fetchall()
             provider = self._provider()
-            return {'project_id':self.project.identity,'schema_version':4,
+            return {'project_id':self.project.identity,'schema_version':5,
                 'document_count':sum(row['count'] for row in rows),
                 'semantic_states':{row['semantic_status']:row['count'] for row in rows},
                 'retrieval':'hybrid' if provider else 'keyword',
@@ -846,8 +1729,14 @@ class DocumentKnowledgeLibrary:
         return assets
 
     def close(self) -> None:
+        with self._job_condition:
+            self._worker_stop = True
+            self._job_condition.notify_all()
+            worker = self._worker
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=3.0)
         provider = self._embedding_provider
-        if provider is not None and callable(getattr(provider, 'close', None)):
+        if (worker is None or not worker.is_alive()) and provider is not None and callable(getattr(provider, 'close', None)):
             provider.close()
 
     def backup(self) -> dict:
@@ -896,7 +1785,7 @@ class DocumentKnowledgeLibrary:
             manifest = {'schema_version': 2, 'project_id': self.project.identity,
                 'created_at': _now(), 'database_sha256': hashlib.sha256(raw).hexdigest(),
                 'database_bytes': size, 'sqlite_integrity': 'ok',
-                'knowledge_schema_version': 4, 'embedding_identity': embedding,
+                'knowledge_schema_version': 5, 'embedding_identity': embedding,
                 'embedding_identities':embedding_identities,
                 'portable_files':asset_manifest,
                 'skill_registry_included':'skills/registry.json' in skill_assets,
